@@ -158,6 +158,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
         elif case == "max-age":
             self.send_header("Cache-Control", "max-age=60")
+        elif case == "max-age-low":
+            self.send_header("Cache-Control", "max-age=1")
         elif case == "expires":
             exp = datetime.now(tz=timezone.utc) + timedelta(seconds=60)
             self.send_header("Expires", _httpdate(exp))

@@ -317,6 +317,19 @@ class TestProxyLive:
         assert r1.ok and r2.ok
         assert_cached_response(r2)
 
+    def test_cache_control_max_age_expires(self, proxy_session, test_server, cache_bust_random):
+        # Ensures Cache-Control: max-age expiry triggers revalidation.
+        test_server.reset()
+        url = test_server.url(f"/cache-control/max-age-low?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+        r2 = proxy_get(proxy_session, url, timeout=30)
+        assert r1.ok and r2.ok
+        stats = test_server.stats()
+        assert get_method_count(stats, "/cache-control/max-age-low", "GET") == 1
+        assert get_method_count(stats, "/cache-control/max-age-low", "HEAD") == 2
+        assert_cached_response(r2)
+
     def test_cache_control_expires(self, proxy_session, test_server, cache_bust_random):
         # Ensures Expires header is honored for cache freshness.
         test_server.reset()
