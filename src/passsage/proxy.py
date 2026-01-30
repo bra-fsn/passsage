@@ -583,6 +583,7 @@ class Proxy:
                 flow._orig_data["if-modified-since"] = flow.request.headers.pop("if-modified-since", None)
 
         upstream_failed = False
+        flow._upstream_error = None
         with ctx._lock:
             key = (flow.request.host, flow.request.port, flow.request.scheme)
             if key in ctx._banned:
@@ -591,6 +592,7 @@ class Proxy:
                     del ctx._banned[key]
                 else:
                     upstream_failed = True
+                    flow._upstream_error = ctx._banned.get(key)
 
         if not upstream_failed:
             # If the upstream is not banned, we do an upstream HEAD request
@@ -612,6 +614,7 @@ class Proxy:
                 )
             except Exception as e:
                 upstream_failed = True
+                flow._upstream_error = e
                 # put this server/host onto the ban list, so we don't have to
                 # wait for the timeout to happen in subsequent requests
                 with ctx._lock:
@@ -640,15 +643,31 @@ class Proxy:
         # return a 504 HTTP error
         if upstream_failed:
             flow._save_response = False
-            flow.response = http.Response.make(
-                504,
-                b"""<html>
+            if isinstance(flow._upstream_error, requests.exceptions.SSLError):
+                detail = str(flow._upstream_error) if flow._upstream_error else "unknown"
+                flow.response = http.Response.make(
+                    502,
+                    f"""<html>
+<head><title>502 Bad Gateway</title></head>
+<body>
+<center><h1>502 Bad Gateway</h1></center>
+<p>Upstream TLS certificate verification failed.</p>
+<pre>{detail}</pre>
+</body>
+    </html>""".encode("utf-8"),
+                    {"Content-Type": "text/html"},
+                )
+            else:
+                flow.response = http.Response.make(
+                    504,
+                    b"""<html>
 <head><title>504 Gateway Time-out</title></head>
 <body>
 <center><h1>504 Gateway Time-out</h1></center>
 </body>
 </html>""",
-                {"Content-Type": "text/html"})
+                    {"Content-Type": "text/html"},
+                )
             return
 
         if (http_2xx(flow._cache_head) and cached_method
