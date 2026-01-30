@@ -1,5 +1,4 @@
 # redirects
-# Cache-control
 # handle upstream authentication
 # collect and expose metrics/stats (with limited number of entries), like top list for misses, hits, etc.
 
