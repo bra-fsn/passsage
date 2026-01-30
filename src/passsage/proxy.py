@@ -424,8 +424,8 @@ class Proxy:
         loader.add_option(
             name="default_policy",
             typespec=str,
-            default="Modified",
-            help="Default policy when no rule matches (e.g. Modified, MissingCached)",
+            default="MissingCached",
+            help="Default policy when no rule matches (e.g. MissingCached, Modified)",
         )
         loader.add_option(
             name="upstream_head_timeout",
