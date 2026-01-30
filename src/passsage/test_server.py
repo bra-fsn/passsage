@@ -105,6 +105,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond_cache_control(case, send_body)
             return
 
+        if path.startswith("/stream/"):
+            size_str = path.split("/stream/", 1)[1] or "0"
+            size_bytes = int(size_str)
+            bandwidth = None
+            if "bandwidth" in query:
+                try:
+                    bandwidth = float(query.get("bandwidth", ["0"])[0])
+                except (TypeError, ValueError):
+                    bandwidth = None
+            self._respond_stream(size_bytes, bandwidth, send_body)
+            return
+
         if path == "/stats":
             payload = json.dumps(self.server.state.snapshot()).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -183,6 +195,31 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if send_body:
             self.wfile.write(body)
+
+    def _respond_stream(self, size_bytes: int, bandwidth: float | None, send_body: bool) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size_bytes))
+        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
+        self.send_header("ETag", f"\"stream-{size_bytes}\"")
+        self.send_header("Cache-Control", "public, max-age=60")
+        self.end_headers()
+        if not send_body:
+            return
+        chunk_size = 64 * 1024
+        chunk = b"0" * chunk_size
+        remaining = size_bytes
+        if bandwidth is not None and bandwidth <= 0:
+            bandwidth = None
+        try:
+            while remaining > 0:
+                to_send = min(chunk_size, remaining)
+                self.wfile.write(chunk[:to_send])
+                remaining -= to_send
+                if bandwidth:
+                    time.sleep(to_send / bandwidth)
+        except BrokenPipeError:
+            return
 
     def _respond_text(self, status: int | HTTPStatus, text: str, send_body: bool) -> None:
         body = text.encode("utf-8")
