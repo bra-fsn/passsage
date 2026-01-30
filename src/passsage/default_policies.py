@@ -15,11 +15,8 @@ def default_rules() -> list["Rule"]:
     """
     from passsage.policy import (
         AlwaysCached,
-        AlwaysUpstream,
         HostContainsRule,
         HostPrefixRule,
-        MissingCached,
-        Modified,
         NoCache,
         PathContainsRule,
         RegexRule,
@@ -29,11 +26,6 @@ def default_rules() -> list["Rule"]:
     return [
         SuffixRule(".deb", AlwaysCached),
         HostPrefixRule("169.254.169.", NoCache),
-        PathContainsRule("/policy/AlwaysCached", AlwaysCached),
-        PathContainsRule("/policy/AlwaysUpstream", AlwaysUpstream),
-        PathContainsRule("/policy/Modified", Modified),
-        PathContainsRule("/policy/NoCache", NoCache),
-        PathContainsRule("/policy/MissingCached", MissingCached),
         HostContainsRule("amazonaws.com", NoCache, exclude="codeartifact"),
         PathContainsRule("/mitm.it/", NoCache),
         PathContainsRule("mran.microsoft.com/snapshot/", AlwaysCached),

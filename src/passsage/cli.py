@@ -70,6 +70,12 @@ import click
     envvar="PASSAGE_POLICY_FILE",
     help="Path to Python file defining policy overrides (env: PASSAGE_POLICY_FILE)"
 )
+@click.option(
+    "--allow-policy-header",
+    is_flag=True,
+    default=False,
+    help="Allow client policy override via X-Passsage-Policy"
+)
 @click.version_option()
 def main(
     port,
@@ -83,6 +89,7 @@ def main(
     debug_proxy,
     web,
     policy_file,
+    allow_policy_header,
 ):
     """
     Passsage (Pas³age) - S3-backed caching proxy.
@@ -111,6 +118,8 @@ def main(
         os.environ["S3_ENDPOINT_URL"] = s3_endpoint
     if policy_file:
         os.environ["PASSAGE_POLICY_FILE"] = policy_file
+    if allow_policy_header:
+        os.environ["PASSAGE_ALLOW_POLICY_HEADER"] = "1"
 
     if debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -141,6 +150,8 @@ def main(
         args.extend(["--mode", mode])
     if policy_file:
         args.extend(["--set", f"policy_file={policy_file}"])
+    if allow_policy_header:
+        args.extend(["--set", "allow_policy_header=true"])
 
     if verbose:
         args.extend(["-v"])
