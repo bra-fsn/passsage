@@ -37,6 +37,7 @@ SERVER_NAME = "passsage"
 SERVER_VERSION = __version__
 _VIA_HOSTNAME = (socket.gethostname() or SERVER_NAME).strip() or SERVER_NAME
 VIA_HEADER_VALUE = f"1.1 {_VIA_HOSTNAME} ({SERVER_NAME}/{SERVER_VERSION})"
+POLICY_HEADER = "X-Passsage-Policy"
 
 _S3_ENDPOINT = os.environ.get("S3_ENDPOINT_URL")
 S3_BUCKET = os.environ.get("S3_BUCKET", "364189071156-ds-proxy-us-west-2") if not _S3_ENDPOINT else os.environ.get("S3_BUCKET", "proxy-cache")
@@ -65,6 +66,7 @@ from passsage.policy import (
     Modified,
     NoCache,
     Policy,
+    POLICY_BY_NAME,
     get_default_resolver,
     policy_from_name,
     PolicyResolver,
@@ -158,6 +160,18 @@ def save_response(proxy, flow, data: bytes) -> Union[bytes, Iterable[bytes]]:
 
 
 def get_policy(flow):
+    if (
+        flow.request.headers
+        and hasattr(ctx, "options")
+        and getattr(ctx.options, "allow_policy_header", False)
+    ):
+        policy_name = flow.request.headers.get(POLICY_HEADER)
+        if policy_name:
+            policy = POLICY_BY_NAME.get(policy_name.strip().lower())
+            if policy:
+                LOG.debug("Policy header override=%s", policy_name)
+                return policy
+            LOG.warning("Unknown policy header override=%s", policy_name)
     request_ctx = Context(
         url=flow.request.url,
         method=flow.request.method,
@@ -421,6 +435,12 @@ class Proxy:
             typespec=str,
             default=os.environ.get("PASSAGE_POLICY_FILE", ""),
             help="Path to a Python file defining policy overrides",
+        )
+        loader.add_option(
+            name="allow_policy_header",
+            typespec=bool,
+            default=bool(os.environ.get("PASSAGE_ALLOW_POLICY_HEADER")),
+            help="Allow client policy override via X-Passsage-Policy",
         )
 
     def configure(self, updated):
