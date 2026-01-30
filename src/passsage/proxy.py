@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import re
+import ssl
 import socket
 import tempfile
 import threading
@@ -92,6 +93,15 @@ def get_s3_client(tls=threading.local()):
             kwargs["config"] = Config(s3={"addressing_style": "path"})
         tls.s3 = boto3.session.Session().client("s3", **kwargs)
         return tls.s3
+
+
+def _is_tls_verify_error(err: Exception | None) -> bool:
+    if err is None:
+        return False
+    if isinstance(err, (requests.exceptions.SSLError, ssl.SSLError)):
+        return True
+    message = str(err).lower()
+    return "certificate verify failed" in message or "tls" in message
 
 
 def _load_policy_module(path: str):
@@ -643,7 +653,7 @@ class Proxy:
         # return a 504 HTTP error
         if upstream_failed:
             flow._save_response = False
-            if isinstance(flow._upstream_error, requests.exceptions.SSLError):
+            if _is_tls_verify_error(flow._upstream_error):
                 detail = str(flow._upstream_error) if flow._upstream_error else "unknown"
                 flow.response = http.Response.make(
                     502,

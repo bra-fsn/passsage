@@ -425,4 +425,4 @@ class TestProxyLive:
     def test_tls_expired_cert_rejected(self, proxy_session):
         # Ensures expired upstream certificates are rejected.
         resp = proxy_session.get("https://expired.badssl.com/", timeout=30)
-        assert resp.status_code == 504
+        assert resp.status_code == 502
