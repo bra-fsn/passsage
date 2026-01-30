@@ -202,7 +202,10 @@ class PolicyResolver:
     __slots__ = ("_rules", "_prefix_rules", "_default_policy")
 
     def __init__(
-        self, rules: Optional[Sequence[Rule]] = None, *, default_policy: type[Policy] = Modified
+        self,
+        rules: Optional[Sequence[Rule]] = None,
+        *,
+        default_policy: type[Policy] = MissingCached,
     ) -> None:
         if rules is None:
             rules = default_rules()
@@ -269,5 +272,5 @@ POLICY_BY_NAME = {
 }
 
 
-def policy_from_name(name: str, *, default: type[Policy] = Modified) -> type[Policy]:
+def policy_from_name(name: str, *, default: type[Policy] = MissingCached) -> type[Policy]:
     return POLICY_BY_NAME.get(name.strip().lower(), default)
