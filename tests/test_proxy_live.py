@@ -406,3 +406,23 @@ class TestProxyLive:
         )
         assert r1.ok and r2.ok
         assert_cached_response(r2)
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://sha256.badssl.com/",
+            "https://ecc384.badssl.com/",
+            "https://rsa4096.badssl.com/",
+        ],
+    )
+    def test_tls_connectivity_through_proxy(self, proxy_session, url):
+        # Ensures TLS sites are reachable through the proxy with mitm cert.
+        resp = proxy_session.get(url, timeout=30)
+        resp.raise_for_status()
+
+    @pytest.mark.integration
+    def test_tls_expired_cert_rejected(self, proxy_session):
+        # Ensures expired upstream certificates are rejected.
+        resp = proxy_session.get("https://expired.badssl.com/", timeout=30)
+        assert resp.status_code == 504
