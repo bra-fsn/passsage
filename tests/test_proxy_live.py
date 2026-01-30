@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
+import psutil
 import requests
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -48,6 +49,13 @@ def build_proxy_session(cert_path: str) -> requests.Session:
     session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
     session.verify = cert_path
     return session
+
+
+def get_available_memory_bytes() -> int | None:
+    try:
+        return int(psutil.virtual_memory().total)
+    except (ValueError, TypeError):
+        return None
 
 
 @pytest.fixture(scope="session")
@@ -329,6 +337,23 @@ class TestProxyLive:
         assert get_method_count(stats, "/cache-control/max-age-low", "GET") == 1
         assert get_method_count(stats, "/cache-control/max-age-low", "HEAD") == 2
         assert_cached_response(r2)
+
+    @pytest.mark.slow
+    def test_huge_streaming_body_no_oom(self, proxy_session, test_server, cache_bust_random):
+        # Ensures large streaming responses do not require holding full body in memory.
+        test_server.reset()
+        available_bytes = get_available_memory_bytes()
+        if not available_bytes:
+            pytest.skip("Unable to read MemAvailable from /proc/meminfo")
+        size_bytes = available_bytes * 2
+        url = test_server.url(f"/stream/{size_bytes}?random={cache_bust_random}")
+        resp = proxy_get(proxy_session, url, timeout=120, stream=True)
+        resp.raise_for_status()
+        received = 0
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                received += len(chunk)
+        assert received == size_bytes
 
     def test_cache_control_expires(self, proxy_session, test_server, cache_bust_random):
         # Ensures Expires header is honored for cache freshness.
