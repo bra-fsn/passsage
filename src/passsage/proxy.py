@@ -641,13 +641,12 @@ class Proxy:
                 cache_redirect(flow)
                 return
 
-        # On any upstream errors or if it's banned, return the cached version if exists.
+        # On upstream errors or if it's banned, MissingCached may serve cached content.
         if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
-            if http_2xx(flow._cache_head) and cached_method:
-                if policy in (AlwaysCached, AlwaysUpstream, Modified, MissingCached):
-                    LOG.debug("Upstream failed -> cache_redirect")
-                    cache_redirect(flow)
-                    return
+            if http_2xx(flow._cache_head) and cached_method and policy == MissingCached:
+                LOG.debug("Upstream failed -> cache_redirect (MissingCached)")
+                cache_redirect(flow)
+                return
 
         # If upstream didn't respond (or banned) and we have a cache miss,
         # return a 504 HTTP error
@@ -680,8 +679,11 @@ class Proxy:
                 )
             return
 
-        if (http_2xx(flow._cache_head) and cached_method
-                and policy in (Modified, MissingCached)):
+        if (http_2xx(flow._cache_head)
+                and cached_method
+                and policy in (Modified, MissingCached)
+                and flow._upstream_head
+                and (http_2xx(flow._upstream_head) or flow._upstream_head.status_code == 304)):
             # if any of lastmod or etag changed, we must re-fetch the object,
             # otherwise return the stored variant (revalidated)
             if not (flow._upstream_head.headers.get("last-modified")
@@ -766,10 +768,12 @@ class Proxy:
                     continue
                 extras["Metadata"][f"header-{k}"] = headers[k]
             # map HTTP headers to AWS S3 ExtraArgs
-            m = {"content-type": "ContentType",
-                 "cache-control": "CacheControl",
-                 "expires": "Expires",
-                 }
+            m = {
+                "content-type": "ContentType",
+                "content-encoding": "ContentEncoding",
+                "cache-control": "CacheControl",
+                "expires": "Expires",
+            }
             for header, aws_key in m.items():
                 if header in headers:
                     extras[aws_key] = headers[header]
