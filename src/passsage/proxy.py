@@ -7,11 +7,12 @@ import hashlib
 import logging
 import os
 import re
-import ssl
 import socket
+import ssl
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable, Union
@@ -21,10 +22,22 @@ import boto3
 import pytz
 import requests
 from cachetools import TTLCache
-from concurrent.futures import ThreadPoolExecutor
-from mitmproxy import http, ctx
+from mitmproxy import ctx, http
 from mitmproxy.script import concurrent
 from werkzeug.http import parse_date
+
+from passsage.policy import (
+    POLICY_BY_NAME,
+    AlwaysCached,
+    Context,
+    MissingCached,
+    Modified,
+    NoCache,
+    PolicyResolver,
+    get_default_resolver,
+    policy_from_name,
+    set_default_resolver,
+)
 
 try:
     from passsage import __version__
@@ -56,22 +69,6 @@ else:
     S3_PATH_STYLE = False
 CACHE_TIMEOUT = 10
 UPSTREAM_TIMEOUT = 10
-
-
-from passsage.policy import (
-    AlwaysCached,
-    AlwaysUpstream,
-    Context,
-    MissingCached,
-    Modified,
-    NoCache,
-    Policy,
-    POLICY_BY_NAME,
-    get_default_resolver,
-    policy_from_name,
-    PolicyResolver,
-    set_default_resolver,
-)
 
 
 def get_s3_client(tls=threading.local()):
