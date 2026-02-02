@@ -54,6 +54,13 @@ class _TestState:
                 "delay": delay,
             }
 
+    def set_path_override(self, path: str, *, status: int | None = None, delay: float | None = None) -> None:
+        with self.lock:
+            self.policy_overrides[path] = {
+                "status": status,
+                "delay": delay,
+            }
+
 
 class _Handler(BaseHTTPRequestHandler):
     server: "_TestHTTPServer"
@@ -158,8 +165,14 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _respond_cache_control(self, case: str, send_body: bool) -> None:
+        path = f"/cache-control/{case}"
+        override = self.server.state.policy_overrides.get(path, {})
+        delay = override.get("delay")
+        if delay:
+            time.sleep(delay)
+        status = override.get("status") or HTTPStatus.OK
         body = f"cache-control {case}".encode("utf-8")
-        self.send_response(HTTPStatus.OK)
+        self.send_response(status)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
@@ -294,3 +307,8 @@ class TestServer:
         if self._server is None:
             raise RuntimeError("Server not started")
         self._server.state.set_policy_override(policy_name, status=status, delay=delay)
+
+    def set_path_override(self, path: str, *, status: int | None = None, delay: float | None = None) -> None:
+        if self._server is None:
+            raise RuntimeError("Server not started")
+        self._server.state.set_path_override(path, status=status, delay=delay)
