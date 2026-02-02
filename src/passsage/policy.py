@@ -25,20 +25,20 @@ class NoCache(Policy):
     pass
 
 
-class AlwaysCached(Policy):
-    """Serve from cache without checking upstream; if missing, fetch from upstream."""
+class NoRefresh(Policy):
+    """Serve from cache without revalidation; fetch from upstream only on miss."""
 
     pass
 
 
-class MissingCached(Policy):
-    """HEAD first; if upstream returns any kind of failure (404, 500, timeout etc.), serve from cache."""
+class StaleIfError(Policy):
+    """Revalidate when stale; serve cached content on upstream errors (including 404/5xx/timeout)."""
 
     pass
 
 
-class Modified(Policy):
-    """HEAD first; compare last-modified with cache; if unchanged, serve from cache."""
+class Standard(Policy):
+    """RFC 9111 compliant caching and revalidation; serve errors if upstream fails."""
 
     pass
 
@@ -205,7 +205,7 @@ class PolicyResolver:
         self,
         rules: Optional[Sequence[Rule]] = None,
         *,
-        default_policy: type[Policy] = MissingCached,
+        default_policy: type[Policy] = Standard,
     ) -> None:
         if rules is None:
             rules = default_rules()
@@ -265,12 +265,12 @@ def resolve_policy(
 
 POLICY_BY_NAME = {
     "nocache": NoCache,
-    "alwayscached": AlwaysCached,
-    "missingcached": MissingCached,
-    "modified": Modified,
+    "norefresh": NoRefresh,
+    "staleiferror": StaleIfError,
+    "standard": Standard,
     "alwaysupstream": AlwaysUpstream,
 }
 
 
-def policy_from_name(name: str, *, default: type[Policy] = MissingCached) -> type[Policy]:
+def policy_from_name(name: str, *, default: type[Policy] = Standard) -> type[Policy]:
     return POLICY_BY_NAME.get(name.strip().lower(), default)

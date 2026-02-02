@@ -117,6 +117,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond_cache_control(case, send_body)
             return
 
+        if path == "/redirect":
+            self._respond_redirect(send_body)
+            return
+
+        if path == "/headers":
+            self._respond_headers(send_body)
+            return
+
         if path.startswith("/stream/"):
             size_str = path.split("/stream/", 1)[1] or "0"
             size_bytes = int(size_str)
@@ -195,6 +203,10 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Expires", _httpdate(exp))
         elif case == "private":
             self.send_header("Cache-Control", "private, max-age=60")
+        elif case == "stale-if-error":
+            self.send_header("Cache-Control", "max-age=1, stale-if-error=60")
+        elif case == "stale-while-revalidate":
+            self.send_header("Cache-Control", "max-age=1, stale-while-revalidate=60")
         self.end_headers()
         if send_body:
             self.wfile.write(body)
@@ -225,6 +237,32 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "public, max-age=3600")
         self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
         self.send_header("ETag", "\"encoding-gzip\"")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def _respond_redirect(self, send_body: bool) -> None:
+        self.send_response(HTTPStatus.FOUND)
+        self.send_header("Location", "/redirect-target")
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Cache-Control", "public, max-age=3600")
+        body = b"redirect"
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def _respond_headers(self, send_body: bool) -> None:
+        body = b"headers"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Language", "en")
+        self.send_header("Content-Disposition", "inline")
+        self.send_header("Content-Location", "/headers")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Link", '</style.css>; rel="preload"; as="style"')
+        self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
         if send_body:
             self.wfile.write(body)

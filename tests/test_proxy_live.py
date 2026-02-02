@@ -126,11 +126,12 @@ def get_cached_without_upstream(
     timeout: int = 30,
     retries: int = 5,
     sleep_seconds: float = 0.5,
+    **kwargs,
 ) -> requests.Response:
     last_resp = None
     for _ in range(retries):
         before = get_method_count(test_server.stats(), path, "GET")
-        last_resp = proxy_get(session, url, headers=headers, timeout=timeout)
+        last_resp = proxy_get(session, url, headers=headers, timeout=timeout, **kwargs)
         after = get_method_count(test_server.stats(), path, "GET")
         if "Cache-Status" in last_resp.headers and after == before:
             return last_resp
@@ -164,34 +165,34 @@ class TestProxyLive:
                 f"request {i+1} took {elapsed:.1f}s; expected < {CONCURRENT_MAX_RESPONSE_TIME}s"
             )
 
-    def test_policy_always_cached(self, proxy_session, test_server, cache_bust_random):
-        # Ensures AlwaysCached serves from cache after the first request.
+    def test_policy_no_refresh(self, proxy_session, test_server, cache_bust_random):
+        # Ensures NoRefresh serves from cache after the first request.
         test_server.reset()
-        url = test_server.url(f"/policy/AlwaysCached?random={cache_bust_random}")
-        r1 = proxy_get(proxy_session, url, headers=policy_headers("AlwaysCached"), timeout=30)
+        url = test_server.url(f"/policy/NoRefresh?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("NoRefresh"), timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
         r2 = get_cached_without_upstream(
             proxy_session,
             url,
             test_server,
-            "/policy/AlwaysCached",
-            headers=policy_headers("AlwaysCached"),
+            "/policy/NoRefresh",
+            headers=policy_headers("NoRefresh"),
         )
         assert r1.ok and r2.ok
         assert_cached_response(r2)
 
-    def test_policy_modified(self, proxy_session, test_server, cache_bust_random):
-        # Ensures Modified reuses cached content when upstream is unchanged.
+    def test_policy_standard(self, proxy_session, test_server, cache_bust_random):
+        # Ensures Standard reuses cached content when upstream is unchanged.
         test_server.reset()
-        url = test_server.url(f"/policy/Modified?random={cache_bust_random}")
-        r1 = proxy_get(proxy_session, url, headers=policy_headers("Modified"), timeout=30)
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
         r2 = get_cached_without_upstream(
             proxy_session,
             url,
             test_server,
-            "/policy/Modified",
-            headers=policy_headers("Modified"),
+            "/policy/Standard",
+            headers=policy_headers("Standard"),
         )
         assert r1.ok and r2.ok
         assert_cached_response(r2)
@@ -218,94 +219,94 @@ class TestProxyLive:
         assert get_method_count(stats, "/policy/AlwaysUpstream", "GET") == 2
         assert "Cache-Status" not in r2.headers
 
-    def test_policy_missing_cached_404(self, proxy_session, test_server, cache_bust_random):
-        # Ensures MissingCached serves cached content on upstream 404.
+    def test_policy_stale_if_error_404(self, proxy_session, test_server, cache_bust_random):
+        # Ensures StaleIfError serves cached content on upstream 404.
         test_server.reset()
-        url = test_server.url(f"/policy/MissingCached?random={cache_bust_random}")
-        r1 = proxy_get(proxy_session, url, headers=policy_headers("MissingCached"), timeout=30)
+        url = test_server.url(f"/policy/StaleIfError?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("StaleIfError"), timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
         _ = get_cached_without_upstream(
             proxy_session,
             url,
             test_server,
-            "/policy/MissingCached",
-            headers=policy_headers("MissingCached"),
+            "/policy/StaleIfError",
+            headers=policy_headers("StaleIfError"),
         )
-        test_server.set_policy_override("MissingCached", status=404)
+        test_server.set_policy_override("StaleIfError", status=404)
         r2 = get_cached_without_upstream(
             proxy_session,
             url,
             test_server,
-            "/policy/MissingCached",
-            headers=policy_headers("MissingCached"),
+            "/policy/StaleIfError",
+            headers=policy_headers("StaleIfError"),
         )
         assert r1.ok and r2.ok
         assert_cached_response(r2)
 
-    def test_policy_missing_cached_500(self, proxy_session, test_server, cache_bust_random):
-        # Ensures MissingCached serves cached content on upstream 500.
+    def test_policy_stale_if_error_500(self, proxy_session, test_server, cache_bust_random):
+        # Ensures StaleIfError serves cached content on upstream 500.
         test_server.reset()
-        url = test_server.url(f"/policy/MissingCached?random={cache_bust_random}")
-        r1 = proxy_get(proxy_session, url, headers=policy_headers("MissingCached"), timeout=30)
+        url = test_server.url(f"/policy/StaleIfError?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("StaleIfError"), timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
         _ = get_cached_without_upstream(
             proxy_session,
             url,
             test_server,
-            "/policy/MissingCached",
-            headers=policy_headers("MissingCached"),
+            "/policy/StaleIfError",
+            headers=policy_headers("StaleIfError"),
         )
-        test_server.set_policy_override("MissingCached", status=500)
+        test_server.set_policy_override("StaleIfError", status=500)
         r2 = get_cached_without_upstream(
             proxy_session,
             url,
             test_server,
-            "/policy/MissingCached",
-            headers=policy_headers("MissingCached"),
+            "/policy/StaleIfError",
+            headers=policy_headers("StaleIfError"),
         )
         assert r1.ok and r2.ok
         assert_cached_response(r2)
 
     @pytest.mark.slow
-    def test_policy_missing_cached_timeout(self, proxy_session, test_server, cache_bust_random):
-        # Ensures MissingCached serves cached content on upstream timeout.
+    def test_policy_stale_if_error_timeout(self, proxy_session, test_server, cache_bust_random):
+        # Ensures StaleIfError serves cached content on upstream timeout.
         test_server.reset()
-        url = test_server.url(f"/policy/MissingCached?random={cache_bust_random}")
-        r1 = proxy_get(proxy_session, url, headers=policy_headers("MissingCached"), timeout=30)
+        url = test_server.url(f"/policy/StaleIfError?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("StaleIfError"), timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
         _ = get_cached_without_upstream(
             proxy_session,
             url,
             test_server,
-            "/policy/MissingCached",
-            headers=policy_headers("MissingCached"),
+            "/policy/StaleIfError",
+            headers=policy_headers("StaleIfError"),
         )
-        test_server.set_policy_override("MissingCached", delay=15)
+        test_server.set_policy_override("StaleIfError", delay=15)
         r2 = get_cached_without_upstream(
             proxy_session,
             url,
             test_server,
-            "/policy/MissingCached",
-            headers=policy_headers("MissingCached"),
+            "/policy/StaleIfError",
+            headers=policy_headers("StaleIfError"),
         )
         assert r1.ok and r2.ok
         assert_cached_response(r2)
 
-    def test_missing_cached_fallback_on_expired_upstream_failure(
+    def test_stale_if_error_fallback_on_expired_upstream_failure(
         self, proxy_session, test_server, cache_bust_random
     ):
-        # Ensures MissingCached serves stale cache on upstream failure while others return errors.
+        # Ensures StaleIfError serves stale cache on upstream failure while others return errors.
         test_server.reset()
         case_random = uuid.uuid4().hex
         url = test_server.url(
             f"/cache-control/max-age-low?random={cache_bust_random}&case={case_random}"
         )
-        r1 = proxy_get(proxy_session, url, headers=policy_headers("MissingCached"), timeout=30)
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("StaleIfError"), timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
         cached = get_cached_without_upstream(
             proxy_session,
             url,
-            headers=policy_headers("AlwaysCached"),
+            headers=policy_headers("StaleIfError"),
             test_server=test_server,
             path="/cache-control/max-age-low",
             retries=10,
@@ -314,14 +315,14 @@ class TestProxyLive:
         assert "Cache-Status" in cached.headers
         time.sleep(SYNC_SETTLE_SECONDS + 2)
         test_server.set_path_override("/cache-control/max-age-low", status=500)
-        r2 = proxy_get(proxy_session, url, headers=policy_headers("MissingCached"), timeout=30)
+        r2 = proxy_get(proxy_session, url, headers=policy_headers("StaleIfError"), timeout=30)
         assert r1.ok and r2.ok
         assert_cached_response(r2)
 
         stats = test_server.stats()
         before_get = get_method_count(stats, "/cache-control/max-age-low", "GET")
         before_head = get_method_count(stats, "/cache-control/max-age-low", "HEAD")
-        r3 = proxy_get(proxy_session, url, headers=policy_headers("AlwaysCached"), timeout=30)
+        r3 = proxy_get(proxy_session, url, headers=policy_headers("NoRefresh"), timeout=30)
         stats = test_server.stats()
         after_get = get_method_count(stats, "/cache-control/max-age-low", "GET")
         after_head = get_method_count(stats, "/cache-control/max-age-low", "HEAD")
@@ -330,7 +331,7 @@ class TestProxyLive:
         assert after_get == before_get
         assert after_head == before_head
 
-        for policy_name in ("Modified", "AlwaysUpstream", "NoCache"):
+        for policy_name in ("Standard", "AlwaysUpstream", "NoCache"):
             resp = proxy_get(proxy_session, url, headers=policy_headers(policy_name), timeout=30)
             assert resp.status_code == 500
             assert "Cache-Status" not in resp.headers
@@ -357,6 +358,25 @@ class TestProxyLive:
         assert r1.ok and r2.ok
         assert_cached_response(r2)
 
+    def test_request_no_cache_revalidates(self, proxy_session, test_server, cache_bust_random):
+        # Ensures request Cache-Control: no-cache forces revalidation.
+        test_server.reset()
+        url = test_server.url(f"/cache-control/max-age?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS)
+        stats = test_server.stats()
+        before_head = get_method_count(stats, "/cache-control/max-age", "HEAD")
+        r2 = proxy_get(
+            proxy_session,
+            url,
+            headers={"Cache-Control": "no-cache"},
+            timeout=30,
+        )
+        stats = test_server.stats()
+        after_head = get_method_count(stats, "/cache-control/max-age", "HEAD")
+        assert r1.ok and r2.ok
+        assert after_head == before_head + 1
+
     def test_cache_control_max_age(self, proxy_session, test_server, cache_bust_random):
         # Ensures Cache-Control: max-age keeps cached content fresh.
         test_server.reset()
@@ -376,14 +396,90 @@ class TestProxyLive:
         url = test_server.url(
             f"/cache-control/max-age-low?random={cache_bust_random}&case={case_random}"
         )
-        r1 = proxy_get(proxy_session, url, headers=policy_headers("Modified"), timeout=30)
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS + 2)
-        r2 = proxy_get(proxy_session, url, headers=policy_headers("Modified"), timeout=30)
+        r2 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
         assert r1.ok and r2.ok
         stats = test_server.stats()
         assert get_method_count(stats, "/cache-control/max-age-low", "GET") == 1
         assert get_method_count(stats, "/cache-control/max-age-low", "HEAD") == 2
         assert_cached_response(r2)
+
+    def test_cached_redirect_preserves_status_and_location(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        # Ensures cached redirects preserve status code and Location header.
+        test_server.reset()
+        url = test_server.url(f"/redirect?random={cache_bust_random}")
+        r1 = proxy_get(
+            proxy_session, url, headers=policy_headers("Standard"), timeout=30, allow_redirects=False
+        )
+        time.sleep(SYNC_SETTLE_SECONDS)
+        r2 = get_cached_without_upstream(
+            proxy_session,
+            url,
+            test_server,
+            "/redirect",
+            headers=policy_headers("Standard"),
+            timeout=30,
+            allow_redirects=False,
+        )
+        assert r1.status_code == 302
+        assert r2.status_code == 302
+        assert r2.headers.get("Location") == "/redirect-target"
+        assert_cached_response(r2)
+
+    def test_cached_headers_preserved(self, proxy_session, test_server, cache_bust_random):
+        # Ensures cached hits preserve key response headers.
+        test_server.reset()
+        url = test_server.url(f"/headers?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS)
+        r2 = get_cached_without_upstream(
+            proxy_session,
+            url,
+            test_server,
+            "/headers",
+            headers=policy_headers("Standard"),
+        )
+        assert r1.ok and r2.ok
+        assert r2.headers.get("Content-Language") == "en"
+        assert r2.headers.get("Content-Disposition") == "inline"
+        assert r2.headers.get("Content-Location") == "/headers"
+        assert r2.headers.get("Accept-Ranges") == "bytes"
+        assert r2.headers.get("Link") == '</style.css>; rel="preload"; as="style"'
+        assert_cached_response(r2)
+
+    def test_standard_stale_if_error_directive(self, proxy_session, test_server, cache_bust_random):
+        # Ensures stale-if-error allows Standard to serve stale cache on upstream failure.
+        test_server.reset()
+        url = test_server.url(f"/cache-control/stale-if-error?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+        test_server.set_path_override("/cache-control/stale-if-error", status=500)
+        r2 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert r1.ok and r2.ok
+        assert_cached_response(r2)
+
+    def test_standard_stale_while_revalidate_directive(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        # Ensures stale-while-revalidate allows serving stale cache without upstream fetch.
+        test_server.reset()
+        url = test_server.url(f"/cache-control/stale-while-revalidate?random={cache_bust_random}")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+        stats = test_server.stats()
+        before_get = get_method_count(stats, "/cache-control/stale-while-revalidate", "GET")
+        before_head = get_method_count(stats, "/cache-control/stale-while-revalidate", "HEAD")
+        r2 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        stats = test_server.stats()
+        after_get = get_method_count(stats, "/cache-control/stale-while-revalidate", "GET")
+        after_head = get_method_count(stats, "/cache-control/stale-while-revalidate", "HEAD")
+        assert r1.ok and r2.ok
+        assert_cached_response(r2)
+        assert after_get == before_get
+        assert after_head == before_head
 
     @pytest.mark.slow
     def test_huge_streaming_body_no_oom(self, proxy_session, test_server, cache_bust_random):
