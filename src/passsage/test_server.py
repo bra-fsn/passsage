@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import threading
 import time
@@ -107,6 +108,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond_vary_accept_encoding(send_body)
             return
 
+        if path.startswith("/encoding/gzip"):
+            self._respond_gzip_json(send_body)
+            return
+
         if path.startswith("/cache-control/"):
             case = path.split("/cache-control/", 1)[1] or ""
             self._respond_cache_control(case, send_body)
@@ -205,6 +210,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Vary", "Accept-Encoding")
         self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def _respond_gzip_json(self, send_body: bool) -> None:
+        payload = json.dumps({"status": "ok", "encoding": "gzip"}).encode("utf-8")
+        body = gzip.compress(payload)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
+        self.send_header("ETag", "\"encoding-gzip\"")
         self.end_headers()
         if send_body:
             self.wfile.write(body)

@@ -291,6 +291,50 @@ class TestProxyLive:
         assert r1.ok and r2.ok
         assert_cached_response(r2)
 
+    def test_missing_cached_fallback_on_expired_upstream_failure(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        # Ensures MissingCached serves stale cache on upstream failure while others return errors.
+        test_server.reset()
+        case_random = uuid.uuid4().hex
+        url = test_server.url(
+            f"/cache-control/max-age-low?random={cache_bust_random}&case={case_random}"
+        )
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("MissingCached"), timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS)
+        cached = get_cached_without_upstream(
+            proxy_session,
+            url,
+            headers=policy_headers("AlwaysCached"),
+            test_server=test_server,
+            path="/cache-control/max-age-low",
+            retries=10,
+            sleep_seconds=SYNC_SETTLE_SECONDS,
+        )
+        assert "Cache-Status" in cached.headers
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+        test_server.set_path_override("/cache-control/max-age-low", status=500)
+        r2 = proxy_get(proxy_session, url, headers=policy_headers("MissingCached"), timeout=30)
+        assert r1.ok and r2.ok
+        assert_cached_response(r2)
+
+        stats = test_server.stats()
+        before_get = get_method_count(stats, "/cache-control/max-age-low", "GET")
+        before_head = get_method_count(stats, "/cache-control/max-age-low", "HEAD")
+        r3 = proxy_get(proxy_session, url, headers=policy_headers("AlwaysCached"), timeout=30)
+        stats = test_server.stats()
+        after_get = get_method_count(stats, "/cache-control/max-age-low", "GET")
+        after_head = get_method_count(stats, "/cache-control/max-age-low", "HEAD")
+        assert r3.ok
+        assert_cached_response(r3)
+        assert after_get == before_get
+        assert after_head == before_head
+
+        for policy_name in ("Modified", "AlwaysUpstream", "NoCache"):
+            resp = proxy_get(proxy_session, url, headers=policy_headers(policy_name), timeout=30)
+            assert resp.status_code == 500
+            assert "Cache-Status" not in resp.headers
+
     def test_cache_control_no_store(self, proxy_session, test_server, cache_bust_random):
         # Ensures Cache-Control: no-store prevents caching.
         test_server.reset()
@@ -328,10 +372,13 @@ class TestProxyLive:
     def test_cache_control_max_age_expires(self, proxy_session, test_server, cache_bust_random):
         # Ensures Cache-Control: max-age expiry triggers revalidation.
         test_server.reset()
-        url = test_server.url(f"/cache-control/max-age-low?random={cache_bust_random}")
-        r1 = proxy_get(proxy_session, url, timeout=30)
+        case_random = uuid.uuid4().hex
+        url = test_server.url(
+            f"/cache-control/max-age-low?random={cache_bust_random}&case={case_random}"
+        )
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Modified"), timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS + 2)
-        r2 = proxy_get(proxy_session, url, timeout=30)
+        r2 = proxy_get(proxy_session, url, headers=policy_headers("Modified"), timeout=30)
         assert r1.ok and r2.ok
         stats = test_server.stats()
         assert get_method_count(stats, "/cache-control/max-age-low", "GET") == 1
@@ -392,6 +439,26 @@ class TestProxyLive:
         assert r3.ok and r4.ok
         assert r3.text == "vary gzip"
         assert r4.text == "vary identity"
+
+    def test_cached_gzip_content_encoding(self, proxy_session, test_server, cache_bust_random):
+        test_server.reset()
+        url = test_server.url(f"/encoding/gzip?random={cache_bust_random}")
+        headers = {"Accept-Encoding": "gzip"}
+        r1 = proxy_get(proxy_session, url, headers=headers, timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS)
+        r2 = get_cached_without_upstream(
+            proxy_session,
+            url,
+            test_server,
+            "/encoding/gzip",
+            headers=headers,
+        )
+        assert r1.ok and r2.ok
+        assert r2.headers.get("Content-Encoding") == "gzip"
+        assert r2.json() == {"status": "ok", "encoding": "gzip"}
+        assert_cached_response(r2)
+        stats = test_server.stats()
+        assert get_method_count(stats, "/encoding/gzip", "GET") == 1
 
     def test_refresh_pattern_override(self, proxy_session, test_server, cache_bust_random):
         # Ensures refresh_pattern overrides response headers for caching decisions.
