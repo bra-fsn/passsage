@@ -17,6 +17,7 @@ def default_rules() -> list["Rule"]:
         AlwaysCached,
         HostContainsRule,
         HostPrefixRule,
+        MissingCached,
         NoCache,
         PathContainsRule,
         RegexRule,
@@ -25,7 +26,11 @@ def default_rules() -> list["Rule"]:
 
     return [
         SuffixRule(".deb", AlwaysCached),
+        SuffixRule("/Packages", MissingCached),
+        SuffixRule("/Packages.gz", MissingCached),
+        SuffixRule("/Packages.xz", MissingCached),
         HostPrefixRule("169.254.169.", NoCache),
+        SuffixRule("/InRelease", MissingCached),
         HostContainsRule("amazonaws.com", NoCache, exclude="codeartifact"),
         PathContainsRule("/mitm.it/", NoCache),
         PathContainsRule("mran.microsoft.com/snapshot/", AlwaysCached),
