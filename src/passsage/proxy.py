@@ -28,12 +28,12 @@ from werkzeug.http import parse_date
 
 from passsage.policy import (
     POLICY_BY_NAME,
-    AlwaysCached,
     Context,
-    MissingCached,
-    Modified,
     NoCache,
+    NoRefresh,
     PolicyResolver,
+    StaleIfError,
+    Standard,
     get_default_resolver,
     policy_from_name,
     set_default_resolver,
@@ -211,6 +211,16 @@ def parse_cache_control(value: str) -> dict[str, str | bool]:
     return directives
 
 
+def parse_cache_control_seconds(cc: dict[str, str | bool], name: str) -> int | None:
+    value = cc.get(name)
+    if value is None or value is True:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class RefreshPattern:
     pattern: re.Pattern[str]
@@ -270,33 +280,156 @@ def cache_stored_at(headers: dict[str, str]) -> datetime | None:
     return None
 
 
-def cache_is_fresh(url: str, headers: dict[str, str], refresh_patterns: list[RefreshPattern]) -> bool:
-    now = datetime.now(tz=pytz.utc)
-    stored_at = cache_stored_at(headers)
-    if stored_at is None:
-        return False
+@dataclass(frozen=True)
+class CacheFreshness:
+    age_seconds: int
+    ttl_seconds: int | None
+    is_fresh: bool
+    stale_while_revalidate_seconds: int | None
+    stale_if_error_seconds: int | None
+    allow_stale_while_revalidate: bool
+    allow_stale_if_error: bool
+
+
+def cache_ttl_seconds(
+    url: str,
+    headers: dict[str, str],
+    refresh_patterns: list[RefreshPattern],
+    now: datetime,
+    stored_at: datetime,
+) -> int | None:
     for pattern in refresh_patterns:
         if pattern.pattern.search(url):
-            ttl = pattern.ttl_seconds(now, headers)
-            return (now - stored_at) < timedelta(seconds=ttl)
+            return pattern.ttl_seconds(now, headers)
     cc = parse_cache_control(headers.get("cache-control", ""))
-    if "no-store" in cc or "no-cache" in cc:
-        return False
+    if "no-store" in cc:
+        return None
+    if "no-cache" in cc:
+        return 0
+    if (s_maxage := cc.get("s-maxage")) is not None:
+        try:
+            return int(s_maxage)
+        except ValueError:
+            return None
     if (max_age := cc.get("max-age")) is not None:
         try:
-            return (now - stored_at).total_seconds() < int(max_age)
+            return int(max_age)
         except ValueError:
-            return False
+            return None
     if (exp := headers.get("expires")):
         exp_dt = parse_date(exp)
         if exp_dt:
-            return now < exp_dt
+            return max(0, int((exp_dt - stored_at).total_seconds()))
     if (lastmod := headers.get("x-amz-meta-last-modified") or headers.get("last-modified")):
         lastmod_dt = parse_date(lastmod)
         if lastmod_dt:
             lifetime = max(0, int((now - lastmod_dt).total_seconds() * 0.1))
-            return (now - stored_at) < timedelta(seconds=lifetime)
+            return lifetime
+    return None
+
+
+def cache_freshness(
+    url: str, headers: dict[str, str], refresh_patterns: list[RefreshPattern]
+) -> CacheFreshness:
+    now = datetime.now(tz=pytz.utc)
+    stored_at = cache_stored_at(headers)
+    if stored_at is None:
+        return CacheFreshness(
+            age_seconds=0,
+            ttl_seconds=None,
+            is_fresh=False,
+            stale_while_revalidate_seconds=None,
+            stale_if_error_seconds=None,
+            allow_stale_while_revalidate=False,
+            allow_stale_if_error=False,
+        )
+    age_seconds = max(0, int((now - stored_at).total_seconds()))
+    cc = parse_cache_control(headers.get("cache-control", ""))
+    ttl_seconds = cache_ttl_seconds(url, headers, refresh_patterns, now, stored_at)
+    is_fresh = ttl_seconds is not None and age_seconds < ttl_seconds
+    stale_while_revalidate_seconds = parse_cache_control_seconds(cc, "stale-while-revalidate")
+    stale_if_error_seconds = parse_cache_control_seconds(cc, "stale-if-error")
+    allow_stale_while_revalidate = False
+    if (
+        not is_fresh
+        and ttl_seconds is not None
+        and stale_while_revalidate_seconds is not None
+        and age_seconds <= ttl_seconds + stale_while_revalidate_seconds
+        and "must-revalidate" not in cc
+        and "proxy-revalidate" not in cc
+    ):
+        allow_stale_while_revalidate = True
+    allow_stale_if_error = False
+    if (
+        not is_fresh
+        and ttl_seconds is not None
+        and stale_if_error_seconds is not None
+        and age_seconds <= ttl_seconds + stale_if_error_seconds
+    ):
+        allow_stale_if_error = True
+    return CacheFreshness(
+        age_seconds=age_seconds,
+        ttl_seconds=ttl_seconds,
+        is_fresh=is_fresh,
+        stale_while_revalidate_seconds=stale_while_revalidate_seconds,
+        stale_if_error_seconds=stale_if_error_seconds,
+        allow_stale_while_revalidate=allow_stale_while_revalidate,
+        allow_stale_if_error=allow_stale_if_error,
+    )
+
+
+def request_requires_revalidation(request_headers: dict[str, str], freshness: CacheFreshness) -> bool:
+    cc = parse_cache_control(request_headers.get("cache-control", ""))
+    if "no-cache" in cc:
+        return True
+    if (req_max_age := parse_cache_control_seconds(cc, "max-age")) is not None:
+        return freshness.age_seconds > req_max_age
     return False
+
+
+def apply_cached_metadata(flow: http.HTTPFlow) -> None:
+    if (status_code := flow.response.headers.get("x-amz-meta-status-code")):
+        flow.response.status_code = int(status_code)
+    if (reason := flow.response.headers.get("x-amz-meta-reason")):
+        flow.response.reason = reason
+    for k, v in flow.response.headers.items():
+        if not k.startswith("x-amz-meta-header-"):
+            continue
+        k = k.replace("x-amz-meta-header-", "")
+        flow.response.headers[k] = v
+    if (lastmod := flow.response.headers.get("x-amz-meta-last-modified")):
+        flow.response.headers["last-modified"] = lastmod
+
+
+def refresh_cache_metadata(cache_key: str, cache_headers: dict[str, str]) -> None:
+    metadata: dict[str, str] = {}
+    for key, value in cache_headers.items():
+        if key.lower().startswith("x-amz-meta-"):
+            metadata[key[len("x-amz-meta-"):]] = value
+    if not metadata:
+        return
+    metadata["stored-at"] = str(time.time())
+    copy_args = {
+        "Bucket": S3_BUCKET,
+        "Key": cache_key,
+        "CopySource": {"Bucket": S3_BUCKET, "Key": cache_key},
+        "Metadata": metadata,
+        "MetadataDirective": "REPLACE",
+    }
+    header_map = {
+        "content-type": "ContentType",
+        "content-encoding": "ContentEncoding",
+        "cache-control": "CacheControl",
+        "expires": "Expires",
+    }
+    for header, aws_key in header_map.items():
+        if header in cache_headers:
+            copy_args[aws_key] = cache_headers[header]
+    try:
+        s3 = get_s3_client()
+        s3.copy_object(**copy_args)
+    except Exception as exc:
+        LOG.warning("Cache metadata refresh failed for %s: %s", cache_key, exc)
 
 
 def get_refresh_patterns() -> list[RefreshPattern]:
@@ -421,8 +554,8 @@ class Proxy:
         loader.add_option(
             name="default_policy",
             typespec=str,
-            default="MissingCached",
-            help="Default policy when no rule matches (e.g. MissingCached, Modified)",
+            default="Standard",
+            help="Default policy when no rule matches (e.g. Standard, StaleIfError)",
         )
         loader.add_option(
             name="upstream_head_timeout",
@@ -537,10 +670,12 @@ class Proxy:
         # if we have a GET cached, we can serve both HEAD/GET from the cache. If we have HEAD,
         # only HEAD can be served
         cached_method = False
-        if (http_2xx(flow._cache_head)
-                and (flow._cache_head.headers["x-amz-meta-method"] == "GET"
-                     or flow._cache_head.headers["x-amz-meta-method"] == flow.request.method)):
-            cached_method = True
+        if http_2xx(flow._cache_head):
+            meta_method = flow._cache_head.headers.get("x-amz-meta-method")
+            if meta_method is None:
+                cached_method = True
+            elif meta_method == "GET" or meta_method == flow.request.method:
+                cached_method = True
         if flow._cache_head is not None:
             LOG.debug(
                 "Cache metadata status=%s method_meta=%s etag_meta=%s lastmod_meta=%s",
@@ -552,29 +687,48 @@ class Proxy:
             LOG.debug("Cache method match cached_method=%s", cached_method)
 
         refresh_patterns = get_refresh_patterns()
-
-        cache_fresh = (
-            http_2xx(flow._cache_head)
-            and cached_method
-            and cache_is_fresh(flow.request.url, flow._cache_head.headers, refresh_patterns)
+        cache_hit = http_2xx(flow._cache_head) and cached_method
+        freshness = (
+            cache_freshness(flow.request.url, flow._cache_head.headers, refresh_patterns)
+            if cache_hit
+            else None
         )
+        cache_fresh = bool(freshness and freshness.is_fresh)
+        allow_stale_while_revalidate = bool(freshness and freshness.allow_stale_while_revalidate)
+        allow_stale_if_error = bool(freshness and freshness.allow_stale_if_error)
+        flow._allow_stale_if_error = allow_stale_if_error
+        if flow.request.headers:
+            request_headers = {k.lower(): v for k, v in flow.request.headers.items()}
+        else:
+            request_headers = {}
+        if (
+            cache_hit
+            and freshness
+            and policy in (Standard, StaleIfError)
+            and request_requires_revalidation(request_headers, freshness)
+        ):
+            cache_fresh = False
+            allow_stale_while_revalidate = False
         LOG.debug(
-            "Cache freshness cached_method=%s cache_fresh=%s policy=%s",
+            "Cache freshness cached_method=%s cache_fresh=%s policy=%s stale_while_revalidate=%s stale_if_error=%s",
             cached_method,
             cache_fresh,
             policy.__name__,
+            allow_stale_while_revalidate,
+            allow_stale_if_error,
         )
 
-        if http_2xx(flow._cache_head) and cached_method:
-            # cache hit, we have the file
-            if policy == AlwaysCached:
-                # On AlwaysCached we unconditionally serve the file from the
-                # cache on cache hit
-                LOG.debug("Cache hit: AlwaysCached -> cache_redirect")
+        if cache_hit:
+            if policy == NoRefresh:
+                LOG.debug("Cache hit: NoRefresh -> cache_redirect")
                 cache_redirect(flow)
                 return
-            if policy in (Modified, MissingCached) and cache_fresh:
+            if cache_fresh and policy in (Standard, StaleIfError):
                 LOG.debug("Cache hit: fresh -> cache_redirect")
+                cache_redirect(flow)
+                return
+            if policy in (Standard, StaleIfError) and allow_stale_while_revalidate:
+                LOG.debug("Cache hit: stale-while-revalidate -> cache_redirect")
                 cache_redirect(flow)
                 return
         else:
@@ -612,6 +766,11 @@ class Proxy:
                 if (k.lower().startswith("x-echo-")
                         or k.lower() in ("x-sleep", "x-status-code")):
                     upstream_hdrs[k] = v
+            if cache_hit and policy in (Standard, StaleIfError):
+                if (etag := flow._cache_head.headers.get("x-amz-meta-header-etag")):
+                    upstream_hdrs["If-None-Match"] = etag
+                if (lastmod := flow._cache_head.headers.get("x-amz-meta-last-modified")):
+                    upstream_hdrs["If-Modified-Since"] = lastmod
             try:
                 timeout = getattr(ctx.options, "upstream_head_timeout", UPSTREAM_TIMEOUT)
                 flow._upstream_head = requests.head(
@@ -630,18 +789,18 @@ class Proxy:
                          flow.request.port,
                          flow.request.scheme)] = e
 
-            # First, we check for MissingCached and handle 404 status code
-            # Return cached on upstream 404 and MissingCached policy
-            if (not upstream_failed and http_2xx(flow._cache_head) and cached_method
+            # First, we check for StaleIfError and handle 404 status code
+            # Return cached on upstream 404 and StaleIfError policy or stale-if-error directive.
+            if (not upstream_failed and cache_hit
                     and flow._upstream_head.status_code == 404
-                    and policy == MissingCached):
+                    and (policy == StaleIfError or allow_stale_if_error)):
                 cache_redirect(flow)
                 return
 
-        # On upstream errors or if it's banned, MissingCached may serve cached content.
+        # On upstream errors or if it's banned, StaleIfError may serve cached content.
         if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
-            if http_2xx(flow._cache_head) and cached_method and policy == MissingCached:
-                LOG.debug("Upstream failed -> cache_redirect (MissingCached)")
+            if cache_hit and (policy == StaleIfError or allow_stale_if_error):
+                LOG.debug("Upstream failed -> cache_redirect (StaleIfError)")
                 cache_redirect(flow)
                 return
 
@@ -676,9 +835,8 @@ class Proxy:
                 )
             return
 
-        if (http_2xx(flow._cache_head)
-                and cached_method
-                and policy in (Modified, MissingCached)
+        if (cache_hit
+                and policy in (Standard, StaleIfError)
                 and flow._upstream_head
                 and (http_2xx(flow._upstream_head) or flow._upstream_head.status_code == 304)):
             # if any of lastmod or etag changed, we must re-fetch the object,
@@ -686,11 +844,40 @@ class Proxy:
             if not (flow._upstream_head.headers.get("last-modified")
                     != flow._cache_head.headers.get("x-amz-meta-last-modified")
                     or flow._upstream_head.headers.get("etag") != flow._cache_head.headers.get("x-amz-meta-header-etag")):
+                if flow._cache_key:
+                    refresh_cache_metadata(flow._cache_key, flow._cache_head.headers)
                 cache_redirect(flow)
                 return
 
 
     def responseheaders(self, flow):
+        if (
+            not flow._cached
+            and flow._cache_head
+            and flow._policy in (Standard, StaleIfError)
+            and (
+                flow.response.status_code >= 500
+                or (flow.response.status_code == 404 and flow._policy == StaleIfError)
+            )
+            and (flow._policy == StaleIfError or getattr(flow, "_allow_stale_if_error", False))
+        ):
+            cache_key = flow._cache_key or get_cache_key(flow.request.url)
+            try:
+                cached_resp = requests.get(
+                    get_cache_url(flow, cache_key),
+                    timeout=CACHE_TIMEOUT,
+                )
+                if http_2xx(cached_resp):
+                    flow.response = http.Response.make(
+                        cached_resp.status_code,
+                        cached_resp.content,
+                        dict(cached_resp.headers),
+                    )
+                    flow._cached = True
+                    flow._save_response = False
+            except Exception as e:
+                LOG.debug("Cache fallback fetch failed: %s", e)
+
         flow.response.headers["x-proxy-policy"] = flow._policy.__name__
         # Identify proxy via Via (RFC 7230); do not rewrite Server header
         existing_via = flow.response.headers.get("via", "")
@@ -704,25 +891,14 @@ class Proxy:
             # this is a cached response, rewrite headers from cache (origin Server preserved)
             LOG.debug("Cache response: serving from cache")
             flow.response.headers["Cache-Status"] = f"{SERVER_NAME};hit;detail=stored"
-            if (s3_lastmod := flow.response.headers.get("Last-Modified")):
-                stored_dt = parse_date(s3_lastmod)
-                if stored_dt:
-                    stored_dt = stored_dt.astimezone(pytz.utc)
-                    age_seconds = int((datetime.now(tz=pytz.utc) - stored_dt).total_seconds())
-                    flow.response.headers["Age"] = str(max(0, age_seconds))
+            apply_cached_metadata(flow)
+            if (stored_dt := cache_stored_at(flow.response.headers)):
+                stored_dt = stored_dt.astimezone(pytz.utc)
+                age_seconds = int((datetime.now(tz=pytz.utc) - stored_dt).total_seconds())
+                flow.response.headers["Age"] = str(max(0, age_seconds))
         else:
             LOG.debug("Cache response: not cached")
-            if (status_code := flow.response.headers.get("x-amz-meta-status-code")):
-                flow.response.status_code = int(status_code)
-            if (reason := flow.response.headers.get("x-amz-meta-reason")):
-                flow.response.reason = reason
-            for k, v in flow.response.headers.items():
-                if not k.startswith("x-amz-meta-header-"):
-                    continue
-                k = k.replace("x-amz-meta-header-", "")
-                flow.response.headers[k] = v
-            if (lastmod := flow.response.headers.get("x-amz-meta-last-modified")):
-                flow.response.headers["last-modified"] = lastmod
+            apply_cached_metadata(flow)
         if flow.response.headers.get("last-modified"):
             # if the response has a last-modified header and we got
             # if-modified-since, compare the two and return 304 accordingly
@@ -760,7 +936,18 @@ class Proxy:
             # cache any headers, which we'll return unmodified when responding
             # from the cache. S3 limits the size of metadata and possibly
             # responds with MetadataTooLarge if it gets too large...
-            for k in ("location", "etag", "vary"):
+            for k in (
+                "location",
+                "etag",
+                "vary",
+                "content-language",
+                "content-disposition",
+                "content-location",
+                "content-range",
+                "accept-ranges",
+                "link",
+                "cache-control",
+            ):
                 if k not in headers:
                     continue
                 extras["Metadata"][f"header-{k}"] = headers[k]

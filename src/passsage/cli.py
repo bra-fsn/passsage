@@ -95,8 +95,8 @@ def main(
     Passsage (Pas³age) - S3-backed caching proxy.
 
     A caching HTTP proxy that stores responses in S3 or S3-compatible storage.
-    Objects are cached based on configurable policies (AlwaysCached, Modified,
-    MissingCached, AlwaysUpstream, NoCache).
+    Objects are cached based on configurable policies (NoRefresh, Standard,
+    StaleIfError, AlwaysUpstream, NoCache).
 
     \b
     Examples:
