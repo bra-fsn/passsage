@@ -76,6 +76,21 @@ import click
     default=False,
     help="Allow client policy override via X-Passsage-Policy"
 )
+@click.option(
+    "--health-port",
+    envvar="PASSAGE_HEALTH_PORT",
+    type=int,
+    default=8082,
+    show_default=True,
+    help="Health endpoint port (env: PASSAGE_HEALTH_PORT, 0 disables)"
+)
+@click.option(
+    "--health-host",
+    envvar="PASSAGE_HEALTH_HOST",
+    default="0.0.0.0",
+    show_default=True,
+    help="Health endpoint bind host (env: PASSAGE_HEALTH_HOST)"
+)
 @click.version_option()
 def main(
     port,
@@ -90,6 +105,8 @@ def main(
     web,
     policy_file,
     allow_policy_header,
+    health_port,
+    health_host,
 ):
     """
     Passsage (Pas³age) - S3-backed caching proxy.
@@ -120,6 +137,10 @@ def main(
         os.environ["PASSAGE_POLICY_FILE"] = policy_file
     if allow_policy_header:
         os.environ["PASSAGE_ALLOW_POLICY_HEADER"] = "1"
+    if health_port is not None:
+        os.environ["PASSAGE_HEALTH_PORT"] = str(health_port)
+    if health_host:
+        os.environ["PASSAGE_HEALTH_HOST"] = health_host
 
     if debug:
         logging.basicConfig(level=logging.DEBUG)
