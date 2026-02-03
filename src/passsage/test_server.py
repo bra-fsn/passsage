@@ -26,12 +26,15 @@ class _TestState:
     counts: Dict[str, int] = field(default_factory=dict)
     requests: Dict[str, list[dict]] = field(default_factory=dict)
     last_modified: datetime = field(default_factory=lambda: datetime(2024, 1, 1, tzinfo=timezone.utc))
+    version: int = 1
     policy_overrides: Dict[str, dict] = field(default_factory=dict)
 
     def reset(self) -> None:
         with self.lock:
             self.counts.clear()
             self.requests.clear()
+            self.last_modified = datetime(2024, 1, 1, tzinfo=timezone.utc)
+            self.version = 1
             self.policy_overrides.clear()
 
     def record(self, path: str, record: dict) -> None:
@@ -61,6 +64,11 @@ class _TestState:
                 "status": status,
                 "delay": delay,
             }
+
+    def bump_version(self) -> None:
+        with self.lock:
+            self.version += 1
+            self.last_modified = datetime.now(tz=timezone.utc)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -184,29 +192,37 @@ class _Handler(BaseHTTPRequestHandler):
         if delay:
             time.sleep(delay)
         status = override.get("status") or HTTPStatus.OK
+        cache_control = None
         body = f"cache-control {case}".encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
-        self.send_header("ETag", f"\"cache-{case}\"")
+        etag = f"\"cache-{case}\""
         if case == "no-store":
-            self.send_header("Cache-Control", "no-store")
+            cache_control = "no-store"
         elif case == "no-cache":
-            self.send_header("Cache-Control", "no-cache")
+            cache_control = "no-cache"
         elif case == "max-age":
-            self.send_header("Cache-Control", "max-age=60")
+            cache_control = "max-age=60"
         elif case == "max-age-low":
-            self.send_header("Cache-Control", "max-age=1")
+            cache_control = "max-age=1"
         elif case == "expires":
             exp = datetime.now(tz=timezone.utc) + timedelta(seconds=60)
             self.send_header("Expires", _httpdate(exp))
         elif case == "private":
-            self.send_header("Cache-Control", "private, max-age=60")
+            cache_control = "private, max-age=60"
         elif case == "stale-if-error":
-            self.send_header("Cache-Control", "max-age=1, stale-if-error=60")
+            cache_control = "max-age=1, stale-if-error=60"
         elif case == "stale-while-revalidate":
-            self.send_header("Cache-Control", "max-age=1, stale-while-revalidate=60")
+            cache_control = "max-age=1, stale-while-revalidate=60"
+        elif case == "changing":
+            cache_control = "max-age=1"
+            body = f"version={self.server.state.version}".encode("utf-8")
+            etag = f"\"cache-changing-{self.server.state.version}\""
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
+        self.send_header("ETag", etag)
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
         self.end_headers()
         if send_body:
             self.wfile.write(body)
@@ -370,3 +386,8 @@ class TestServer:
         if self._server is None:
             raise RuntimeError("Server not started")
         self._server.state.set_path_override(path, status=status, delay=delay)
+
+    def bump_version(self) -> None:
+        if self._server is None:
+            raise RuntimeError("Server not started")
+        self._server.state.bump_version()
