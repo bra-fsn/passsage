@@ -15,6 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable, Union
 from urllib.parse import urlparse
 
@@ -69,6 +70,58 @@ else:
     S3_PATH_STYLE = False
 CACHE_TIMEOUT = 10
 UPSTREAM_TIMEOUT = 10
+HEALTH_PORT = int(os.environ.get("PASSAGE_HEALTH_PORT", "8082"))
+HEALTH_HOST = os.environ.get("PASSAGE_HEALTH_HOST", "0.0.0.0")
+HEALTH_CHECK_S3 = os.environ.get("PASSAGE_HEALTH_CHECK_S3", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def do_GET(self) -> None:
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        ok, message = _health_check()
+        body = (message or "ok").encode("utf-8")
+        self.send_response(200 if ok else 503)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _health_check() -> tuple[bool, str]:
+    if HEALTH_CHECK_S3:
+        try:
+            get_s3_client().head_bucket(Bucket=S3_BUCKET)
+        except Exception as exc:
+            return False, f"s3_unhealthy: {exc}"
+    return True, "ok"
+
+
+def _start_health_server() -> None:
+    if HEALTH_PORT <= 0:
+        return
+    if getattr(ctx, "_health_server", None):
+        return
+    try:
+        server = ThreadingHTTPServer((HEALTH_HOST, HEALTH_PORT), _HealthHandler)
+    except OSError as exc:
+        LOG.warning("Health server failed to bind to %s:%s: %s", HEALTH_HOST, HEALTH_PORT, exc)
+        return
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    ctx._health_server = server
+    ctx._health_thread = thread
 
 
 def get_s3_client(tls=threading.local()):
@@ -543,6 +596,7 @@ class Proxy:
             ctx._executor = ThreadPoolExecutor()
             ctx._banned = TTLCache(maxsize=2048, ttl=600)
             ctx._executor.submit(release_banned)
+            _start_health_server()
 
     def load(self, loader):
         loader.add_option(
