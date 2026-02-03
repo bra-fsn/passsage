@@ -562,15 +562,19 @@ def build_vary_request(vary_header: str, request_headers) -> str | None:
     return "|".join(parts)
 
 
+def get_cache_path_key(cache_key: str) -> str:
+    return requests.utils.quote(cache_key, safe="/")
+
+
 def get_cache_url(flow, key_override: str | None = None):
     key = key_override or get_quoted_url(flow)
-    encoded_key = requests.utils.quote(key, safe="/")
+    encoded_key = get_cache_path_key(key)
     return f"{S3_URL}/{encoded_key}"
 
 
 def get_cache_redirect_url(flow) -> str:
     cache_key = getattr(flow, "_cache_key", None) or get_quoted_url(flow)
-    cache_path_key = requests.utils.quote(cache_key, safe="/")
+    cache_path_key = get_cache_path_key(cache_key)
     path_prefix = f"/{S3_BUCKET}/" if S3_PATH_STYLE else "/"
     scheme = S3_SCHEME if _S3_ENDPOINT else "https"
     port = S3_PORT if _S3_ENDPOINT else 443
@@ -599,7 +603,7 @@ def cache_redirect(flow):
     cache_key = getattr(flow, "_cache_key", None) or get_quoted_url(flow)
     LOG.debug("Cache redirect key=%s", cache_key)
     path_prefix = f"/{S3_BUCKET}/" if S3_PATH_STYLE else "/"
-    cache_path_key = requests.utils.quote(cache_key, safe="/")
+    cache_path_key = get_cache_path_key(cache_key)
     flow.request.path = f"{path_prefix}{cache_path_key}"
     flow.request.host = S3_HOST
     flow.request.port = S3_PORT
