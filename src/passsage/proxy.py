@@ -77,6 +77,11 @@ HEALTH_CHECK_S3 = os.environ.get("PASSAGE_HEALTH_CHECK_S3", "1").strip().lower()
     "false",
     "no",
 )
+CACHE_REDIRECT = os.environ.get("PASSAGE_CACHE_REDIRECT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -531,6 +536,29 @@ def get_cache_url(flow, key_override: str | None = None):
     return f"{S3_URL}/{encoded_key}"
 
 
+def get_cache_redirect_url(flow) -> str:
+    cache_key = getattr(flow, "_cache_key", None) or get_quoted_url(flow)
+    cache_path_key = requests.utils.quote(cache_key, safe="/")
+    path_prefix = f"/{S3_BUCKET}/" if S3_PATH_STYLE else "/"
+    scheme = S3_SCHEME if _S3_ENDPOINT else "https"
+    port = S3_PORT if _S3_ENDPOINT else 443
+    host = S3_HOST
+    if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+        netloc = host
+    else:
+        netloc = f"{host}:{port}"
+    return f"{scheme}://{netloc}{path_prefix}{cache_path_key}"
+
+
+def cache_redirect_response(flow) -> None:
+    status = 302 if flow.request.method == "GET" else 307
+    location = get_cache_redirect_url(flow)
+    flow.response = http.Response.make(status, b"", {"Location": location})
+    flow._save_response = False
+    flow._cached = True
+    flow._cache_redirect = True
+
+
 def cache_redirect(flow):
     if getattr(flow, "_req_orig_url", None):
         # We've been already called, don't rewrite again
@@ -634,6 +662,12 @@ class Proxy:
             typespec=bool,
             default=bool(os.environ.get("PASSAGE_ALLOW_POLICY_HEADER")),
             help="Allow client policy override via X-Passsage-Policy",
+        )
+        loader.add_option(
+            name="cache_redirect",
+            typespec=bool,
+            default=CACHE_REDIRECT,
+            help="Return a redirect to the cached S3 object on cache hits",
         )
 
     def configure(self, updated):
@@ -775,14 +809,23 @@ class Proxy:
         if cache_hit:
             if policy == NoRefresh:
                 LOG.debug("Cache hit: NoRefresh -> cache_redirect")
+                if getattr(ctx.options, "cache_redirect", False):
+                    cache_redirect_response(flow)
+                    return
                 cache_redirect(flow)
                 return
             if cache_fresh and policy in (Standard, StaleIfError):
                 LOG.debug("Cache hit: fresh -> cache_redirect")
+                if getattr(ctx.options, "cache_redirect", False):
+                    cache_redirect_response(flow)
+                    return
                 cache_redirect(flow)
                 return
             if policy in (Standard, StaleIfError) and allow_stale_while_revalidate:
                 LOG.debug("Cache hit: stale-while-revalidate -> cache_redirect")
+                if getattr(ctx.options, "cache_redirect", False):
+                    cache_redirect_response(flow)
+                    return
                 cache_redirect(flow)
                 return
         else:
@@ -848,6 +891,9 @@ class Proxy:
             if (not upstream_failed and cache_hit
                     and flow._upstream_head.status_code == 404
                     and (policy == StaleIfError or allow_stale_if_error)):
+                if getattr(ctx.options, "cache_redirect", False):
+                    cache_redirect_response(flow)
+                    return
                 cache_redirect(flow)
                 return
 
@@ -855,6 +901,9 @@ class Proxy:
         if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
             if cache_hit and (policy == StaleIfError or allow_stale_if_error):
                 LOG.debug("Upstream failed -> cache_redirect (StaleIfError)")
+                if getattr(ctx.options, "cache_redirect", False):
+                    cache_redirect_response(flow)
+                    return
                 cache_redirect(flow)
                 return
 
@@ -905,6 +954,18 @@ class Proxy:
 
 
     def responseheaders(self, flow):
+        if getattr(flow, "_cache_redirect", False):
+            flow.response.headers["x-proxy-policy"] = flow._policy.__name__
+            existing_via = flow.response.headers.get("via", "")
+            flow.response.headers["via"] = (
+                f"{VIA_HEADER_VALUE}, {existing_via}" if existing_via else VIA_HEADER_VALUE
+            )
+            flow.response.headers["Cache-Status"] = f"{SERVER_NAME};hit;detail=redirect"
+            if flow._cache_head and (stored_dt := cache_stored_at(flow._cache_head.headers)):
+                stored_dt = stored_dt.astimezone(pytz.utc)
+                age_seconds = int((datetime.now(tz=pytz.utc) - stored_dt).total_seconds())
+                flow.response.headers["Age"] = str(max(0, age_seconds))
+            return
         if (
             not flow._cached
             and flow._cache_head

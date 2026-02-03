@@ -32,6 +32,8 @@ whether to serve from cache or go upstream. In brief:
 
 - Cache hits are served by rewriting the request to the S3 object (Cache-Status is set to
   `hit` and `Age` is derived from the stored timestamp).
+- Optionally, cache hits can be redirected to S3 (to avoid proxying bytes), using
+  `--cache-redirect` or `PASSAGE_CACHE_REDIRECT=1`.
 - `NoRefresh` serves from cache immediately on a hit (no revalidation).
 - `Standard` revalidates with an upstream `HEAD` when stale; if the cached `ETag`/`Last-Modified`
   matches, the cached object is served.
@@ -184,14 +186,15 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 Usage: passsage [OPTIONS]
 
 Options:
-  -p, --port INTEGER              Port to listen on (default: 8080)
-  -b, --bind TEXT                 Address to bind to (default: 0.0.0.0)
+  -p, --port INTEGER              Port to listen on (env: PASSSAGE_PORT, default: 8080)
+  -b, --bind TEXT                 Address to bind to (env: PASSSAGE_HOST, default: 0.0.0.0)
   --s3-bucket TEXT                S3 bucket for cache storage
   --s3-endpoint TEXT              S3 endpoint URL for S3-compatible services
   --test                          Run in test mode
   -m, --mode [regular|transparent|wireguard|upstream]
                                   Proxy mode (default: regular)
   -v, --verbose                   Enable verbose logging
+  --cache-redirect                Redirect cache hits to S3 instead of streaming through the proxy
   --health-port INTEGER           Health endpoint port (env: PASSAGE_HEALTH_PORT, 0 disables)
   --health-host TEXT              Health endpoint bind host (env: PASSAGE_HEALTH_HOST)
   --web                           Enable mitmproxy web interface
