@@ -96,16 +96,7 @@ replace `localhost:8080` with the proxy hostname/IP.
 PASSSAGE_PORT=8080 passsage
 ```
 
-2. Fetch the mitmproxy CA certificate from a client (as root, or with sudo, this is for Ubuntu, other systems may vary):
-
-```bash
-curl -x http://localhost:${PASSSAGE_PORT} http://mitm.it/cert/pem -o /usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
-update-ca-certificates
-```
-
-Open the page and download the certificate for your OS or browser, or use the
-direct download above. You can also use the proxy env script, which embeds the
-certificate so no extra download tools are needed:
+2. Run the proxy env script (it embeds the cert, installs it, and exports proxy env vars):
 
 ```bash
 curl -x http://localhost:${PASSSAGE_PORT} http://mitm.it/proxy-env.sh -o /tmp/passsage-proxy-env.sh
@@ -125,40 +116,6 @@ exports the correct proxy address:
 
 ```bash
 passsage --public-proxy-url http://proxy.example.com:8080
-```
-
-3. Install the certificate on the client:
-
-- Linux (system trust store):
-
-```bash
-sudo cp ~/Downloads/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
-sudo update-ca-certificates
-```
-
-- macOS:
-  - Open the downloaded `.pem` in Keychain Access, add to "System", and set to "Always Trust".
-- Windows:
-  - Run `mmc`, add Certificates snap-in for "Computer account", then import the `.pem` into
-    "Trusted Root Certification Authorities".
-
-4. Set proxy environment variables on the client (some tools only honor lowercase):
-
-```bash
-export HTTP_PROXY="http://localhost:${PASSSAGE_PORT}"
-export HTTPS_PROXY="http://localhost:${PASSSAGE_PORT}"
-export NO_PROXY="localhost,127.0.0.1,::1"
-export http_proxy="http://localhost:${PASSSAGE_PORT}"
-export https_proxy="http://localhost:${PASSSAGE_PORT}"
-export no_proxy="localhost,127.0.0.1,::1"
-# Python uv requires this
-export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-```
-
-You can also use per-command proxies:
-
-```bash
-curl -x http://localhost:${PASSSAGE_PORT} https://example.com/
 ```
 
 ### With LocalStack (Local Development)
