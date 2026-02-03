@@ -139,6 +139,14 @@ def get_cached_without_upstream(
     return last_resp
 
 
+def version_from_response(response: requests.Response) -> int:
+    prefix = "version="
+    text = response.text.strip()
+    if not text.startswith(prefix):
+        raise AssertionError(f"Expected response to start with {prefix!r}, got {text!r}")
+    return int(text[len(prefix):])
+
+
 @pytest.mark.integration
 class TestProxyLive:
     def test_concurrent_requests_through_proxy(
@@ -218,6 +226,63 @@ class TestProxyLive:
         stats = test_server.stats()
         assert get_method_count(stats, "/policy/AlwaysUpstream", "GET") == 2
         assert "Cache-Status" not in r2.headers
+
+    def test_cache_updates_on_upstream_change(self, proxy_session, test_server, cache_bust_random):
+        # Verifies how each policy updates cached content when upstream changes.
+        cases = {
+            "Standard": {"expect_cache": True, "expect_updated": True, "cache_policy": "Standard"},
+            "StaleIfError": {"expect_cache": True, "expect_updated": True, "cache_policy": "StaleIfError"},
+            "NoRefresh": {"expect_cache": True, "expect_updated": False, "cache_policy": "NoRefresh"},
+            "AlwaysUpstream": {
+                "expect_cache": True,
+                "expect_updated": True,
+                "cache_policy": "Standard",
+            },
+            "NoCache": {"expect_cache": False, "expect_updated": True, "cache_policy": None},
+        }
+        for policy_name, config in cases.items():
+            test_server.reset()
+            url = test_server.url(
+                f"/cache-control/changing?random={cache_bust_random}&case={policy_name}"
+            )
+            r1 = proxy_get(proxy_session, url, headers=policy_headers(policy_name), timeout=30)
+            assert r1.ok
+            assert version_from_response(r1) == 1
+            time.sleep(SYNC_SETTLE_SECONDS)
+
+            if config["expect_cache"]:
+                cached1 = get_cached_without_upstream(
+                    proxy_session,
+                    url,
+                    test_server,
+                    "/cache-control/changing",
+                    headers=policy_headers(config["cache_policy"]),
+                )
+                assert_cached_response(cached1)
+                assert version_from_response(cached1) == 1
+            else:
+                assert "Cache-Status" not in r1.headers
+
+            test_server.bump_version()
+            time.sleep(SYNC_SETTLE_SECONDS + 2)
+            r2 = proxy_get(proxy_session, url, headers=policy_headers(policy_name), timeout=30)
+            assert r2.ok
+            expected_version = 2 if config["expect_updated"] else 1
+            assert version_from_response(r2) == expected_version
+            if config["expect_cache"]:
+                cached2 = get_cached_without_upstream(
+                    proxy_session,
+                    url,
+                    test_server,
+                    "/cache-control/changing",
+                    headers=policy_headers(config["cache_policy"]),
+                )
+                assert_cached_response(cached2)
+                assert version_from_response(cached2) == expected_version
+            else:
+                stats = test_server.stats()
+                assert get_method_count(stats, "/cache-control/changing", "GET") == 2
+                assert "Cache-Status" not in r2.headers
 
     def test_policy_stale_if_error_404(self, proxy_session, test_server, cache_bust_random):
         # Ensures StaleIfError serves cached content on upstream 404.
