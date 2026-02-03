@@ -149,6 +149,20 @@ def version_from_response(response: requests.Response) -> int:
 
 @pytest.mark.integration
 class TestProxyLive:
+    def test_proxy_env_script_contains_cert(self):
+        resp = requests.get(
+            "http://mitm.it/proxy-env.sh",
+            proxies={"http": PROXY_URL, "https": PROXY_URL},
+            timeout=10,
+            verify=False,
+        )
+        resp.raise_for_status()
+        script = resp.text
+        assert "__PASSSAGE_MITM_CA_PEM__" not in script
+        assert "BEGIN CERTIFICATE" in script
+        assert "export HTTP_PROXY" in script
+        assert "export HTTPS_PROXY" in script
+
     def test_concurrent_requests_through_proxy(
         self, mitmproxy_ca_cert_path, test_server, cache_bust_random
     ):
