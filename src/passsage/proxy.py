@@ -1250,6 +1250,13 @@ class Proxy:
                 flow._save_response = False
         if flow._save_response:
             # save in the background
+            if flow._counter not in self.files or flow._counter not in self.hashes:
+                LOG.debug("Cache save skipped (no body recorded) counter=%s", flow._counter)
+                flow._save_response = False
+                self.log_response(flow)
+                with ctx._lock:
+                    self.cleanup(flow)
+                return
             cache_key = flow._cache_key or get_cache_key(flow.request.url)
             LOG.debug("Cache save enqueue key=%s", cache_key)
             ctx._executor.submit(
