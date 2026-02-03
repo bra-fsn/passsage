@@ -33,7 +33,7 @@ whether to serve from cache or go upstream. In brief:
 - Cache hits are served by rewriting the request to the S3 object (Cache-Status is set to
   `hit` and `Age` is derived from the stored timestamp).
 - Optionally, cache hits can be redirected to S3 (to avoid proxying bytes), using
-  `--cache-redirect` or `PASSAGE_CACHE_REDIRECT=1`.
+  `--cache-redirect` or `PASSSAGE_CACHE_REDIRECT=1`.
 - `NoRefresh` serves from cache immediately on a hit (no revalidation).
 - `Standard` revalidates with an upstream `HEAD` when stale; if the cached `ETag`/`Last-Modified`
   matches, the cached object is served.
@@ -96,7 +96,7 @@ replace `localhost:8080` with the proxy hostname/IP.
 PASSSAGE_PORT=8080 passsage
 ```
 
-2. Fetch the mitmproxy CA certificate from a client (as root, or with sudo):
+2. Fetch the mitmproxy CA certificate from a client (as root, or with sudo, this is for Ubuntu, other systems may vary):
 
 ```bash
 curl -x http://localhost:${PASSSAGE_PORT} http://mitm.it/cert/pem -o /usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
@@ -104,7 +104,28 @@ update-ca-certificates
 ```
 
 Open the page and download the certificate for your OS or browser, or use the
-direct download above.
+direct download above. You can also use the proxy env script, which embeds the
+certificate so no extra download tools are needed:
+
+```bash
+curl -x http://localhost:${PASSSAGE_PORT} http://mitm.it/proxy-env.sh -o /tmp/passsage-proxy-env.sh
+. /tmp/passsage-proxy-env.sh
+```
+
+You can also source it in one line:
+
+```bash
+. <(curl -fsSL -x http://localhost:${PASSSAGE_PORT} http://mitm.it/proxy-env.sh)
+```
+
+It also tries to write `~/.passsage/proxy-env.sh` for reuse in other shells.
+
+If the proxy is behind a load balancer, set a public URL so the proxy env script
+exports the correct proxy address:
+
+```bash
+passsage --public-proxy-url http://proxy.example.com:8080
+```
 
 3. Install the certificate on the client:
 
@@ -195,8 +216,8 @@ Options:
                                   Proxy mode (default: regular)
   -v, --verbose                   Enable verbose logging
   --cache-redirect                Redirect cache hits to S3 instead of streaming through the proxy
-  --health-port INTEGER           Health endpoint port (env: PASSAGE_HEALTH_PORT, 0 disables)
-  --health-host TEXT              Health endpoint bind host (env: PASSAGE_HEALTH_HOST)
+  --health-port INTEGER           Health endpoint port (env: PASSSAGE_HEALTH_PORT, 0 disables)
+  --health-host TEXT              Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)
   --web                           Enable mitmproxy web interface
   --version                       Show the version and exit.
   --help                          Show this message and exit.
@@ -285,22 +306,22 @@ ruff format src/
 ### Integration tests with Docker Compose
 
 The integration suite expects a running proxy that allows `X-Passsage-Policy` overrides.
-Start Passsage with `--allow-policy-header` or set `PASSAGE_ALLOW_POLICY_HEADER=1`.
+Start Passsage with `--allow-policy-header` or set `PASSSAGE_ALLOW_POLICY_HEADER=1`.
 
 ```bash
 # Default port 8080 and health port 8082
-PASSAGE_ALLOW_POLICY_HEADER=1 docker compose up --build
+PASSSAGE_ALLOW_POLICY_HEADER=1 docker compose up --build
 
 # Override the host port mappings
-PROXY_PORT=9090 HEALTH_PORT=9092 PASSAGE_ALLOW_POLICY_HEADER=1 docker compose up --build
+PROXY_PORT=9090 HEALTH_PORT=9092 PASSSAGE_ALLOW_POLICY_HEADER=1 docker compose up --build
 ```
 
 When the proxy runs in a container, the test server must be reachable by Passsage.
 On Linux, set the bind host and public host so the proxy can reach the test server:
 
 ```bash
-export PASSAGE_TEST_SERVER_BIND_HOST=0.0.0.0
-export PASSAGE_TEST_SERVER_HOST=host.docker.internal
+export PASSSAGE_TEST_SERVER_BIND_HOST=0.0.0.0
+export PASSSAGE_TEST_SERVER_HOST=host.docker.internal
 export PROXY_URL=http://localhost:9090
 pytest -m "not slow"
 ```
@@ -316,8 +337,8 @@ curl -f http://localhost:8082/health
 Configure it via environment variables:
 
 ```bash
-export PASSAGE_HEALTH_PORT=8082
-export PASSAGE_HEALTH_HOST=0.0.0.0
+export PASSSAGE_HEALTH_PORT=8082
+export PASSSAGE_HEALTH_HOST=0.0.0.0
 ```
 
 ## Policy Overrides
@@ -363,7 +384,7 @@ passsage --policy-file /path/to/policies.py
 You can also set the environment variable:
 
 ```bash
-export PASSAGE_POLICY_FILE=/path/to/policies.py
+export PASSSAGE_POLICY_FILE=/path/to/policies.py
 passsage
 ```
 

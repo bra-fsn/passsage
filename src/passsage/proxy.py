@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Iterable, Union
 from urllib.parse import urlparse
 
@@ -70,18 +71,19 @@ else:
     S3_PATH_STYLE = False
 CACHE_TIMEOUT = 10
 UPSTREAM_TIMEOUT = 10
-HEALTH_PORT = int(os.environ.get("PASSAGE_HEALTH_PORT", "8082"))
-HEALTH_HOST = os.environ.get("PASSAGE_HEALTH_HOST", "0.0.0.0")
-HEALTH_CHECK_S3 = os.environ.get("PASSAGE_HEALTH_CHECK_S3", "1").strip().lower() not in (
+HEALTH_PORT = int(os.environ.get("PASSSAGE_HEALTH_PORT", "8082"))
+HEALTH_HOST = os.environ.get("PASSSAGE_HEALTH_HOST", "0.0.0.0")
+HEALTH_CHECK_S3 = os.environ.get("PASSSAGE_HEALTH_CHECK_S3", "1").strip().lower() not in (
     "0",
     "false",
     "no",
 )
-CACHE_REDIRECT = os.environ.get("PASSAGE_CACHE_REDIRECT", "").strip().lower() in (
+CACHE_REDIRECT = os.environ.get("PASSSAGE_CACHE_REDIRECT", "").strip().lower() in (
     "1",
     "true",
     "yes",
 )
+PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -148,6 +150,35 @@ def get_s3_client(tls=threading.local()):
             kwargs["config"] = Config(s3={"addressing_style": "path"})
         tls.s3 = boto3.session.Session().client("s3", **kwargs)
         return tls.s3
+
+
+def load_proxy_env_script() -> bytes:
+    try:
+        from importlib import resources
+        script = resources.files("passsage").joinpath("onboarding/proxy-env.sh").read_text()
+        public_url = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
+        if public_url:
+            script = script.replace("__PASSSAGE_PUBLIC_PROXY_URL__", public_url)
+        cert_pem = _read_ca_cert_pem()
+        if cert_pem:
+            script = script.replace("__PASSSAGE_MITM_CA_PEM__", cert_pem)
+        return script.encode("utf-8")
+    except Exception as exc:
+        LOG.error("Failed to load proxy env script: %s", exc)
+        return b""
+
+
+def _read_ca_cert_pem() -> str:
+    confdir = getattr(ctx.options, "confdir", None)
+    if confdir:
+        candidate = os.path.join(confdir, "mitmproxy-ca-cert.pem")
+        if os.path.isfile(candidate):
+            return Path(candidate).read_text()
+    default_path = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+    if os.path.isfile(default_path):
+        return Path(default_path).read_text()
+    LOG.error("Mitmproxy CA certificate not found in confdir or ~/.mitmproxy")
+    return ""
 
 
 def _is_tls_verify_error(err: Exception | None) -> bool:
@@ -654,14 +685,20 @@ class Proxy:
         loader.add_option(
             name="policy_file",
             typespec=str,
-            default=os.environ.get("PASSAGE_POLICY_FILE", ""),
+            default=os.environ.get("PASSSAGE_POLICY_FILE", ""),
             help="Path to a Python file defining policy overrides",
         )
         loader.add_option(
             name="allow_policy_header",
             typespec=bool,
-            default=bool(os.environ.get("PASSAGE_ALLOW_POLICY_HEADER")),
+            default=bool(os.environ.get("PASSSAGE_ALLOW_POLICY_HEADER")),
             help="Allow client policy override via X-Passsage-Policy",
+        )
+        loader.add_option(
+            name="public_proxy_url",
+            typespec=str,
+            default=PUBLIC_PROXY_URL,
+            help="Public proxy URL embedded in mitm.it/proxy-env responses",
         )
         loader.add_option(
             name="cache_redirect",
@@ -692,6 +729,29 @@ class Proxy:
         flow._cached = False
         flow._save_response = True
         policy = flow._policy = get_policy(flow)
+        if flow.request.pretty_host == "mitm.it" and flow.request.path in ("/proxy-env", "/proxy-env.sh"):
+            public_url = getattr(ctx.options, "public_proxy_url", "").strip()
+            if public_url:
+                os.environ["PASSSAGE_PUBLIC_PROXY_URL"] = public_url
+            body = load_proxy_env_script()
+            if not body:
+                flow.response = http.Response.make(
+                    500,
+                    b"proxy env script unavailable",
+                    {"Content-Type": "text/plain"},
+                )
+            else:
+                flow.response = http.Response.make(
+                    200,
+                    body,
+                    {
+                        "Content-Type": "text/plain",
+                        "Cache-Control": "no-store",
+                    },
+                )
+            flow._save_response = False
+            flow._short_circuit = True
+            return
         with ctx._lock:
             flow._counter = self.counter
             self.counter += 1
@@ -1089,6 +1149,9 @@ class Proxy:
             f.close()
 
     def response(self, flow):
+        if getattr(flow, "_short_circuit", False):
+            self.log_response(flow)
+            return
         if (flow.request.method not in ("GET", "HEAD")
                 or flow._policy == NoCache or flow._cached):
             self.log_response(flow)
@@ -1176,6 +1239,8 @@ class Proxy:
             self.cleanup(flow)
 
     def cleanup(self, flow):
+        if not hasattr(flow, "_counter"):
+            return
         if flow._counter in self.files:
             del self.files[flow._counter]
         if flow._counter in self.hashes:
