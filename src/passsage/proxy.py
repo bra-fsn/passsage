@@ -1066,7 +1066,12 @@ class Proxy:
                 getattr(flow, "_cache_key", None),
             )
 
-        if flow._save_response and flow._cache_head and flow.request.method == "GET":
+        if (
+            flow._save_response
+            and flow._cache_head
+            and flow.request.method == "GET"
+            and flow._counter in self.hashes
+        ):
             # check if the downloaded file and the cached are the same and if
             # so, don't save it again
             if self.hashes[flow._counter].hexdigest() == flow._cache_head.headers.get("x-amz-meta-sha224"):
