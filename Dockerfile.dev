@@ -1,0 +1,21 @@
+FROM python:3.14-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy package files (these will be overshadowed by volume mounts in dev mode)
+COPY pyproject.toml README.md LICENSE ./
+COPY src/ ./src/
+
+# Install in editable mode
+RUN pip install --no-cache-dir -e .
+
+# Expose proxy port and web interface port
+EXPOSE 8080 8081
+
+CMD ["passsage", "-p", "8080", "--web", "--bind", "0.0.0.0"]

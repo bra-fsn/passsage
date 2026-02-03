@@ -1,0 +1,15 @@
+# Development override - use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Mounts source code; mitmproxy reloads proxy.py on change.
+
+services:
+  passsage:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./src:/app/src:ro
+      - ./pyproject.toml:/app/pyproject.toml:ro
+    environment:
+      - S3_ENDPOINT_URL=http://localstack:4566
+      - S3_BUCKET=proxy-cache
