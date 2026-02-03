@@ -12,12 +12,14 @@ import click
     "-p", "--port",
     default=8080,
     type=int,
-    help="Port to listen on (default: 8080)"
+    envvar="PASSSAGE_PORT",
+    help="Port to listen on (env: PASSSAGE_PORT, default: 8080)"
 )
 @click.option(
     "-b", "--bind",
     default="0.0.0.0",
-    help="Address to bind to (default: 0.0.0.0)"
+    envvar="PASSSAGE_HOST",
+    help="Address to bind to (env: PASSSAGE_HOST, default: 0.0.0.0)"
 )
 @click.option(
     "--s3-bucket",
