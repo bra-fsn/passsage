@@ -157,10 +157,10 @@ main() {
 
   export HTTP_PROXY="$proxy_url"
   export HTTPS_PROXY="$proxy_url"
-  export NO_PROXY="localhost,127.0.0.1,::1"
+  export NO_PROXY="localhost,127.0.0.1,::1,__PASSSAGE_S3_HOST__"
   export http_proxy="$proxy_url"
   export https_proxy="$proxy_url"
-  export no_proxy="localhost,127.0.0.1,::1"
+  export no_proxy="localhost,127.0.0.1,::1,__PASSSAGE_S3_HOST__"
   if [ -n "$ca_bundle" ]; then
     export SSL_CERT_FILE="$ca_bundle"
     export REQUESTS_CA_BUNDLE="$ca_bundle"
