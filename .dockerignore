@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+dist
+build
+.venv
+venv
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation (not needed in image)
+*.md
+!README.md
+
+# Tests (not needed in production image)
+tests/
+
+# Local development
+.env
+.envrc
