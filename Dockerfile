@@ -27,4 +27,3 @@ EXPOSE 8082
 
 # Default command
 ENTRYPOINT ["passsage"]
-CMD ["-p", "8080", "--bind", "0.0.0.0"]
