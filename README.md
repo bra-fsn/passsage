@@ -16,12 +16,12 @@ See https://docs.mitmproxy.org/stable/concepts/how-mitmproxy-works/ for the deta
 
 - **S3-backed caching**: Store cached responses in AWS S3 or S3-compatible storage (MinIO, LocalStack, etc.)
 - **Flexible caching policies**: Configure how different URLs are cached
-  - `AlwaysCached`: Serve from cache without checking upstream
-  - `Modified`: Check if content changed via Last-Modified/ETag headers
-  - `MissingCached`: Serve from cache on upstream failure (4xx/5xx/timeout)
+  - `NoRefresh`: Serve from cache without revalidation; fetch on miss
+  - `Standard`: RFC 9111 compliant caching and revalidation
+  - `StaleIfError`: Serve stale cache on upstream failure (4xx/5xx/timeout)
   - `AlwaysUpstream`: Always fetch from upstream, cache as fallback
   - `NoCache`: Pass through without caching
-  - Default policy when no rule matches: `MissingCached` (override with `--default-policy`)
+  - Default policy when no rule matches: `Standard` (override with `--default-policy`)
 - **Automatic failover**: Serve cached content when upstream is unavailable
 - **Ban management**: Temporarily ban unresponsive upstreams to avoid timeouts
 
@@ -32,11 +32,16 @@ whether to serve from cache or go upstream. In brief:
 
 - Cache hits are served by rewriting the request to the S3 object (Cache-Status is set to
   `hit` and `Age` is derived from the stored timestamp).
-- `AlwaysCached` serves from cache immediately on a hit.
-- `Modified` and `MissingCached` revalidate with an upstream `HEAD` when needed; if the
-  cached `ETag`/`Last-Modified` matches, the cached object is served.
+- `NoRefresh` serves from cache immediately on a hit (no revalidation).
+- `Standard` revalidates with an upstream `HEAD` when stale; if the cached `ETag`/`Last-Modified`
+  matches, the cached object is served.
+- `StaleIfError` serves stale cache on upstream failure, and `Standard` honors
+  `stale-if-error` / `stale-while-revalidate` directives when present.
 - `AlwaysUpstream` always fetches from upstream, even if cached.
 - `NoCache` bypasses cache lookup for non-GET/HEAD or policy override.
+
+`Standard` follows RFC 9111 HTTP caching semantics; `stale-if-error` and
+`stale-while-revalidate` are supported when present.
 
 On cache misses, Passsage fetches from upstream and streams the response to the client.
 Responses are saved to S3 unless caching is disabled by policy or response headers
@@ -63,8 +68,13 @@ pip install -e ".[dev]"
 # Run with default settings (uses AWS S3)
 passsage
 
-# Run on a specific port
+# Run on a specific port (CLI or env var)
+PASSSAGE_PORT=9090 passsage
 passsage -p 9090
+
+# Bind to a specific interface (CLI or env var)
+PASSSAGE_HOST=127.0.0.1 passsage
+passsage --bind 127.0.0.1
 
 # Run with web interface
 passsage --web
@@ -81,13 +91,13 @@ replace `localhost:8080` with the proxy hostname/IP.
 1. Start Passsage (example on localhost):
 
 ```bash
-passsage -p 8080
+PASSSAGE_PORT=8080 passsage
 ```
 
 2. Fetch the mitmproxy CA certificate from a client (as root, or with sudo):
 
 ```bash
-curl -x http://localhost:8080 http://mitm.it/cert/pem -o /usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
+curl -x http://localhost:${PASSSAGE_PORT} http://mitm.it/cert/pem -o /usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 update-ca-certificates
 ```
 
@@ -112,11 +122,11 @@ sudo update-ca-certificates
 4. Set proxy environment variables on the client (some tools only honor lowercase):
 
 ```bash
-export HTTP_PROXY="http://localhost:8080"
-export HTTPS_PROXY="http://localhost:8080"
+export HTTP_PROXY="http://localhost:${PASSSAGE_PORT}"
+export HTTPS_PROXY="http://localhost:${PASSSAGE_PORT}"
 export NO_PROXY="localhost,127.0.0.1,::1"
-export http_proxy="http://localhost:8080"
-export https_proxy="http://localhost:8080"
+export http_proxy="http://localhost:${PASSSAGE_PORT}"
+export https_proxy="http://localhost:${PASSSAGE_PORT}"
 export no_proxy="localhost,127.0.0.1,::1"
 # Python uv requires this
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
@@ -125,7 +135,7 @@ export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 You can also use per-command proxies:
 
 ```bash
-curl -x http://localhost:8080 https://example.com/
+curl -x http://localhost:${PASSSAGE_PORT} https://example.com/
 ```
 
 ### With LocalStack (Local Development)
@@ -163,6 +173,8 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `PASSSAGE_PORT` | Proxy listen port | `8080` |
+| `PASSSAGE_HOST` | Proxy bind host | `0.0.0.0` |
 | `S3_BUCKET` | S3 bucket name for cache storage | `364189071156-ds-proxy-us-west-2` (AWS) or `proxy-cache` (custom endpoint) |
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
 
@@ -180,6 +192,8 @@ Options:
   -m, --mode [regular|transparent|wireguard|upstream]
                                   Proxy mode (default: regular)
   -v, --verbose                   Enable verbose logging
+  --health-port INTEGER           Health endpoint port (env: PASSAGE_HEALTH_PORT, 0 disables)
+  --health-host TEXT              Health endpoint bind host (env: PASSAGE_HEALTH_HOST)
   --web                           Enable mitmproxy web interface
   --version                       Show the version and exit.
   --help                          Show this message and exit.
@@ -209,7 +223,8 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 This starts:
 - **LocalStack** S3 on port 4566 with pre-configured `proxy-cache` bucket
-- **Passsage** proxy on port 8080, web interface on port 8081
+- **Passsage** proxy on port 8080
+- **Health endpoint** on port 8082 (`/health`)
 
 ### Development Workflow
 
@@ -264,6 +279,44 @@ ruff check src/
 ruff format src/
 ```
 
+### Integration tests with Docker Compose
+
+The integration suite expects a running proxy that allows `X-Passsage-Policy` overrides.
+Start Passsage with `--allow-policy-header` or set `PASSAGE_ALLOW_POLICY_HEADER=1`.
+
+```bash
+# Default port 8080 and health port 8082
+PASSAGE_ALLOW_POLICY_HEADER=1 docker compose up --build
+
+# Override the host port mappings
+PROXY_PORT=9090 HEALTH_PORT=9092 PASSAGE_ALLOW_POLICY_HEADER=1 docker compose up --build
+```
+
+When the proxy runs in a container, the test server must be reachable by Passsage.
+On Linux, set the bind host and public host so the proxy can reach the test server:
+
+```bash
+export PASSAGE_TEST_SERVER_BIND_HOST=0.0.0.0
+export PASSAGE_TEST_SERVER_HOST=host.docker.internal
+export PROXY_URL=http://localhost:9090
+pytest -m "not slow"
+```
+
+### Health endpoint
+
+Passsage starts a lightweight HTTP server for health checks on a separate port.
+
+```bash
+curl -f http://localhost:8082/health
+```
+
+Configure it via environment variables:
+
+```bash
+export PASSAGE_HEALTH_PORT=8082
+export PASSAGE_HEALTH_HOST=0.0.0.0
+```
+
 ## Policy Overrides
 
 You can override caching policies by pointing Passsage at a Python file. The file
@@ -287,11 +340,11 @@ passsage --allow-policy-header
 
 ```bash
 curl -x http://localhost:8080 \
-  -H "X-Passsage-Policy: AlwaysCached" \
+  -H "X-Passsage-Policy: NoRefresh" \
   http://example.com/data.csv
 ```
 
-Supported values: `AlwaysCached`, `AlwaysUpstream`, `MissingCached`, `Modified`, `NoCache`.
+Supported values: `NoRefresh`, `Standard`, `StaleIfError`, `AlwaysUpstream`, `NoCache`.
 
 Security note: this allows clients to bypass normal policy rules. A malicious or
 misconfigured client could force caching of sensitive responses or disable caching
@@ -315,11 +368,11 @@ passsage
 
 ```python
 # /path/to/policies.py
-from passsage.policy import AlwaysCached, Modified, NoCache, PathContainsRule, RegexRule
+from passsage.policy import NoCache, NoRefresh, PathContainsRule, RegexRule
 
 RULES = [
-    PathContainsRule("/assets/", AlwaysCached),
-    RegexRule(r".*\\.csv$", AlwaysCached),
+    PathContainsRule("/assets/", NoRefresh),
+    RegexRule(r".*\\.csv$", NoRefresh),
     PathContainsRule("/api/private", NoCache),
 ]
 ```
@@ -342,23 +395,23 @@ def get_rules():
 ```python
 # /path/to/policies.py
 from passsage.default_policies import default_rules
-from passsage.policy import Modified, PolicyResolver
+from passsage.policy import PolicyResolver, Standard
 
 def get_resolver():
-    return PolicyResolver(rules=default_rules(), default_policy=Modified)
+    return PolicyResolver(rules=default_rules(), default_policy=Standard)
 ```
 
 ### Example: dynamic rule based on headers
 
 ```python
 # /path/to/policies.py
-from passsage.policy import AlwaysCached, CallableRule, Context, NoCache
+from passsage.policy import CallableRule, Context, NoCache, NoRefresh
 
 def choose_policy(ctx: Context):
     for key, value in (ctx.headers or []):
         if key.lower() == "x-no-cache" and value == "1":
             return NoCache
-    return AlwaysCached
+    return NoRefresh
 
 RULES = [
     CallableRule(choose_policy),
@@ -366,5 +419,7 @@ RULES = [
 ```
 
 ## License
+
+See `LICENSE` and `NOTICE` for copyright and attribution details.
 
 MIT License - see [LICENSE](LICENSE) for details.
