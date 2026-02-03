@@ -26,6 +26,7 @@ import requests
 from cachetools import TTLCache
 from mitmproxy import ctx, http
 from mitmproxy.script import concurrent
+from botocore.exceptions import ClientError
 from werkzeug.http import parse_date
 
 from passsage.policy import (
@@ -82,6 +83,11 @@ CACHE_REDIRECT = os.environ.get("PASSSAGE_CACHE_REDIRECT", "").strip().lower() i
     "1",
     "true",
     "yes",
+)
+SIGNED_CACHE_REDIRECT = os.environ.get("PASSSAGE_CACHE_REDIRECT_SIGNED_URL", "").strip().lower() not in (
+    "0",
+    "false",
+    "no",
 )
 PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
 
@@ -150,6 +156,29 @@ def get_s3_client(tls=threading.local()):
             kwargs["config"] = Config(s3={"addressing_style": "path"})
         tls.s3 = boto3.session.Session().client("s3", **kwargs)
         return tls.s3
+
+
+@dataclass
+class S3HeadResponse:
+    status_code: int
+    headers: dict
+
+
+def s3_head_object(cache_key: str) -> S3HeadResponse:
+    s3 = get_s3_client()
+    try:
+        response = s3.head_object(Bucket=S3_BUCKET, Key=cache_key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return S3HeadResponse(404, {})
+        raise
+    headers = {}
+    http_headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+    headers.update(http_headers)
+    for key, value in (response.get("Metadata") or {}).items():
+        headers[f"x-amz-meta-{key}"] = value
+    return S3HeadResponse(200, headers)
 
 
 def load_proxy_env_script() -> bytes:
@@ -533,18 +562,18 @@ def get_refresh_patterns() -> list[RefreshPattern]:
 
 
 def get_quoted_url(flow):
-    return requests.utils.quote(flow.request.url)
+    return flow.request.url
 
 
 def get_cache_key(url: str, vary_key: str | None = None) -> str:
-    base = requests.utils.quote(url)
+    base = url
     if vary_key:
         return f"{base}__vary__{vary_key}"
     return base
 
 
 def get_vary_index_key(url: str) -> str:
-    return f"{requests.utils.quote(url)}__vary_index"
+    return f"{url}__vary_index"
 
 
 def compute_vary_key(vary_header: str, request_headers) -> str | None:
@@ -568,13 +597,19 @@ def get_cache_path_key(cache_key: str) -> str:
 
 def get_cache_url(flow, key_override: str | None = None):
     key = key_override or get_quoted_url(flow)
-    encoded_key = get_cache_path_key(key)
-    return f"{S3_URL}/{encoded_key}"
+    cache_key = get_cache_path_key(key)
+    return f"{S3_URL}/{cache_key}"
 
 
 def get_cache_redirect_url(flow) -> str:
     cache_key = getattr(flow, "_cache_key", None) or get_quoted_url(flow)
     cache_path_key = get_cache_path_key(cache_key)
+    if getattr(ctx.options, "cache_redirect_signed_url", False):
+        return get_s3_client().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": cache_key},
+            ExpiresIn=3600,
+        )
     path_prefix = f"/{S3_BUCKET}/" if S3_PATH_STYLE else "/"
     scheme = S3_SCHEME if _S3_ENDPOINT else "https"
     port = S3_PORT if _S3_ENDPOINT else 443
@@ -711,6 +746,12 @@ class Proxy:
             default=CACHE_REDIRECT,
             help="Return a redirect to the cached S3 object on cache hits",
         )
+        loader.add_option(
+            name="cache_redirect_signed_url",
+            typespec=bool,
+            default=SIGNED_CACHE_REDIRECT,
+            help="Redirect cache hits to a signed S3 URL instead of public S3 access",
+        )
 
     def configure(self, updated):
         if "policy_file" in updated:
@@ -774,7 +815,7 @@ class Proxy:
         try:
             vary_index_key = get_vary_index_key(flow.request.url)
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
-            vary_index_head = requests.head(get_cache_url(flow, vary_index_key), timeout=CACHE_TIMEOUT)
+            vary_index_head = s3_head_object(vary_index_key)
             if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.headers.get("x-amz-meta-vary")):
                 flow._cache_vary = vary_hdr
                 if "*" not in vary_hdr:
@@ -791,10 +832,7 @@ class Proxy:
                 flow._cache_key = get_cache_key(flow.request.url)
                 LOG.debug("Cache lookup default key=%s", flow._cache_key)
             if flow._cache_key:
-                flow._cache_head = requests.head(
-                    get_cache_url(flow, flow._cache_key),
-                    timeout=CACHE_TIMEOUT,
-                )
+                flow._cache_head = s3_head_object(flow._cache_key)
                 LOG.debug(
                     "Cache HEAD status=%s key=%s",
                     flow._cache_head.status_code,
