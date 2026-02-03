@@ -26,7 +26,7 @@ jobs:
 
       - name: Start proxy stack
         env:
-          PASSAGE_ALLOW_POLICY_HEADER: "1"
+          PASSSAGE_ALLOW_POLICY_HEADER: "1"
         run: |
           docker compose up -d --build --wait
           docker compose ps
@@ -34,8 +34,8 @@ jobs:
       - name: Run tests
         env:
           PROXY_URL: http://localhost:8080
-          PASSAGE_TEST_SERVER_BIND_HOST: 0.0.0.0
-          PASSAGE_TEST_SERVER_HOST: host.docker.internal
+          PASSSAGE_TEST_SERVER_BIND_HOST: 0.0.0.0
+          PASSSAGE_TEST_SERVER_HOST: host.docker.internal
         run: |
           pytest -m "not slow"
 
