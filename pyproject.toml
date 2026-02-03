@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "passsage"
-version = "0.1.0"
+dynamic = ["version"]
 description = "S3-backed caching proxy for mitmproxy (Pas³age = Passage + S3)"
 readme = "README.md"
 license = "MIT"
@@ -57,6 +57,9 @@ passsage = "passsage.cli:main"
 [project.urls]
 Homepage = "https://github.com/bra-fsn/passsage"
 Repository = "https://github.com/bra-fsn/passsage"
+
+[tool.hatch.version]
+path = "src/passsage/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/passsage"]
