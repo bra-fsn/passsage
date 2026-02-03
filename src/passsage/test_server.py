@@ -193,6 +193,7 @@ class _Handler(BaseHTTPRequestHandler):
             time.sleep(delay)
         status = override.get("status") or HTTPStatus.OK
         cache_control = None
+        expires_value = None
         body = f"cache-control {case}".encode("utf-8")
         etag = f"\"cache-{case}\""
         if case == "no-store":
@@ -205,7 +206,7 @@ class _Handler(BaseHTTPRequestHandler):
             cache_control = "max-age=1"
         elif case == "expires":
             exp = datetime.now(tz=timezone.utc) + timedelta(seconds=60)
-            self.send_header("Expires", _httpdate(exp))
+            expires_value = _httpdate(exp)
         elif case == "private":
             cache_control = "private, max-age=60"
         elif case == "stale-if-error":
@@ -223,6 +224,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("ETag", etag)
         if cache_control:
             self.send_header("Cache-Control", cache_control)
+        if case == "expires":
+            self.send_header("Expires", expires_value)
         self.end_headers()
         if send_body:
             self.wfile.write(body)
