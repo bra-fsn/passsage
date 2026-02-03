@@ -133,10 +133,10 @@ write_env_file() {
   if ! {
     printf 'export HTTP_PROXY="%s"\n' "$proxy_url"
     printf 'export HTTPS_PROXY="%s"\n' "$proxy_url"
-    printf 'export NO_PROXY="localhost,127.0.0.1,::1"\n'
+    printf 'export NO_PROXY="localhost,127.0.0.1,::1,__PASSSAGE_S3_HOST__"\n'
     printf 'export http_proxy="%s"\n' "$proxy_url"
     printf 'export https_proxy="%s"\n' "$proxy_url"
-    printf 'export no_proxy="localhost,127.0.0.1,::1"\n'
+    printf 'export no_proxy="localhost,127.0.0.1,::1,__PASSSAGE_S3_HOST__"\n'
     if [ -n "$ca_bundle" ]; then
       printf 'export SSL_CERT_FILE="%s"\n' "$ca_bundle"
       printf 'export REQUESTS_CA_BUNDLE="%s"\n' "$ca_bundle"
