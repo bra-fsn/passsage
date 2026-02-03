@@ -159,6 +159,7 @@ def load_proxy_env_script() -> bytes:
         public_url = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
         if public_url:
             script = script.replace("__PASSSAGE_PUBLIC_PROXY_URL__", public_url)
+        script = script.replace("__PASSSAGE_S3_HOST__", S3_HOST)
         cert_pem = _read_ca_cert_pem()
         if cert_pem:
             script = script.replace("__PASSSAGE_MITM_CA_PEM__", cert_pem)

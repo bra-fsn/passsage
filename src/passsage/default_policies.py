@@ -25,14 +25,23 @@ def default_rules() -> list["Rule"]:
     )
 
     return [
-        SuffixRule(".deb", NoRefresh),
+        PathContainsRule("/mitm.it/", NoCache),
+        # Debian based mirrors
+        SuffixRule(".deb", StaleIfError),
         SuffixRule("/Packages", StaleIfError),
         SuffixRule("/Packages.gz", StaleIfError),
         SuffixRule("/Packages.xz", StaleIfError),
-        HostPrefixRule("169.254.169.", NoCache),
         SuffixRule("/InRelease", StaleIfError),
+        RegexRule(r".*by-hash/[A-Z0-9]+/[a-f0-9]+$", StaleIfError),
+        # Python hosted packages
+        HostContainsRule("files.pythonhosted.org", StaleIfError),
+        # cloud metadata endpoints
+        HostPrefixRule("169.254.169.", NoCache),
+        HostPrefixRule("169.254.170.", NoCache),
+        HostPrefixRule("100.100.100.", NoCache),
+        HostContainsRule("metadata.azure.internal", NoCache),
+        HostContainsRule("metadata.google.internal", NoCache),
         HostContainsRule("amazonaws.com", NoCache, exclude="codeartifact"),
-        PathContainsRule("/mitm.it/", NoCache),
-        PathContainsRule("mran.microsoft.com/snapshot/", NoRefresh),
-        RegexRule(r".*by-hash/[A-Z0-9]+/[a-f0-9]+$", NoRefresh),
+        # MRAN mirror
+        PathContainsRule("mran.microsoft.com/snapshot/", StaleIfError),
     ]
