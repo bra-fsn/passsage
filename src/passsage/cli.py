@@ -79,6 +79,12 @@ import click
     help="Allow client policy override via X-Passsage-Policy"
 )
 @click.option(
+    "--cache-redirect",
+    is_flag=True,
+    default=False,
+    help="Redirect cache hits to S3 instead of streaming through the proxy"
+)
+@click.option(
     "--health-port",
     envvar="PASSAGE_HEALTH_PORT",
     type=int,
@@ -107,6 +113,7 @@ def main(
     web,
     policy_file,
     allow_policy_header,
+    cache_redirect,
     health_port,
     health_host,
 ):
@@ -139,6 +146,8 @@ def main(
         os.environ["PASSAGE_POLICY_FILE"] = policy_file
     if allow_policy_header:
         os.environ["PASSAGE_ALLOW_POLICY_HEADER"] = "1"
+    if cache_redirect:
+        os.environ["PASSAGE_CACHE_REDIRECT"] = "1"
     if health_port is not None:
         os.environ["PASSAGE_HEALTH_PORT"] = str(health_port)
     if health_host:
@@ -175,6 +184,8 @@ def main(
         args.extend(["--set", f"policy_file={policy_file}"])
     if allow_policy_header:
         args.extend(["--set", "allow_policy_header=true"])
+    if cache_redirect:
+        args.extend(["--set", "cache_redirect=true"])
 
     if verbose:
         args.extend(["-v"])
