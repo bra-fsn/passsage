@@ -85,6 +85,12 @@ import click
     help="Redirect cache hits to S3 instead of streaming through the proxy"
 )
 @click.option(
+    "--cache-redirect-signed-url/--cache-redirect-public",
+    envvar="PASSSAGE_CACHE_REDIRECT_SIGNED_URL",
+    default=True,
+    help="Redirect cache hits to signed S3 URLs (env: PASSSAGE_CACHE_REDIRECT_SIGNED_URL)"
+)
+@click.option(
     "--public-proxy-url",
     envvar="PASSSAGE_PUBLIC_PROXY_URL",
     default="",
@@ -120,6 +126,7 @@ def main(
     policy_file,
     allow_policy_header,
     cache_redirect,
+    cache_redirect_signed_url,
     public_proxy_url,
     health_port,
     health_host,
@@ -155,6 +162,7 @@ def main(
         os.environ["PASSSAGE_ALLOW_POLICY_HEADER"] = "1"
     if cache_redirect:
         os.environ["PASSSAGE_CACHE_REDIRECT"] = "1"
+    os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL"] = "1" if cache_redirect_signed_url else "0"
     if public_proxy_url:
         os.environ["PASSSAGE_PUBLIC_PROXY_URL"] = public_proxy_url
     if health_port is not None:
@@ -195,6 +203,8 @@ def main(
         args.extend(["--set", "allow_policy_header=true"])
     if cache_redirect:
         args.extend(["--set", "cache_redirect=true"])
+    if cache_redirect_signed_url:
+        args.extend(["--set", "cache_redirect_signed_url=true"])
     if public_proxy_url:
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
