@@ -33,7 +33,67 @@ whether to serve from cache or go upstream. In brief:
 - Cache hits are served by rewriting the request to the S3 object (Cache-Status is set to
   `hit` and `Age` is derived from the stored timestamp).
 - Optionally, cache hits can be redirected to S3 (to avoid proxying bytes), using
-  `--cache-redirect` or `PASSSAGE_CACHE_REDIRECT=1`.
+  `--cache-redirect` or `PASSSAGE_CACHE_REDIRECT=1`. Signed URLs are the default for
+  cache redirects and do not require a public bucket policy. Use
+  `--cache-redirect-public` (or `PASSSAGE_CACHE_REDIRECT_SIGNED_URL=0`) to redirect
+  to public S3 objects instead.
+- When `--cache-redirect` is enabled, clients must be able to fetch cached objects from
+  S3 without AWS credentials. Configure a bucket policy to allow unauthenticated
+  `s3:GetObject`/`s3:ListBucket` from your network:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "vpc_access",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "*"
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-bucket/*",
+        "arn:aws:s3:::your-bucket"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceVpc": [
+            "vpc-xxxxxxxx",
+            "vpc-yyyyyyyy"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ip_access",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "*"
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-bucket/*",
+        "arn:aws:s3:::your-bucket"
+      ],
+      "Condition": {
+        "IpAddress": {
+          "aws:SourceIp": [
+            "203.0.113.10/32",
+            "198.51.100.42/32"
+          ]
+        }
+      }
+    }
+  ]
+}
+```
 - `NoRefresh` serves from cache immediately on a hit (no revalidation).
 - `Standard` revalidates with an upstream `HEAD` when stale; if the cached `ETag`/`Last-Modified`
   matches, the cached object is served.
