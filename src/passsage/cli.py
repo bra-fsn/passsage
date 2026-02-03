@@ -69,8 +69,8 @@ import click
 )
 @click.option(
     "--policy-file",
-    envvar="PASSAGE_POLICY_FILE",
-    help="Path to Python file defining policy overrides (env: PASSAGE_POLICY_FILE)"
+    envvar="PASSSAGE_POLICY_FILE",
+    help="Path to Python file defining policy overrides (env: PASSSAGE_POLICY_FILE)"
 )
 @click.option(
     "--allow-policy-header",
@@ -85,19 +85,25 @@ import click
     help="Redirect cache hits to S3 instead of streaming through the proxy"
 )
 @click.option(
+    "--public-proxy-url",
+    envvar="PASSSAGE_PUBLIC_PROXY_URL",
+    default="",
+    help="Public proxy URL embedded in mitm.it/proxy-env responses (env: PASSSAGE_PUBLIC_PROXY_URL)"
+)
+@click.option(
     "--health-port",
-    envvar="PASSAGE_HEALTH_PORT",
+    envvar="PASSSAGE_HEALTH_PORT",
     type=int,
     default=8082,
     show_default=True,
-    help="Health endpoint port (env: PASSAGE_HEALTH_PORT, 0 disables)"
+    help="Health endpoint port (env: PASSSAGE_HEALTH_PORT, 0 disables)"
 )
 @click.option(
     "--health-host",
-    envvar="PASSAGE_HEALTH_HOST",
+    envvar="PASSSAGE_HEALTH_HOST",
     default="0.0.0.0",
     show_default=True,
-    help="Health endpoint bind host (env: PASSAGE_HEALTH_HOST)"
+    help="Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)"
 )
 @click.version_option()
 def main(
@@ -114,6 +120,7 @@ def main(
     policy_file,
     allow_policy_header,
     cache_redirect,
+    public_proxy_url,
     health_port,
     health_host,
 ):
@@ -143,15 +150,17 @@ def main(
     if s3_endpoint:
         os.environ["S3_ENDPOINT_URL"] = s3_endpoint
     if policy_file:
-        os.environ["PASSAGE_POLICY_FILE"] = policy_file
+        os.environ["PASSSAGE_POLICY_FILE"] = policy_file
     if allow_policy_header:
-        os.environ["PASSAGE_ALLOW_POLICY_HEADER"] = "1"
+        os.environ["PASSSAGE_ALLOW_POLICY_HEADER"] = "1"
     if cache_redirect:
-        os.environ["PASSAGE_CACHE_REDIRECT"] = "1"
+        os.environ["PASSSAGE_CACHE_REDIRECT"] = "1"
+    if public_proxy_url:
+        os.environ["PASSSAGE_PUBLIC_PROXY_URL"] = public_proxy_url
     if health_port is not None:
-        os.environ["PASSAGE_HEALTH_PORT"] = str(health_port)
+        os.environ["PASSSAGE_HEALTH_PORT"] = str(health_port)
     if health_host:
-        os.environ["PASSAGE_HEALTH_HOST"] = health_host
+        os.environ["PASSSAGE_HEALTH_HOST"] = health_host
 
     if debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -186,6 +195,8 @@ def main(
         args.extend(["--set", "allow_policy_header=true"])
     if cache_redirect:
         args.extend(["--set", "cache_redirect=true"])
+    if public_proxy_url:
+        args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
     if verbose:
         args.extend(["-v"])

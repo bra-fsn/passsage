@@ -18,9 +18,9 @@ from passsage.test_server import TestServer
 urllib3.disable_warnings(InsecureRequestWarning)
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8080")
-TEST_SERVER_BIND_HOST = os.environ.get("PASSAGE_TEST_SERVER_BIND_HOST", "127.0.0.1")
-TEST_SERVER_PUBLIC_HOST = os.environ.get("PASSAGE_TEST_SERVER_HOST")
-SYNC_SETTLE_SECONDS = float(os.environ.get("PASSAGE_SYNC_SETTLE_SECONDS", "1.0"))
+TEST_SERVER_BIND_HOST = os.environ.get("PASSSAGE_TEST_SERVER_BIND_HOST", "127.0.0.1")
+TEST_SERVER_PUBLIC_HOST = os.environ.get("PASSSAGE_TEST_SERVER_HOST")
+SYNC_SETTLE_SECONDS = float(os.environ.get("PASSSAGE_SYNC_SETTLE_SECONDS", "1.0"))
 POLICY_HEADER = "X-Passsage-Policy"
 
 CONCURRENT_DELAY = 5
@@ -65,7 +65,7 @@ def cache_bust_random():
 
 @pytest.fixture(scope="module", autouse=True)
 def test_server():
-    # Use PASSAGE_TEST_SERVER_HOST when the proxy runs in a container (e.g. host.docker.internal).
+    # Use PASSSAGE_TEST_SERVER_HOST when the proxy runs in a container (e.g. host.docker.internal).
     server = TestServer(public_host=TEST_SERVER_PUBLIC_HOST)
     server.start(host=TEST_SERVER_BIND_HOST, port=0)
     yield server
@@ -623,8 +623,8 @@ class TestProxyLive:
 
     def test_refresh_pattern_override(self, proxy_session, test_server, cache_bust_random):
         # Ensures refresh_pattern overrides response headers for caching decisions.
-        if not os.environ.get("PASSAGE_REFRESH_PATTERN"):
-            pytest.skip("PASSAGE_REFRESH_PATTERN not configured for proxy")
+        if not os.environ.get("PASSSAGE_REFRESH_PATTERN"):
+            pytest.skip("PASSSAGE_REFRESH_PATTERN not configured for proxy")
         test_server.reset()
         url = test_server.url(f"/cache-control/no-store?random={cache_bust_random}")
         r1 = proxy_get(proxy_session, url, timeout=30)

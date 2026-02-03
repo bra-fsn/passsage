@@ -158,13 +158,13 @@ pytest
 ## Integration test notes
 
 The integration suite relies on `X-Passsage-Policy` overrides. Enable them with
-`PASSAGE_ALLOW_POLICY_HEADER=1` or `passsage --allow-policy-header`.
+`PASSSAGE_ALLOW_POLICY_HEADER=1` or `passsage --allow-policy-header`.
 
 If the proxy runs in a container, ensure the host test server is reachable:
 
 ```bash
-export PASSAGE_TEST_SERVER_BIND_HOST=0.0.0.0
-export PASSAGE_TEST_SERVER_HOST=host.docker.internal
+export PASSSAGE_TEST_SERVER_BIND_HOST=0.0.0.0
+export PASSSAGE_TEST_SERVER_HOST=host.docker.internal
 export PROXY_URL=http://localhost:${PASSSAGE_PORT:-8080}
 pytest -m "not slow"
 ```

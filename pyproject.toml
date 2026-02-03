@@ -63,12 +63,14 @@ path = "src/passsage/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/passsage"]
+include = ["src/passsage/onboarding/proxy-env.sh"]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "/src",
     "/README.md",
     "/LICENSE",
+    "/src/passsage/onboarding/proxy-env.sh",
 ]
 
 [tool.ruff]
