@@ -1669,7 +1669,19 @@ class Proxy:
                     flow._save_response = False
 
     @staticmethod
-    def _save_to_cache(status_code, reason, method, f, digest, headers, url, cache_key, vary_header, vary_request):
+    def _save_to_cache(
+        status_code,
+        reason,
+        method,
+        f,
+        digest,
+        headers,
+        url,
+        cache_key,
+        vary_header,
+        vary_request,
+        normalized_url,
+    ):
         try:
             extras = {"Metadata": {
                 "status-code": str(status_code),
@@ -1719,7 +1731,7 @@ class Proxy:
             if vary_header:
                 s3.put_object(
                     Bucket=S3_BUCKET,
-                    Key=get_vary_index_key(url),
+                    Key=get_vary_index_key(normalized_url),
                     Metadata={"vary": vary_header},
                 )
         except Exception as e:
@@ -1807,7 +1819,8 @@ class Proxy:
                 with ctx._lock:
                     self.cleanup(flow)
                 return
-            cache_key = flow._cache_key or get_cache_key(flow.request.url)
+            normalized_url = get_quoted_url(flow)
+            cache_key = flow._cache_key or get_cache_key(normalized_url)
             LOG.debug("Cache save enqueue key=%s", cache_key)
             ctx._executor.submit(
                 self._save_to_cache,
@@ -1823,6 +1836,7 @@ class Proxy:
                 cache_key,
                 getattr(flow, "_cache_vary", None),
                 getattr(flow, "_cache_vary_request", None),
+                normalized_url,
             )
 
         if flow.response.status_code == 304:
