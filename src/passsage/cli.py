@@ -40,29 +40,33 @@ import click
     "--test",
     is_flag=True,
     default=False,
+    envvar="PASSSAGE_TEST",
     show_default=True,
-    help="Run in test mode (banned sites are not released)"
+    help="Run in test mode (banned sites are not released) (env: PASSSAGE_TEST)"
 )
 @click.option(
     "-m", "--mode",
     type=click.Choice(["regular", "transparent", "wireguard", "upstream"]),
     default="regular",
+    envvar="PASSSAGE_MODE",
     show_default=True,
-    help="Proxy mode (default: regular)"
+    help="Proxy mode (default: regular) (env: PASSSAGE_MODE)"
 )
 @click.option(
     "-v", "--verbose",
     is_flag=True,
     default=False,
+    envvar="PASSSAGE_VERBOSE",
     show_default=True,
-    help="Enable verbose logging"
+    help="Enable verbose logging (env: PASSSAGE_VERBOSE)"
 )
 @click.option(
     "--debug",
     is_flag=True,
     default=False,
+    envvar="PASSSAGE_DEBUG",
     show_default=True,
-    help="Enable debug logging for proxy internals"
+    help="Enable debug logging for proxy internals (env: PASSSAGE_DEBUG)"
 )
 @click.option(
     "--debug-proxy",
@@ -76,8 +80,9 @@ import click
     "--web",
     is_flag=True,
     default=False,
+    envvar="PASSSAGE_WEB",
     show_default=True,
-    help="Enable mitmproxy web interface"
+    help="Enable mitmproxy web interface (env: PASSSAGE_WEB)"
 )
 @click.option(
     "--policy-file",
@@ -89,15 +94,17 @@ import click
     "--allow-policy-header",
     is_flag=True,
     default=False,
+    envvar="PASSSAGE_ALLOW_POLICY_HEADER",
     show_default=True,
-    help="Allow client policy override via X-Passsage-Policy"
+    help="Allow client policy override via X-Passsage-Policy (env: PASSSAGE_ALLOW_POLICY_HEADER)"
 )
 @click.option(
     "--cache-redirect",
     is_flag=True,
     default=False,
+    envvar="PASSSAGE_CACHE_REDIRECT",
     show_default=True,
-    help="Redirect cache hits to S3 instead of streaming through the proxy"
+    help="Redirect cache hits to S3 instead of streaming through the proxy (env: PASSSAGE_CACHE_REDIRECT)"
 )
 @click.option(
     "--cache-redirect-signed-url/--cache-redirect-public",
@@ -117,6 +124,7 @@ import click
     "--access-logs",
     is_flag=True,
     default=True,
+    envvar="PASSSAGE_ACCESS_LOGS",
     show_default=True,
     help="Enable S3 access logs in Parquet format (env: PASSSAGE_ACCESS_LOGS)"
 )
@@ -160,6 +168,7 @@ import click
     "--error-logs",
     is_flag=True,
     default=True,
+    envvar="PASSSAGE_ERROR_LOGS",
     show_default=True,
     help="Enable S3 error logs with tracebacks in Parquet format (env: PASSSAGE_ERROR_LOGS)",
 )
