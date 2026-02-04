@@ -1,13 +1,17 @@
+import json
 import os
 import statistics
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 
 import pyarrow.dataset as ds
 import s3fs
+from rich import box
+from rich.console import Group
+from rich.table import Table
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
 
@@ -77,6 +81,9 @@ class ToggleFocusTable(DataTable):
         if event.key in ("tab", "shift+tab"):
             event.stop()
             self.app.action_toggle_focus()
+        if event.key == "enter":
+            event.stop()
+            self.app.action_show_details()
 
 
 class QueryInput(Input):
@@ -90,6 +97,21 @@ class QueryInput(Input):
         if event.key == "escape":
             event.stop()
             self.app.action_hide_query()
+
+
+class DetailsScreen(ModalScreen):
+    def __init__(self, content) -> None:
+        super().__init__()
+        self._content = content
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Static(self._content)
+
+    def on_key(self, event) -> None:
+        if event.key in ("escape", "q", "enter"):
+            event.stop()
+            self.app.pop_screen()
 
 
 class AccessLogApp(App):
@@ -110,6 +132,7 @@ class AccessLogApp(App):
         super().__init__()
         self._rows = rows
         self._filtered = rows
+        self._visible_rows: list[dict] = []
         self._query_value = ""
         self._summary = Static(id="summary")
         self._table = ToggleFocusTable(id="table")
@@ -200,7 +223,8 @@ class AccessLogApp(App):
 
     def _render_table(self, rows: list[dict]) -> None:
         self._table.clear()
-        for row in rows[:500]:
+        self._visible_rows = rows[:500]
+        for row in self._visible_rows:
             ts = row.get("timestamp")
             ts_text = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
             self._table.add_row(
@@ -214,6 +238,111 @@ class AccessLogApp(App):
                 str(row.get("bytes_sent") or ""),
                 row.get("user_agent") or "",
             )
+
+    def action_show_details(self) -> None:
+        if not self._visible_rows:
+            return
+        row_index = self._table.cursor_row
+        if row_index is None or row_index >= len(self._visible_rows):
+            return
+        row = self._visible_rows[row_index]
+        self.push_screen(DetailsScreen(_build_details_renderable(row)))
+
+
+def _format_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def _format_kv_table(title: str, items: list[tuple[str, str]]) -> Table:
+    table = Table(title=title, box=box.SIMPLE, show_header=False)
+    table.add_column("key", style="bold cyan", no_wrap=True)
+    table.add_column("value", style="white")
+    for key, value in items:
+        table.add_row(key, value)
+    return table
+
+
+def _format_headers_table(title: str, headers) -> Table | None:
+    if not headers:
+        return None
+    if isinstance(headers, list):
+        headers = {k: v for k, v in headers if len((k, v)) == 2}
+    table = Table(title=title, box=box.SIMPLE, show_header=False)
+    table.add_column("header", style="bold magenta", no_wrap=True)
+    table.add_column("value", style="white")
+    for key in sorted(headers.keys()):
+        table.add_row(key, str(headers[key]))
+    return table
+
+
+def _build_details_renderable(row: dict):
+    request_items = [
+        ("timestamp", _format_value(row.get("timestamp"))),
+        ("request_id", _format_value(row.get("request_id"))),
+        ("method", _format_value(row.get("method"))),
+        ("url", _format_value(row.get("url"))),
+        ("host", _format_value(row.get("host"))),
+        ("path", _format_value(row.get("path"))),
+        ("query", _format_value(row.get("query"))),
+        ("scheme", _format_value(row.get("scheme"))),
+        ("port", _format_value(row.get("port"))),
+        ("client_ip", _format_value(row.get("client_ip"))),
+        ("client_port", _format_value(row.get("client_port"))),
+        ("user_agent", _format_value(row.get("user_agent"))),
+    ]
+    response_items = [
+        ("status_code", _format_value(row.get("status_code"))),
+        ("reason", _format_value(row.get("reason"))),
+        ("content_length", _format_value(row.get("content_length"))),
+        ("content_type", _format_value(row.get("content_type"))),
+        ("content_encoding", _format_value(row.get("content_encoding"))),
+    ]
+    cache_items = [
+        ("policy", _format_value(row.get("policy"))),
+        ("cached", _format_value(row.get("cached"))),
+        ("cache_redirect", _format_value(row.get("cache_redirect"))),
+        ("cache_key", _format_value(row.get("cache_key"))),
+        ("cache_vary", _format_value(row.get("cache_vary"))),
+        ("cache_hit", _format_value(row.get("cache_hit"))),
+        ("cache_fresh", _format_value(row.get("cache_fresh"))),
+        ("stale_while_revalidate", _format_value(row.get("stale_while_revalidate"))),
+        ("stale_if_error", _format_value(row.get("stale_if_error"))),
+        ("cache_head_status", _format_value(row.get("cache_head_status"))),
+        ("cache_head_etag", _format_value(row.get("cache_head_etag"))),
+        ("cache_head_last_modified", _format_value(row.get("cache_head_last_modified"))),
+        ("cache_head_method", _format_value(row.get("cache_head_method"))),
+    ]
+    upstream_items = [
+        ("upstream_head_status", _format_value(row.get("upstream_head_status"))),
+        ("upstream_head_time_ms", _format_value(row.get("upstream_head_time_ms"))),
+        ("upstream_error", _format_value(row.get("upstream_error"))),
+    ]
+    timing_items = [
+        ("duration_ms", _format_value(row.get("duration_ms"))),
+        ("bytes_sent", _format_value(row.get("bytes_sent"))),
+    ]
+    error_items = [
+        ("error", _format_value(row.get("error"))),
+    ]
+    group_items = [
+        _format_kv_table("Request", request_items),
+        _format_kv_table("Response", response_items),
+        _format_kv_table("Cache", cache_items),
+        _format_kv_table("Upstream", upstream_items),
+        _format_kv_table("Timing", timing_items),
+        _format_kv_table("Errors", error_items),
+    ]
+    req_headers_table = _format_headers_table("Request Headers", row.get("request_headers"))
+    if req_headers_table:
+        group_items.append(req_headers_table)
+    resp_headers_table = _format_headers_table("Response Headers", row.get("response_headers"))
+    if resp_headers_table:
+        group_items.append(resp_headers_table)
+    return Group(*group_items)
 
 
 def run_logs_ui(bucket: str, prefix: str, start_date: str, end_date: str, limit: int | None) -> None:
