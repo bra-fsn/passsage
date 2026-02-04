@@ -40,3 +40,15 @@ def test_signed_storage_rule_strips_azure_params():
     assert normalized == "https://pkg-containers.githubusercontent.com/ghcr1/blobs/sha256:abc?keep=1"
 
 
+def test_signed_storage_rule_sorts_remaining_query():
+    url = (
+        "https://example.r2.cloudflarestorage.com/blob"
+        "?X-Amz-Date=20260204T210046Z"
+        "&b=2"
+        "&a=1"
+        "&A=3"
+    )
+    normalized = _strip_for(url)
+    assert normalized == "https://example.r2.cloudflarestorage.com/blob?A=3&a=1&b=2"
+
+
