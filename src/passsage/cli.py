@@ -69,7 +69,8 @@ import click
     is_flag=True,
     default=False,
     show_default=True,
-    help="Enable debug logging for passsage proxy only"
+    envvar="PASSSAGE_DEBUG_PROXY",
+    help="Enable debug logging for passsage proxy only (env: PASSSAGE_DEBUG_PROXY)"
 )
 @click.option(
     "--web",
