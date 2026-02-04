@@ -28,6 +28,8 @@ CONCURRENT_DELAY = 5
 # takes ~2*CONCURRENT_DELAY. We expect concurrency, so each request should finish
 # well under 2*CONCURRENT_DELAY*2 (sequential) and allow some buffer.
 CONCURRENT_MAX_RESPONSE_TIME = CONCURRENT_DELAY * 4 * 0.8
+UPSTREAM_TIMEOUT_DELAY = 12
+UPSTREAM_CLIENT_TIMEOUT = 20
 
 
 def get_method_count(stats: dict, path: str, method: str) -> int:
@@ -229,6 +231,53 @@ class TestProxyLive:
         stats = test_server.stats()
         assert get_method_count(stats, "/policy/NoCache", "GET") == 2
         assert "Cache-Status" not in r2.headers
+
+    def test_upstream_connection_refused(self, proxy_session):
+        url = "http://127.0.0.1:1/connection-refused"
+        resp = proxy_get(proxy_session, url, timeout=UPSTREAM_CLIENT_TIMEOUT)
+        assert resp.status_code == 502
+        assert "Upstream connection failed" in resp.text
+
+    @pytest.mark.parametrize(
+        ("policy_name", "expect_cached", "expect_status"),
+        [
+            ("Standard", False, 504),
+            ("StaleIfError", True, 200),
+            ("NoRefresh", True, 200),
+            ("AlwaysUpstream", False, 504),
+        ],
+    )
+    def test_upstream_timeout_policies(
+        self,
+        proxy_session,
+        test_server,
+        cache_bust_random,
+        policy_name,
+        expect_cached,
+        expect_status,
+    ):
+        test_server.reset()
+        url = test_server.url(
+            f"/cache-control/max-age-low?random={cache_bust_random}&case={policy_name}"
+        )
+        r1 = proxy_get(proxy_session, url, headers=policy_headers(policy_name), timeout=30)
+        assert r1.ok
+        time.sleep(2)
+        test_server.set_path_override(
+            "/cache-control/max-age-low",
+            delay=UPSTREAM_TIMEOUT_DELAY,
+        )
+        r2 = proxy_get(
+            proxy_session,
+            url,
+            headers=policy_headers(policy_name),
+            timeout=UPSTREAM_CLIENT_TIMEOUT,
+        )
+        assert r2.status_code == expect_status
+        if expect_cached:
+            assert_cached_response(r2)
+        else:
+            assert "Cache-Status" not in r2.headers
 
     def test_policy_always_upstream(self, proxy_session, test_server, cache_bust_random):
         # Ensures AlwaysUpstream always fetches from upstream even when cached.
