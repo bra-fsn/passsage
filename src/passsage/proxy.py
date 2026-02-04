@@ -33,9 +33,15 @@ from mitmproxy.script import concurrent
 from botocore.exceptions import ClientError
 from werkzeug.http import parse_date
 
+from passsage.cache_key import (
+    CacheKeyResolver,
+    Context as CacheKeyContext,
+    get_default_cache_key_resolver,
+    set_default_cache_key_resolver,
+)
 from passsage.policy import (
     POLICY_BY_NAME,
-    Context,
+    Context as PolicyContext,
     NoCache,
     NoRefresh,
     PolicyResolver,
@@ -276,33 +282,78 @@ def _load_policy_overrides(path: str) -> None:
     except Exception as exc:
         LOG.error("Policy file load failed path=%s error=%s", path, exc)
         return
+    policy_loaded = False
+    cache_key_loaded = False
 
     if hasattr(module, "get_resolver"):
         resolver = module.get_resolver()
         if isinstance(resolver, PolicyResolver):
             set_default_resolver(resolver)
             LOG.info("Policy overrides loaded via get_resolver path=%s", path)
-            return
-        LOG.error("Policy file get_resolver did not return PolicyResolver path=%s", path)
-        return
-    if hasattr(module, "get_rules"):
+            policy_loaded = True
+        else:
+            LOG.error("Policy file get_resolver did not return PolicyResolver path=%s", path)
+    elif hasattr(module, "get_rules"):
         rules = module.get_rules()
         if rules:
             set_default_resolver(PolicyResolver(rules=rules))
             LOG.info("Policy overrides loaded via get_rules path=%s", path)
-            return
-        LOG.error("Policy file get_rules returned no rules path=%s", path)
-        return
-    if hasattr(module, "RULES"):
+            policy_loaded = True
+        else:
+            LOG.error("Policy file get_rules returned no rules path=%s", path)
+    elif hasattr(module, "RULES"):
         rules = module.RULES
         if rules:
             set_default_resolver(PolicyResolver(rules=rules))
             LOG.info("Policy overrides loaded via RULES path=%s", path)
-            return
-        LOG.error("Policy file RULES is empty path=%s", path)
-        return
+            policy_loaded = True
+        else:
+            LOG.error("Policy file RULES is empty path=%s", path)
 
-    LOG.error("Policy file missing get_resolver/get_rules/RULES path=%s", path)
+    if hasattr(module, "get_cache_key_resolver"):
+        resolver = module.get_cache_key_resolver()
+        if isinstance(resolver, CacheKeyResolver):
+            set_default_cache_key_resolver(resolver)
+            LOG.info("Cache key overrides loaded via get_cache_key_resolver path=%s", path)
+            cache_key_loaded = True
+        else:
+            LOG.error(
+                "Policy file get_cache_key_resolver did not return CacheKeyResolver path=%s",
+                path,
+            )
+    elif hasattr(module, "CACHE_KEY_RESOLVER"):
+        resolver = module.CACHE_KEY_RESOLVER
+        if isinstance(resolver, CacheKeyResolver):
+            set_default_cache_key_resolver(resolver)
+            LOG.info("Cache key overrides loaded via CACHE_KEY_RESOLVER path=%s", path)
+            cache_key_loaded = True
+        else:
+            LOG.error(
+                "Policy file CACHE_KEY_RESOLVER is not CacheKeyResolver path=%s",
+                path,
+            )
+    elif hasattr(module, "get_cache_key_rules"):
+        rules = module.get_cache_key_rules()
+        if rules:
+            set_default_cache_key_resolver(CacheKeyResolver(rules=rules))
+            LOG.info("Cache key overrides loaded via get_cache_key_rules path=%s", path)
+            cache_key_loaded = True
+        else:
+            LOG.error("Policy file get_cache_key_rules returned no rules path=%s", path)
+    elif hasattr(module, "CACHE_KEY_RULES"):
+        rules = module.CACHE_KEY_RULES
+        if rules:
+            set_default_cache_key_resolver(CacheKeyResolver(rules=rules))
+            LOG.info("Cache key overrides loaded via CACHE_KEY_RULES path=%s", path)
+            cache_key_loaded = True
+        else:
+            LOG.error("Policy file CACHE_KEY_RULES is empty path=%s", path)
+
+    if not policy_loaded and not cache_key_loaded:
+        LOG.error(
+            "Policy file missing policy or cache-key hooks path=%s",
+            path,
+        )
 
 
 def save_response(proxy, flow, data: bytes) -> Union[bytes, Iterable[bytes]]:
@@ -334,7 +385,7 @@ def get_policy(flow):
                 LOG.debug("Policy header override=%s", policy_name)
                 return policy
             LOG.warning("Unknown policy header override=%s", policy_name)
-    request_ctx = Context(
+    request_ctx = PolicyContext(
         url=flow.request.url,
         method=flow.request.method,
         headers=list(flow.request.headers.items()) if flow.request.headers else None,
@@ -896,7 +947,13 @@ def _build_error_log_record(
 
 
 def get_quoted_url(flow):
-    return flow.request.url
+    request_ctx = CacheKeyContext(
+        url=flow.request.url,
+        method=flow.request.method,
+        headers=list(flow.request.headers.items()) if flow.request.headers else None,
+    )
+    resolver = get_default_cache_key_resolver()
+    return resolver.resolve(request_ctx)
 
 
 def get_cache_key(url: str, vary_key: str | None = None) -> str:
@@ -1270,7 +1327,8 @@ class Proxy:
         flow._cache_key = None
         flow._cache_vary = None
         try:
-            vary_index_key = get_vary_index_key(flow.request.url)
+            normalized_url = get_quoted_url(flow)
+            vary_index_key = get_vary_index_key(normalized_url)
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
             vary_index_head = s3_head_object(vary_index_key)
             if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.headers.get("x-amz-meta-vary")):
@@ -1278,7 +1336,7 @@ class Proxy:
                 if "*" not in vary_hdr:
                     vary_key = compute_vary_key(vary_hdr, flow.request.headers)
                     if vary_key is not None:
-                        flow._cache_key = get_cache_key(flow.request.url, vary_key)
+                        flow._cache_key = get_cache_key(normalized_url, vary_key)
                         LOG.debug(
                             "Cache lookup vary header=%s vary_key=%s cache_key=%s",
                             vary_hdr,
@@ -1286,7 +1344,7 @@ class Proxy:
                             flow._cache_key,
                         )
             if flow._cache_key is None and flow._cache_vary != "*":
-                flow._cache_key = get_cache_key(flow.request.url)
+                flow._cache_key = get_cache_key(normalized_url)
                 LOG.debug("Cache lookup default key=%s", flow._cache_key)
             if flow._cache_key:
                 flow._cache_head = s3_head_object(flow._cache_key)
@@ -1713,7 +1771,8 @@ class Proxy:
             else:
                 vary_key = compute_vary_key(vary_header, flow.request.headers)
                 if vary_key:
-                    flow._cache_key = get_cache_key(flow.request.url, vary_key)
+                    normalized_url = get_quoted_url(flow)
+                    flow._cache_key = get_cache_key(normalized_url, vary_key)
                     flow._cache_vary = vary_header
                     flow._cache_vary_request = build_vary_request(
                         vary_header, flow.request.headers
