@@ -760,7 +760,8 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
     start_ts = getattr(flow, "_access_log_start", now)
     duration_ms = int((now - start_ts) * 1000)
     start_dt = datetime.fromtimestamp(start_ts, tz=pytz.utc)
-    parsed = urlparse(flow.request.url)
+    request_url = getattr(flow, "_req_orig_url", None) or flow.request.url
+    parsed = urlparse(request_url)
     client_addr = getattr(flow.client_conn, "peername", None) or ()
     client_ip = client_addr[0] if isinstance(client_addr, tuple) and client_addr else None
     client_port = client_addr[1] if isinstance(client_addr, tuple) and len(client_addr) > 1 else None
@@ -789,7 +790,7 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "client_ip": client_ip,
         "client_port": _safe_int(client_port),
         "method": flow.request.method,
-        "url": flow.request.url,
+        "url": request_url,
         "host": parsed.hostname,
         "scheme": parsed.scheme,
         "port": _safe_int(parsed.port),
