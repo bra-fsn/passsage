@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 import boto3
 import pytz
 import requests
+from requests.exceptions import ConnectionError as RequestsConnectionError
 from cachetools import TTLCache
 from mitmproxy import ctx, http
 from mitmproxy.script import concurrent
@@ -339,6 +340,26 @@ def http_2xx(r):
     if r and 200 <= r.status_code <= 299:
         return True
     return False
+
+
+def _is_connection_error(err: Exception | None) -> bool:
+    if not err:
+        return False
+    if isinstance(err, RequestsConnectionError):
+        return True
+    return "Connection refused" in str(err) or "Failed to establish a new connection" in str(err)
+
+
+def _build_upstream_error_response(status_code: int, title: str, detail: str) -> http.Response:
+    body = f"""<html>
+<head><title>{status_code} {title}</title></head>
+<body>
+<center><h1>{status_code} {title}</h1></center>
+<p>Upstream request failed.</p>
+<pre>{detail}</pre>
+</body>
+</html>""".encode("utf-8")
+    return http.Response.make(status_code, body, {"Content-Type": "text/html"})
 
 
 def parse_cache_control(value: str) -> dict[str, str | bool]:
@@ -1421,28 +1442,24 @@ class Proxy:
             flow._save_response = False
             if _is_tls_verify_error(flow._upstream_error):
                 detail = str(flow._upstream_error) if flow._upstream_error else "unknown"
-                flow.response = http.Response.make(
+                flow.response = _build_upstream_error_response(
                     502,
-                    f"""<html>
-<head><title>502 Bad Gateway</title></head>
-<body>
-<center><h1>502 Bad Gateway</h1></center>
-<p>Upstream TLS certificate verification failed.</p>
-<pre>{detail}</pre>
-</body>
-    </html>""".encode("utf-8"),
-                    {"Content-Type": "text/html"},
+                    "Bad Gateway",
+                    f"TLS certificate verification failed.\n{detail}",
+                )
+            elif _is_connection_error(flow._upstream_error):
+                detail = str(flow._upstream_error) if flow._upstream_error else "connection error"
+                flow.response = _build_upstream_error_response(
+                    502,
+                    "Bad Gateway",
+                    f"Upstream connection failed.\n{detail}",
                 )
             else:
-                flow.response = http.Response.make(
+                detail = str(flow._upstream_error) if flow._upstream_error else "upstream timeout"
+                flow.response = _build_upstream_error_response(
                     504,
-                    b"""<html>
-<head><title>504 Gateway Time-out</title></head>
-<body>
-<center><h1>504 Gateway Time-out</h1></center>
-</body>
-</html>""",
-                    {"Content-Type": "text/html"},
+                    "Gateway Timeout",
+                    detail,
                 )
             return
 
