@@ -362,6 +362,10 @@ def _build_upstream_error_response(status_code: int, title: str, detail: str) ->
     return http.Response.make(status_code, body, {"Content-Type": "text/html"})
 
 
+def _is_s3_cache_request(flow: http.HTTPFlow) -> bool:
+    return flow.request.pretty_host == S3_HOST
+
+
 def parse_cache_control(value: str) -> dict[str, str | bool]:
     directives: dict[str, str | bool] = {}
     if not value:
@@ -1183,6 +1187,12 @@ class Proxy:
         flow._allow_stale_if_error = False
         flow._save_response = True
         policy = flow._policy = get_policy(flow)
+        if _is_s3_cache_request(flow):
+            # If a client proxies the S3 redirect URL back through us, avoid re-caching
+            # the cached object again and create a loop. Force NoCache for S3 host.
+            flow._save_response = False
+            flow._policy = NoCache
+            return
         if flow.request.pretty_host == "mitm.it" and flow.request.path in ("/proxy-env", "/proxy-env.sh"):
             public_url = getattr(ctx.options, "public_proxy_url", "").strip()
             if public_url:
