@@ -536,5 +536,121 @@ def errors(start_date, end_date, limit, s3_bucket, error_log_prefix):
     run_errors_ui(bucket, error_log_prefix, start_date, end_date, limit)
 
 
+@main.command("cache-keys")
+@click.option(
+    "--start-date",
+    default=date.today().isoformat(),
+    show_default=True,
+    help="Start date (YYYY-MM-DD)",
+)
+@click.option(
+    "--end-date",
+    default=date.today().isoformat(),
+    show_default=True,
+    help="End date (YYYY-MM-DD)",
+)
+@click.option(
+    "--s3-bucket",
+    envvar="S3_BUCKET",
+    default="",
+    show_default=True,
+    help="S3 bucket for access logs (env: S3_BUCKET)",
+)
+@click.option(
+    "--access-log-prefix",
+    envvar="PASSSAGE_ACCESS_LOG_PREFIX",
+    default="__passsage_logs__",
+    show_default=True,
+    help="S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)",
+)
+@click.option(
+    "--db-path",
+    default="/tmp/passsage-cache-key-audit.sqlite",
+    show_default=True,
+    help="SQLite file used for aggregation",
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=5000,
+    show_default=True,
+    help="Rows per parquet batch to scan",
+)
+@click.option(
+    "--min-distinct",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Minimum distinct values per param",
+)
+@click.option(
+    "--min-paths",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Minimum distinct paths per param",
+)
+@click.option(
+    "--min-misses",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Minimum cache-miss count per param",
+)
+@click.option(
+    "--top",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Maximum number of candidates to show",
+)
+@click.option(
+    "--reset-db",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Delete the SQLite file before scanning",
+)
+def cache_keys(
+    start_date,
+    end_date,
+    s3_bucket,
+    access_log_prefix,
+    db_path,
+    batch_size,
+    min_distinct,
+    min_paths,
+    min_misses,
+    top,
+    reset_db,
+):
+    from passsage.log_analysis import analyze_cache_fragmentation
+
+    bucket = s3_bucket or os.environ.get("S3_BUCKET", "")
+    if not bucket:
+        raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
+    candidates = analyze_cache_fragmentation(
+        bucket=bucket,
+        prefix=access_log_prefix,
+        start_date=start_date,
+        end_date=end_date,
+        db_path=db_path,
+        batch_size=batch_size,
+        min_distinct=min_distinct,
+        min_paths=min_paths,
+        min_misses=min_misses,
+        top=top,
+        reset_db=reset_db,
+    )
+    if not candidates:
+        click.echo("No candidates found.")
+        return
+    click.echo("host\tparam\tdistinct_values\tpaths\tmisses")
+    for entry in candidates:
+        click.echo(
+            f"{entry.host}\t{entry.param}\t{entry.distinct_values}\t{entry.paths}\t{entry.misses}"
+        )
+
+
 if __name__ == "__main__":
     main()
