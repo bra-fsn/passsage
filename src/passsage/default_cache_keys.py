@@ -46,11 +46,10 @@ Example override (policy file):
         return [CallableRule(strip_signed_r2)]
 """
 
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from dataclasses import dataclass
 from typing import Callable, Optional
-from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
