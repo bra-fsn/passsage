@@ -1,7 +1,7 @@
 import json
 import os
 import statistics
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import pyarrow.dataset as ds
@@ -42,6 +42,16 @@ def _format_bytes(value: int) -> str:
             return f"{size:.1f}{unit}"
         size /= 1024.0
     return f"{size:.1f}TB"
+
+
+def _format_timestamp(value) -> str:
+    if not isinstance(value, datetime):
+        return str(value)
+    dt = value.astimezone(timezone.utc) if value.tzinfo else value
+    base = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    frac = int(dt.microsecond / 10000)
+    suffix = "Z" if dt.tzinfo else ""
+    return f"{base}.{frac:02d}{suffix}"
 
 
 def _load_parquet_logs(bucket: str, prefix: str, start: date, end: date, limit: int | None):
@@ -329,7 +339,7 @@ class AccessLogApp(App):
         self._visible_rows = rows[:500]
         for row in self._visible_rows:
             ts = row.get("timestamp")
-            ts_text = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            ts_text = _format_timestamp(ts) if ts else ""
             if self._view == "error":
                 message = row.get("error_message") or ""
                 if len(message) > 120:
@@ -411,6 +421,8 @@ class AccessLogApp(App):
 def _format_value(value) -> str:
     if value is None:
         return ""
+    if isinstance(value, datetime):
+        return _format_timestamp(value)
     if isinstance(value, dict):
         return json.dumps(value, sort_keys=True)
     return str(value)
