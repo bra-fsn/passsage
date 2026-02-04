@@ -538,6 +538,10 @@ def cache_freshness(
         and age_seconds <= ttl_seconds + stale_if_error_seconds
     ):
         allow_stale_if_error = True
+    if not allow_stale_if_error and "immutable" in cc and not is_fresh and ttl_seconds is not None:
+        # Immutable implies the resource is versioned; if upstream fails after expiry,
+        # allow serving the stale cached copy even without stale-if-error.
+        allow_stale_if_error = True
     return CacheFreshness(
         age_seconds=age_seconds,
         ttl_seconds=ttl_seconds,
