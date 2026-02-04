@@ -41,6 +41,7 @@ from passsage.policy import (
     policy_from_name,
     set_default_resolver,
 )
+from passsage.access_logs import AccessLogWriter, build_access_log_config
 
 try:
     from passsage import __version__
@@ -90,6 +91,20 @@ SIGNED_CACHE_REDIRECT = os.environ.get("PASSSAGE_CACHE_REDIRECT_SIGNED_URL", "")
     "no",
 )
 PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
+ACCESS_LOGS = os.environ.get("PASSSAGE_ACCESS_LOGS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+ACCESS_LOG_PREFIX = os.environ.get("PASSSAGE_ACCESS_LOG_PREFIX", "__passsage_logs__").strip()
+ACCESS_LOG_DIR = os.environ.get("PASSSAGE_ACCESS_LOG_DIR", "/tmp/passsage-logs").strip()
+ACCESS_LOG_FLUSH_SECONDS = os.environ.get("PASSSAGE_ACCESS_LOG_FLUSH_SECONDS", "30").strip()
+ACCESS_LOG_FLUSH_BYTES = os.environ.get("PASSSAGE_ACCESS_LOG_FLUSH_BYTES", "1G").strip()
+ACCESS_LOG_HEADERS = os.environ.get(
+    "PASSSAGE_ACCESS_LOG_HEADERS",
+    "accept,accept-encoding,cache-control,content-type,content-encoding,"
+    "etag,last-modified,range,user-agent,via,x-cache,x-cache-lookup,x-amz-request-id",
+).strip()
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -561,6 +576,125 @@ def get_refresh_patterns() -> list[RefreshPattern]:
     return patterns
 
 
+def _parse_header_names(raw: str) -> list[str]:
+    return [name.strip().lower() for name in raw.split(",") if name.strip()]
+
+
+def _select_headers(headers, names: list[str]) -> dict[str, str]:
+    if not headers or not names:
+        return {}
+    selected: dict[str, str] = {}
+    for name in names:
+        value = headers.get(name)
+        if value is not None:
+            selected[name] = value
+    return selected
+
+
+def _safe_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _access_log_writer() -> AccessLogWriter | None:
+    return getattr(ctx, "_access_log_writer", None)
+
+
+def _init_access_logs() -> None:
+    writer = _access_log_writer()
+    if not getattr(ctx.options, "access_logs", False):
+        if writer:
+            writer.stop()
+        ctx._access_log_writer = None
+        return
+    config = build_access_log_config(
+        S3_BUCKET,
+        getattr(ctx.options, "access_log_prefix", ACCESS_LOG_PREFIX),
+        getattr(ctx.options, "access_log_dir", ACCESS_LOG_DIR),
+        getattr(ctx.options, "access_log_flush_seconds", ACCESS_LOG_FLUSH_SECONDS),
+        getattr(ctx.options, "access_log_flush_bytes", ACCESS_LOG_FLUSH_BYTES),
+    )
+    if writer:
+        writer.stop()
+    ctx._access_log_writer = AccessLogWriter(get_s3_client(), config, LOG)
+    ctx._access_log_header_names = _parse_header_names(
+        getattr(ctx.options, "access_log_headers", ACCESS_LOG_HEADERS)
+    )
+    ctx._access_log_writer.start()
+
+
+def _build_access_log_record(flow, error: str | None = None) -> dict:
+    now = time.time()
+    start_ts = getattr(flow, "_access_log_start", now)
+    duration_ms = int((now - start_ts) * 1000)
+    start_dt = datetime.fromtimestamp(start_ts, tz=pytz.utc)
+    parsed = urlparse(flow.request.url)
+    client_addr = getattr(flow.client_conn, "peername", None) or ()
+    client_ip = client_addr[0] if isinstance(client_addr, tuple) and client_addr else None
+    client_port = client_addr[1] if isinstance(client_addr, tuple) and len(client_addr) > 1 else None
+    request_headers = _select_headers(
+        flow.request.headers,
+        getattr(ctx, "_access_log_header_names", []),
+    )
+    response = getattr(flow, "response", None)
+    response_headers = (
+        _select_headers(response.headers, getattr(ctx, "_access_log_header_names", []))
+        if response
+        else {}
+    )
+    content_length = None
+    if response:
+        content_length = _safe_int(response.headers.get("content-length"))
+    if content_length is None and response and response.content is not None:
+        content_length = len(response.content)
+    cache_head = getattr(flow, "_cache_head", None)
+    upstream_head = getattr(flow, "_upstream_head", None)
+    upstream_error = getattr(flow, "_upstream_error", None)
+    upstream_head_time = getattr(flow, "_upstream_head_time_ms", None)
+    return {
+        "timestamp": start_dt,
+        "request_id": getattr(flow, "id", None),
+        "client_ip": client_ip,
+        "client_port": _safe_int(client_port),
+        "method": flow.request.method,
+        "url": flow.request.url,
+        "host": parsed.hostname,
+        "scheme": parsed.scheme,
+        "port": _safe_int(parsed.port),
+        "path": parsed.path,
+        "query": parsed.query,
+        "user_agent": flow.request.headers.get("User-Agent"),
+        "request_headers": request_headers,
+        "status_code": response.status_code if response else None,
+        "reason": response.reason if response else None,
+        "response_headers": response_headers,
+        "content_length": content_length,
+        "content_type": response.headers.get("content-type") if response else None,
+        "content_encoding": response.headers.get("content-encoding") if response else None,
+        "policy": getattr(flow, "_policy", None).__name__ if getattr(flow, "_policy", None) else None,
+        "cached": getattr(flow, "_cached", None),
+        "cache_redirect": getattr(flow, "_cache_redirect", None),
+        "cache_key": getattr(flow, "_cache_key", None),
+        "cache_vary": getattr(flow, "_cache_vary", None),
+        "cache_hit": getattr(flow, "_cache_hit", None),
+        "cache_fresh": getattr(flow, "_cache_fresh", None),
+        "stale_while_revalidate": getattr(flow, "_allow_stale_while_revalidate", None),
+        "stale_if_error": getattr(flow, "_allow_stale_if_error", None),
+        "upstream_head_status": upstream_head.status_code if upstream_head else None,
+        "upstream_error": str(upstream_error) if upstream_error else None,
+        "upstream_head_time_ms": upstream_head_time,
+        "cache_head_status": cache_head.status_code if cache_head else None,
+        "cache_head_etag": cache_head.headers.get("x-amz-meta-header-etag") if cache_head else None,
+        "cache_head_last_modified": cache_head.headers.get("x-amz-meta-last-modified") if cache_head else None,
+        "cache_head_method": cache_head.headers.get("x-amz-meta-method") if cache_head else None,
+        "error": error,
+        "duration_ms": duration_ms,
+        "bytes_sent": content_length,
+    }
+
+
 def get_quoted_url(flow):
     return flow.request.url
 
@@ -752,10 +886,55 @@ class Proxy:
             default=SIGNED_CACHE_REDIRECT,
             help="Redirect cache hits to a signed S3 URL instead of public S3 access",
         )
+        loader.add_option(
+            name="access_logs",
+            typespec=bool,
+            default=ACCESS_LOGS,
+            help="Enable S3 access logs in Parquet format",
+        )
+        loader.add_option(
+            name="access_log_prefix",
+            typespec=str,
+            default=ACCESS_LOG_PREFIX,
+            help="S3 prefix for access logs (separate from cached objects)",
+        )
+        loader.add_option(
+            name="access_log_dir",
+            typespec=str,
+            default=ACCESS_LOG_DIR,
+            help="Local spool directory for access logs",
+        )
+        loader.add_option(
+            name="access_log_flush_seconds",
+            typespec=str,
+            default=ACCESS_LOG_FLUSH_SECONDS,
+            help="Flush interval in seconds for access logs",
+        )
+        loader.add_option(
+            name="access_log_flush_bytes",
+            typespec=str,
+            default=ACCESS_LOG_FLUSH_BYTES,
+            help="Flush size threshold for access logs (bytes or 1G/500M/10K)",
+        )
+        loader.add_option(
+            name="access_log_headers",
+            typespec=str,
+            default=ACCESS_LOG_HEADERS,
+            help="Comma-separated headers to include in access logs",
+        )
 
     def configure(self, updated):
         if "policy_file" in updated:
             _load_policy_overrides(ctx.options.policy_file)
+        if {
+            "access_logs",
+            "access_log_prefix",
+            "access_log_dir",
+            "access_log_flush_seconds",
+            "access_log_flush_bytes",
+            "access_log_headers",
+        }.intersection(updated):
+            _init_access_logs()
 
     @staticmethod
     def cache_expired(cache):
@@ -771,8 +950,14 @@ class Proxy:
         # these two may hold object HTTP HEAD responses for upstream/cached version
         flow._upstream_head = flow._cache_head = None
         flow._orig_data = {}
+        flow._access_log_start = time.time()
         # we mark this flow as cached only if it returns data from the cache
         flow._cached = False
+        flow._cache_redirect = False
+        flow._cache_hit = False
+        flow._cache_fresh = False
+        flow._allow_stale_while_revalidate = False
+        flow._allow_stale_if_error = False
         flow._save_response = True
         policy = flow._policy = get_policy(flow)
         if flow.request.pretty_host == "mitm.it" and flow.request.path in ("/proxy-env", "/proxy-env.sh"):
@@ -888,6 +1073,9 @@ class Proxy:
         allow_stale_while_revalidate = bool(freshness and freshness.allow_stale_while_revalidate)
         allow_stale_if_error = bool(freshness and freshness.allow_stale_if_error)
         flow._allow_stale_if_error = allow_stale_if_error
+        flow._allow_stale_while_revalidate = allow_stale_while_revalidate
+        flow._cache_hit = cache_hit
+        flow._cache_fresh = cache_fresh
         if flow.request.headers:
             request_headers = {k.lower(): v for k, v in flow.request.headers.items()}
         else:
@@ -973,12 +1161,15 @@ class Proxy:
                     upstream_hdrs["If-Modified-Since"] = lastmod
             try:
                 timeout = getattr(ctx.options, "upstream_head_timeout", UPSTREAM_TIMEOUT)
+                start = time.perf_counter()
                 flow._upstream_head = requests.head(
                     flow.request.url,
                     timeout=timeout,
                     headers=upstream_hdrs,
                 )
+                flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
             except Exception as e:
+                flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
                 upstream_failed = True
                 flow._upstream_error = e
                 # put this server/host onto the ban list, so we don't have to
@@ -1285,8 +1476,19 @@ class Proxy:
             self.cleanup(flow)
 
     def error(self, flow):
+        writer = _access_log_writer()
+        if writer:
+            try:
+                writer.add(_build_access_log_record(flow, error=str(flow.error)))
+            except Exception as exc:
+                LOG.debug("Access log write skipped: %s", exc)
         with ctx._lock:
             self.cleanup(flow)
+
+    def done(self):
+        writer = _access_log_writer()
+        if writer:
+            writer.stop()
 
     def cleanup(self, flow):
         if not hasattr(flow, "_counter"):
@@ -1297,6 +1499,12 @@ class Proxy:
             del self.hashes[flow._counter]
 
     def log_response(self, flow):
+        writer = _access_log_writer()
+        if writer:
+            try:
+                writer.add(_build_access_log_record(flow))
+            except Exception as exc:
+                LOG.debug("Access log write skipped: %s", exc)
         LOG.info(
             "[%s] %s %s %s %s/%s/%s",
             datetime.now().strftime("%m/%d/%Y:%H:%M:%S"),

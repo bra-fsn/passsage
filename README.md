@@ -217,6 +217,12 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 | `PASSSAGE_HOST` | Proxy bind host | `0.0.0.0` |
 | `S3_BUCKET` | S3 bucket name for cache storage | `364189071156-ds-proxy-us-west-2` (AWS) or `proxy-cache` (custom endpoint) |
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
+| `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `0` |
+| `PASSSAGE_ACCESS_LOG_PREFIX` | S3 prefix for access logs | `__passsage_logs__` |
+| `PASSSAGE_ACCESS_LOG_DIR` | Local spool dir for access logs | `/tmp/passsage-logs` |
+| `PASSSAGE_ACCESS_LOG_FLUSH_SECONDS` | Flush interval in seconds | `30` |
+| `PASSSAGE_ACCESS_LOG_FLUSH_BYTES` | Flush size threshold | `1G` |
+| `PASSSAGE_ACCESS_LOG_HEADERS` | Headers to include in access logs | `accept,accept-encoding,cache-control,content-type,content-encoding,etag,last-modified,range,user-agent,via,x-cache,x-cache-lookup,x-amz-request-id` |
 
 ### CLI Options
 
@@ -233,11 +239,40 @@ Options:
                                   Proxy mode (default: regular)
   -v, --verbose                   Enable verbose logging
   --cache-redirect                Redirect cache hits to S3 instead of streaming through the proxy
+  --access-logs                   Enable S3 access logs in Parquet format
+  --access-log-prefix TEXT        S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)
+  --access-log-dir TEXT           Local spool directory for access logs
+  --access-log-flush-seconds TEXT Flush interval in seconds for access logs
+  --access-log-flush-bytes TEXT   Flush size threshold for access logs
+  --access-log-headers TEXT       Headers to include in access logs
   --health-port INTEGER           Health endpoint port (env: PASSSAGE_HEALTH_PORT, 0 disables)
   --health-host TEXT              Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)
   --web                           Enable mitmproxy web interface
   --version                       Show the version and exit.
   --help                          Show this message and exit.
+```
+
+### Access Logs
+
+Passsage can emit structured access logs to S3 as Parquet for diagnostics and performance analysis.
+
+S3 layout:
+
+```
+s3://<bucket>/__passsage_logs__/date=YYYY-MM-DD/hour=HH/<file>.parquet
+```
+
+Enable logging:
+
+```bash
+passsage --access-logs
+```
+
+Log UI:
+
+```bash
+pip install "passsage[ui]"
+passsage logs --start-date 2026-02-01 --end-date 2026-02-02
 ```
 
 ### As a mitmproxy Script
