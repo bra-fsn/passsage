@@ -75,6 +75,21 @@ class CallableRule:
 
 _SIGNED_QUERY_PREFIX = "x-amz-"
 _CLOUDFLARE_SIGNED_PARAMS = {"expires", "signature", "version"}
+_AZURE_SIGNED_PARAMS = {
+    "se",
+    "sig",
+    "ske",
+    "skoid",
+    "sks",
+    "skt",
+    "sktid",
+    "skv",
+    "sp",
+    "spr",
+    "sr",
+    "sv",
+    "hmac",
+}
 _SIGNED_QUERY_RULES = (
     {
         "host_suffixes": ("r2.cloudflarestorage.com", "amazonaws.com"),
@@ -85,6 +100,11 @@ _SIGNED_QUERY_RULES = (
         "host_suffixes": ("production.cloudflare.docker.com",),
         "remove_prefixes": (),
         "remove_params": tuple(sorted(_CLOUDFLARE_SIGNED_PARAMS)),
+    },
+    {
+        "host_suffixes": ("pkg-containers.githubusercontent.com",),
+        "remove_prefixes": (),
+        "remove_params": tuple(sorted(_AZURE_SIGNED_PARAMS)),
     },
 )
 
