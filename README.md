@@ -37,6 +37,18 @@ whether to serve from cache or go upstream. In brief:
   cache redirects and do not require a public bucket policy. Use
   `--cache-redirect-public` (or `PASSSAGE_CACHE_REDIRECT_SIGNED_URL=0`) to redirect
   to public S3 objects instead.
+- When inspecting cached objects with `awslocal`, keys that start with `https://` are
+  treated as URL parameters. Disable that behavior or pass the key via a file:
+
+```bash
+awslocal configure set cli_follow_urlparam false
+awslocal s3api head-object --bucket proxy-cache --key "https://files.pythonhosted.org/..."
+```
+
+```bash
+printf '%s' "https://files.pythonhosted.org/..." > /tmp/passsage-key.txt
+awslocal s3api head-object --bucket proxy-cache --key file:///tmp/passsage-key.txt
+```
 - When `--cache-redirect` is enabled, clients must be able to fetch cached objects from
   S3 without AWS credentials. Configure a bucket policy to allow unauthenticated
   `s3:GetObject`/`s3:ListBucket` from your network:
