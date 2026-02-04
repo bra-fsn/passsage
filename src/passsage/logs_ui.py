@@ -12,7 +12,7 @@ from rich.table import Table
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane, Tabs
 
 
 def _parse_date(value: str) -> date:
@@ -126,6 +126,12 @@ class AccessLogApp(App):
         ("/", "focus_search", "Search"),
         ("tab", "toggle_focus", "Toggle focus"),
         ("shift+tab", "toggle_focus", "Toggle focus"),
+        ("ctrl+tab", "next_tab", "Next tab"),
+        ("ctrl+shift+tab", "prev_tab", "Previous tab"),
+        ("alt+right", "next_tab", "Next tab"),
+        ("alt+left", "prev_tab", "Previous tab"),
+        ("1", "show_logs_tab", "Logs tab"),
+        ("2", "show_stats_tab", "Stats tab"),
     ]
 
     def __init__(self, rows: list[dict]):
@@ -136,6 +142,9 @@ class AccessLogApp(App):
         self._query_value = ""
         self._summary = Static(id="summary")
         self._table = ToggleFocusTable(id="table")
+        self._host_stats = DataTable(id="host_stats")
+        self._ua_stats = DataTable(id="ua_stats")
+        self._client_stats = DataTable(id="client_stats")
         self._search_input = QueryInput(placeholder="Search url/ua", id="query")
         self._search_input.add_class("hidden")
 
@@ -143,8 +152,17 @@ class AccessLogApp(App):
         yield Header()
         with Vertical():
             yield self._search_input
-            yield self._summary
-            yield self._table
+            with TabbedContent(id="tabs"):
+                with TabPane("Logs", id="logs"):
+                    yield self._summary
+                    yield self._table
+                with TabPane("Stats", id="stats"):
+                    yield Static("By upstream host")
+                    yield self._host_stats
+                    yield Static("By user agent")
+                    yield self._ua_stats
+                    yield Static("By client IP")
+                    yield self._client_stats
         yield Footer()
 
     def on_mount(self) -> None:
@@ -158,6 +176,33 @@ class AccessLogApp(App):
             "duration_ms",
             "bytes",
             "user_agent",
+        )
+        self._host_stats.add_columns(
+            "host",
+            "count",
+            "cached",
+            "cache_rate",
+            "mean_ms",
+            "p95_ms",
+            "total_bytes",
+        )
+        self._ua_stats.add_columns(
+            "user_agent",
+            "count",
+            "cached",
+            "cache_rate",
+            "mean_ms",
+            "p95_ms",
+            "total_bytes",
+        )
+        self._client_stats.add_columns(
+            "client_ip",
+            "count",
+            "cached",
+            "cache_rate",
+            "mean_ms",
+            "p95_ms",
+            "total_bytes",
         )
         self._refresh_view()
         self.set_focus(self._table)
@@ -186,10 +231,38 @@ class AccessLogApp(App):
             event.stop()
             self.action_focus_search()
 
+    def action_next_tab(self) -> None:
+        self._cycle_tab(1)
+
+    def action_prev_tab(self) -> None:
+        self._cycle_tab(-1)
+
+    def _cycle_tab(self, direction: int) -> None:
+        tabbed = self.query_one("#tabs", TabbedContent)
+        tab_ids = ["logs", "stats"]
+        current = tabbed.active or tab_ids[0]
+        if current not in tab_ids:
+            tabbed.active = tab_ids[0]
+            return
+        idx = tab_ids.index(current)
+        tabbed.active = tab_ids[(idx + direction) % len(tab_ids)]
+
+    def action_show_logs_tab(self) -> None:
+        self._set_tab_and_focus("logs", self._table)
+
+    def action_show_stats_tab(self) -> None:
+        self._set_tab_and_focus("stats", self._host_stats)
+
+    def _set_tab_and_focus(self, tab_id: str, widget: DataTable) -> None:
+        tabbed = self.query_one("#tabs", TabbedContent)
+        tabbed.active = tab_id
+        self.set_focus(widget)
+
     def _refresh_view(self) -> None:
         self._filtered = self._apply_filters(self._rows)
         self._render_summary(self._filtered)
         self._render_table(self._filtered)
+        self._render_stats(self._filtered)
 
     def _apply_filters(self, rows: list[dict]) -> list[dict]:
         filtered = []
@@ -239,6 +312,47 @@ class AccessLogApp(App):
                 row.get("user_agent") or "",
             )
 
+    def _render_stats(self, rows: list[dict]) -> None:
+        self._render_grouped_stats(self._host_stats, rows, "host", 50)
+        self._render_grouped_stats(self._ua_stats, rows, "user_agent", 50)
+        self._render_grouped_stats(self._client_stats, rows, "client_ip", 50)
+
+    def _render_grouped_stats(
+        self,
+        table: DataTable,
+        rows: list[dict],
+        key: str,
+        limit: int,
+    ) -> None:
+        groups: dict[str, list[dict]] = {}
+        for row in rows:
+            value = row.get(key) or ""
+            groups.setdefault(value, []).append(row)
+        stats_rows = []
+        for value, items in groups.items():
+            count = len(items)
+            cached = sum(1 for r in items if r.get("cached"))
+            durations = [r.get("duration_ms") or 0 for r in items]
+            bytes_sent = [r.get("bytes_sent") or 0 for r in items]
+            mean_ms = statistics.mean(durations) if durations else 0.0
+            p95_ms = _percentile(durations, 95)
+            total_bytes = sum(bytes_sent)
+            cache_rate = f"{cached / count:.2%}" if count else "0.00%"
+            stats_rows.append(
+                (
+                    str(value),
+                    str(count),
+                    str(cached),
+                    cache_rate,
+                    f"{mean_ms:.1f}",
+                    f"{p95_ms:.1f}",
+                    _format_bytes(total_bytes),
+                )
+            )
+        stats_rows.sort(key=lambda r: int(r[1]), reverse=True)
+        table.clear()
+        for row in stats_rows[:limit]:
+            table.add_row(*row)
     def action_show_details(self) -> None:
         if not self._visible_rows:
             return
