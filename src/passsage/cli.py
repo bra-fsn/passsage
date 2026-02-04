@@ -114,6 +114,22 @@ import click
     help="Redirect cache hits to signed S3 URLs (env: PASSSAGE_CACHE_REDIRECT_SIGNED_URL)"
 )
 @click.option(
+    "--cache-redirect-signed-url-expires",
+    type=int,
+    default=3600,
+    envvar="PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES",
+    show_default=True,
+    help="Presigned URL expiration in seconds (env: PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES)",
+)
+@click.option(
+    "--presigned-url-cache-maxsize",
+    type=int,
+    default=10000,
+    envvar="PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE",
+    show_default=True,
+    help="Max entries for presigned URL TTL cache (env: PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE)",
+)
+@click.option(
     "--public-proxy-url",
     envvar="PASSSAGE_PUBLIC_PROXY_URL",
     default="",
@@ -233,6 +249,8 @@ def main(
     allow_policy_header,
     cache_redirect,
     cache_redirect_signed_url,
+    cache_redirect_signed_url_expires,
+    presigned_url_cache_maxsize,
     public_proxy_url,
     access_logs,
     access_log_prefix,
@@ -285,6 +303,8 @@ def main(
             allow_policy_header,
             cache_redirect,
             cache_redirect_signed_url,
+            cache_redirect_signed_url_expires,
+            presigned_url_cache_maxsize,
             public_proxy_url,
             access_logs,
             access_log_prefix,
@@ -317,6 +337,8 @@ def run_proxy(
     allow_policy_header,
     cache_redirect,
     cache_redirect_signed_url,
+    cache_redirect_signed_url_expires,
+    presigned_url_cache_maxsize,
     public_proxy_url,
     access_logs,
     access_log_prefix,
@@ -343,6 +365,8 @@ def run_proxy(
     if cache_redirect:
         os.environ["PASSSAGE_CACHE_REDIRECT"] = "1"
     os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL"] = "1" if cache_redirect_signed_url else "0"
+    os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES"] = str(cache_redirect_signed_url_expires)
+    os.environ["PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE"] = str(presigned_url_cache_maxsize)
     if public_proxy_url:
         os.environ["PASSSAGE_PUBLIC_PROXY_URL"] = public_proxy_url
     if access_logs:
@@ -407,6 +431,8 @@ def run_proxy(
         args.extend(["--set", "cache_redirect=true"])
     if cache_redirect_signed_url:
         args.extend(["--set", "cache_redirect_signed_url=true"])
+    args.extend(["--set", f"cache_redirect_signed_url_expires={cache_redirect_signed_url_expires}"])
+    args.extend(["--set", f"presigned_url_cache_maxsize={presigned_url_cache_maxsize}"])
     if public_proxy_url:
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
