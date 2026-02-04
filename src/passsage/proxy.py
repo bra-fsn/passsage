@@ -3,6 +3,7 @@
 # collect and expose metrics/stats (with limited number of entries), like top list for misses, hits, etc.
 
 import copy
+import json
 import hashlib
 import logging
 import os
@@ -10,6 +11,8 @@ import re
 import socket
 import ssl
 import tempfile
+import traceback
+from functools import wraps
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -41,7 +44,7 @@ from passsage.policy import (
     policy_from_name,
     set_default_resolver,
 )
-from passsage.access_logs import AccessLogWriter, build_access_log_config
+from passsage.log_storage import AccessLogWriter, ErrorLogWriter, build_access_log_config, build_error_log_config
 
 try:
     from passsage import __version__
@@ -105,6 +108,15 @@ ACCESS_LOG_HEADERS = os.environ.get(
     "accept,accept-encoding,cache-control,content-type,content-encoding,"
     "etag,last-modified,range,user-agent,via,x-cache,x-cache-lookup,x-amz-request-id",
 ).strip()
+ERROR_LOGS = os.environ.get("PASSSAGE_ERROR_LOGS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+ERROR_LOG_PREFIX = os.environ.get("PASSSAGE_ERROR_LOG_PREFIX", "__passsage_error_logs__").strip()
+ERROR_LOG_DIR = os.environ.get("PASSSAGE_ERROR_LOG_DIR", "/tmp/passsage-errors").strip()
+ERROR_LOG_FLUSH_SECONDS = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_SECONDS", "30").strip()
+ERROR_LOG_FLUSH_BYTES = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_BYTES", "256M").strip()
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -602,6 +614,63 @@ def _access_log_writer() -> AccessLogWriter | None:
     return getattr(ctx, "_access_log_writer", None)
 
 
+def _error_log_writer() -> ErrorLogWriter | None:
+    return getattr(ctx, "_error_log_writer", None)
+
+
+def _log_exception(
+    exc: Exception,
+    *,
+    flow=None,
+    context: dict | None = None,
+    error_type: str | None = None,
+    request_url: str | None = None,
+    method: str | None = None,
+    request_headers: dict | None = None,
+) -> None:
+    writer = _error_log_writer()
+    if not writer:
+        LOG.exception("Unhandled error: %s", exc)
+        return
+    tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        writer.add(
+            _build_error_log_record(
+                error_type=error_type or type(exc).__name__,
+                error_message=str(exc),
+                traceback_text=tb_text,
+                context=context or {},
+                flow=flow,
+                request_url=request_url,
+                method=method,
+                request_headers=request_headers,
+            )
+        )
+    except Exception as write_exc:
+        LOG.debug("Error log write skipped: %s", write_exc)
+
+
+def _log_hook_errors(hook_name: str):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            flow = kwargs.get("flow")
+            if flow is None:
+                for arg in args:
+                    if isinstance(arg, http.HTTPFlow):
+                        flow = arg
+                        break
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                _log_exception(exc, flow=flow, context={"hook": hook_name})
+                raise
+
+        return wrapper
+
+    return decorator
+
+
 def _init_access_logs() -> None:
     writer = _access_log_writer()
     if not getattr(ctx.options, "access_logs", False):
@@ -623,6 +692,29 @@ def _init_access_logs() -> None:
         getattr(ctx.options, "access_log_headers", ACCESS_LOG_HEADERS)
     )
     ctx._access_log_writer.start()
+
+
+def _init_error_logs() -> None:
+    writer = _error_log_writer()
+    if not getattr(ctx.options, "error_logs", False):
+        if writer:
+            writer.stop()
+        ctx._error_log_writer = None
+        return
+    config = build_error_log_config(
+        S3_BUCKET,
+        getattr(ctx.options, "error_log_prefix", ERROR_LOG_PREFIX),
+        getattr(ctx.options, "error_log_dir", ERROR_LOG_DIR),
+        getattr(ctx.options, "error_log_flush_seconds", ERROR_LOG_FLUSH_SECONDS),
+        getattr(ctx.options, "error_log_flush_bytes", ERROR_LOG_FLUSH_BYTES),
+    )
+    if writer:
+        writer.stop()
+    ctx._error_log_writer = ErrorLogWriter(get_s3_client(), config, LOG)
+    ctx._error_log_header_names = _parse_header_names(
+        getattr(ctx.options, "access_log_headers", ACCESS_LOG_HEADERS)
+    )
+    ctx._error_log_writer.start()
 
 
 def _build_access_log_record(flow, error: str | None = None) -> dict:
@@ -692,6 +784,75 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "error": error,
         "duration_ms": duration_ms,
         "bytes_sent": content_length,
+    }
+
+
+def _build_error_log_record(
+    error_type: str,
+    error_message: str,
+    traceback_text: str,
+    context: dict | None = None,
+    flow=None,
+    request_url: str | None = None,
+    method: str | None = None,
+    request_headers: dict | None = None,
+) -> dict:
+    now = time.time()
+    start_ts = getattr(flow, "_access_log_start", now) if flow else now
+    start_dt = datetime.fromtimestamp(start_ts, tz=pytz.utc)
+    url_value = request_url or (flow.request.url if flow else None)
+    parsed = urlparse(url_value) if url_value else None
+    client_addr = getattr(flow.client_conn, "peername", None) if flow else None
+    client_addr = client_addr or ()
+    client_ip = client_addr[0] if isinstance(client_addr, tuple) and client_addr else None
+    client_port = client_addr[1] if isinstance(client_addr, tuple) and len(client_addr) > 1 else None
+    selected_request_headers = (
+        _select_headers(
+            flow.request.headers,
+            getattr(ctx, "_error_log_header_names", []),
+        )
+        if flow
+        else request_headers
+        or {}
+    )
+    response = getattr(flow, "response", None) if flow else None
+    response_headers = (
+        _select_headers(response.headers, getattr(ctx, "_error_log_header_names", []))
+        if response
+        else {}
+    )
+    cache_head = getattr(flow, "_cache_head", None) if flow else None
+    upstream_head = getattr(flow, "_upstream_head", None) if flow else None
+    upstream_error = getattr(flow, "_upstream_error", None) if flow else None
+    policy = getattr(flow, "_policy", None) if flow else None
+    return {
+        "timestamp": start_dt,
+        "request_id": getattr(flow, "id", None) if flow else None,
+        "client_ip": client_ip,
+        "client_port": _safe_int(client_port),
+        "method": method or (flow.request.method if flow else None),
+        "url": url_value,
+        "host": parsed.hostname if parsed else None,
+        "scheme": parsed.scheme if parsed else None,
+        "port": _safe_int(parsed.port) if parsed else None,
+        "path": parsed.path if parsed else None,
+        "query": parsed.query if parsed else None,
+        "user_agent": flow.request.headers.get("User-Agent") if flow else None,
+        "request_headers": selected_request_headers,
+        "status_code": response.status_code if response else None,
+        "response_headers": response_headers,
+        "policy": policy.__name__ if policy else None,
+        "cached": getattr(flow, "_cached", None) if flow else None,
+        "cache_redirect": getattr(flow, "_cache_redirect", None) if flow else None,
+        "cache_key": getattr(flow, "_cache_key", None) if flow else None,
+        "cache_vary": getattr(flow, "_cache_vary", None) if flow else None,
+        "cache_head_status": cache_head.status_code if cache_head else None,
+        "upstream_head_status": upstream_head.status_code if upstream_head else None,
+        "upstream_error": str(upstream_error) if upstream_error else None,
+        "error_type": error_type,
+        "error_message": error_message,
+        "traceback": traceback_text,
+        "context": json.dumps(context or {}, default=str),
     }
 
 
@@ -831,6 +992,7 @@ class Proxy:
             ctx._executor.submit(release_banned)
             _start_health_server()
 
+    @_log_hook_errors("load")
     def load(self, loader):
         loader.add_option(
             name="test",
@@ -922,7 +1084,38 @@ class Proxy:
             default=ACCESS_LOG_HEADERS,
             help="Comma-separated headers to include in access logs",
         )
+        loader.add_option(
+            name="error_logs",
+            typespec=bool,
+            default=ERROR_LOGS,
+            help="Enable Parquet error logs with tracebacks",
+        )
+        loader.add_option(
+            name="error_log_prefix",
+            typespec=str,
+            default=ERROR_LOG_PREFIX,
+            help="S3 prefix for error logs",
+        )
+        loader.add_option(
+            name="error_log_dir",
+            typespec=str,
+            default=ERROR_LOG_DIR,
+            help="Local spool directory for error logs",
+        )
+        loader.add_option(
+            name="error_log_flush_seconds",
+            typespec=str,
+            default=ERROR_LOG_FLUSH_SECONDS,
+            help="Flush interval in seconds for error logs",
+        )
+        loader.add_option(
+            name="error_log_flush_bytes",
+            typespec=str,
+            default=ERROR_LOG_FLUSH_BYTES,
+            help="Flush size threshold for error logs (bytes or 1G/500M/10K)",
+        )
 
+    @_log_hook_errors("configure")
     def configure(self, updated):
         if "policy_file" in updated:
             _load_policy_overrides(ctx.options.policy_file)
@@ -935,6 +1128,14 @@ class Proxy:
             "access_log_headers",
         }.intersection(updated):
             _init_access_logs()
+        if {
+            "error_logs",
+            "error_log_prefix",
+            "error_log_dir",
+            "error_log_flush_seconds",
+            "error_log_flush_bytes",
+        }.intersection(updated):
+            _init_error_logs()
 
     @staticmethod
     def cache_expired(cache):
@@ -946,6 +1147,7 @@ class Proxy:
 
     # runs in the threadpool, because we use blocking operations here
     @concurrent
+    @_log_hook_errors("requestheaders")
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         # these two may hold object HTTP HEAD responses for upstream/cached version
         flow._upstream_head = flow._cache_head = None
@@ -1029,6 +1231,12 @@ class Proxy:
                 "HTTP HEAD to\n%s\nhas failed with:\n%s",
                 get_cache_url(flow),
                 e,
+            )
+            _log_exception(
+                e,
+                flow=flow,
+                context={"hook": "requestheaders", "stage": "cache_head"},
+                error_type="s3_head_error",
             )
             return
         if (not (http_2xx(flow._cache_head)
@@ -1172,6 +1380,12 @@ class Proxy:
                 flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
                 upstream_failed = True
                 flow._upstream_error = e
+                _log_exception(
+                    e,
+                    flow=flow,
+                    context={"hook": "requestheaders", "stage": "upstream_head"},
+                    error_type="upstream_head_error",
+                )
                 # put this server/host onto the ban list, so we don't have to
                 # wait for the timeout to happen in subsequent requests
                 with ctx._lock:
@@ -1247,6 +1461,7 @@ class Proxy:
                 return
 
 
+    @_log_hook_errors("responseheaders")
     def responseheaders(self, flow):
         if getattr(flow, "_cache_redirect", False):
             flow.response.headers["x-proxy-policy"] = flow._policy.__name__
@@ -1286,6 +1501,12 @@ class Proxy:
                     flow._save_response = False
             except Exception as e:
                 LOG.debug("Cache fallback fetch failed: %s", e)
+                _log_exception(
+                    e,
+                    flow=flow,
+                    context={"hook": "responseheaders", "stage": "cache_fallback"},
+                    error_type="cache_fallback_error",
+                )
 
         flow.response.headers["x-proxy-policy"] = flow._policy.__name__
         # Identify proxy via Via (RFC 7230); do not rewrite Server header
@@ -1377,11 +1598,24 @@ class Proxy:
                     Key=get_vary_index_key(url),
                     Metadata={"vary": vary_header},
                 )
-            f.close()
         except Exception as e:
             LOG.error("Cache save error %s, %s", url, e)
-            f.close()
+            _log_exception(
+                e,
+                request_url=url,
+                method=method,
+                request_headers=headers,
+                context={"cache_key": cache_key, "url": url},
+                error_type="cache_save_error",
+            )
+            raise
+        finally:
+            try:
+                f.close()
+            except Exception:
+                pass
 
+    @_log_hook_errors("response")
     def response(self, flow):
         if getattr(flow, "_short_circuit", False):
             self.log_response(flow)
@@ -1475,6 +1709,7 @@ class Proxy:
         with ctx._lock:
             self.cleanup(flow)
 
+    @_log_hook_errors("error")
     def error(self, flow):
         writer = _access_log_writer()
         if writer:
@@ -1482,13 +1717,40 @@ class Proxy:
                 writer.add(_build_access_log_record(flow, error=str(flow.error)))
             except Exception as exc:
                 LOG.debug("Access log write skipped: %s", exc)
+        err_writer = _error_log_writer()
+        if err_writer:
+            try:
+                tb_text = ""
+                if flow.error and hasattr(flow.error, "__traceback__"):
+                    tb_text = "".join(
+                        traceback.format_exception(
+                            type(flow.error), flow.error, flow.error.__traceback__
+                        )
+                    )
+                if not tb_text:
+                    tb_text = traceback.format_exc()
+                    err_writer.add(
+                        _build_error_log_record(
+                            error_type=type(flow.error).__name__ if flow.error else "flow_error",
+                            error_message=str(flow.error),
+                        traceback_text=tb_text,
+                            context={},
+                            flow=flow,
+                        )
+                    )
+            except Exception as exc:
+                LOG.debug("Error log write skipped: %s", exc)
         with ctx._lock:
             self.cleanup(flow)
 
+    @_log_hook_errors("done")
     def done(self):
         writer = _access_log_writer()
         if writer:
             writer.stop()
+        err_writer = _error_log_writer()
+        if err_writer:
+            err_writer.stop()
 
     def cleanup(self, flow):
         if not hasattr(flow, "_counter"):

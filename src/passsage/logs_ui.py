@@ -44,7 +44,7 @@ def _format_bytes(value: int) -> str:
     return f"{size:.1f}TB"
 
 
-def load_access_logs(bucket: str, prefix: str, start: date, end: date, limit: int | None):
+def _load_parquet_logs(bucket: str, prefix: str, start: date, end: date, limit: int | None):
     endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
     client_kwargs = {}
     config_kwargs = {}
@@ -74,6 +74,14 @@ def load_access_logs(bucket: str, prefix: str, start: date, end: date, limit: in
     if limit:
         rows = rows[:limit]
     return rows
+
+
+def load_access_logs(bucket: str, prefix: str, start: date, end: date, limit: int | None):
+    return _load_parquet_logs(bucket, prefix, start, end, limit)
+
+
+def load_error_logs(bucket: str, prefix: str, start: date, end: date, limit: int | None):
+    return _load_parquet_logs(bucket, prefix, start, end, limit)
 
 
 class ToggleFocusTable(DataTable):
@@ -106,7 +114,7 @@ class DetailsScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Static(self._content)
+            yield Static(self._content, markup=False)
 
     def on_key(self, event) -> None:
         if event.key in ("escape", "q", "enter"):
@@ -134,18 +142,20 @@ class AccessLogApp(App):
         ("2", "show_stats_tab", "Stats tab"),
     ]
 
-    def __init__(self, rows: list[dict]):
+    def __init__(self, rows: list[dict], view: str = "access"):
         super().__init__()
         self._rows = rows
         self._filtered = rows
         self._visible_rows: list[dict] = []
         self._query_value = ""
+        self._view = view
         self._summary = Static(id="summary")
         self._table = ToggleFocusTable(id="table")
         self._host_stats = DataTable(id="host_stats")
         self._ua_stats = DataTable(id="ua_stats")
         self._client_stats = DataTable(id="client_stats")
-        self._search_input = QueryInput(placeholder="Search url/ua", id="query")
+        placeholder = "Search url/ua" if self._view == "access" else "Search url/ua/error"
+        self._search_input = QueryInput(placeholder=placeholder, id="query")
         self._search_input.add_class("hidden")
 
     def compose(self) -> ComposeResult:
@@ -166,17 +176,29 @@ class AccessLogApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._table.add_columns(
-            "timestamp",
-            "method",
-            "status",
-            "host",
-            "path",
-            "cached",
-            "duration_ms",
-            "bytes",
-            "user_agent",
-        )
+        if self._view == "error":
+            self._table.add_columns(
+                "timestamp",
+                "error_type",
+                "method",
+                "status",
+                "host",
+                "path",
+                "message",
+                "user_agent",
+            )
+        else:
+            self._table.add_columns(
+                "timestamp",
+                "method",
+                "status",
+                "host",
+                "path",
+                "cached",
+                "duration_ms",
+                "bytes",
+                "user_agent",
+            )
         self._host_stats.add_columns(
             "host",
             "count",
@@ -271,13 +293,21 @@ class AccessLogApp(App):
                 term = self._query_value.lower()
                 url = (row.get("url") or "").lower()
                 ua = (row.get("user_agent") or "").lower()
-                if term not in url and term not in ua:
+                err_msg = (row.get("error_message") or "").lower()
+                err_type = (row.get("error_type") or "").lower()
+                if term not in url and term not in ua and term not in err_msg and term not in err_type:
                     continue
             filtered.append(row)
         return filtered
 
     def _render_summary(self, rows: list[dict]) -> None:
         count = len(rows)
+        if self._view == "error":
+            types = sorted({r.get("error_type") for r in rows if r.get("error_type")})
+            type_text = ", ".join(types[:5])
+            suffix = f" types={len(types)} {type_text}" if types else ""
+            self._summary.update(f"count={count}{suffix}")
+            return
         cached = sum(1 for r in rows if r.get("cached"))
         durations = [r.get("duration_ms") or 0 for r in rows]
         bytes_sent = [r.get("bytes_sent") or 0 for r in rows]
@@ -300,17 +330,32 @@ class AccessLogApp(App):
         for row in self._visible_rows:
             ts = row.get("timestamp")
             ts_text = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-            self._table.add_row(
-                ts_text,
-                row.get("method"),
-                str(row.get("status_code") or ""),
-                row.get("host"),
-                row.get("path"),
-                str(row.get("cached")),
-                str(row.get("duration_ms") or ""),
-                str(row.get("bytes_sent") or ""),
-                row.get("user_agent") or "",
-            )
+            if self._view == "error":
+                message = row.get("error_message") or ""
+                if len(message) > 120:
+                    message = f"{message[:117]}..."
+                self._table.add_row(
+                    ts_text,
+                    row.get("error_type") or "",
+                    row.get("method"),
+                    str(row.get("status_code") or ""),
+                    row.get("host"),
+                    row.get("path"),
+                    message,
+                    row.get("user_agent") or "",
+                )
+            else:
+                self._table.add_row(
+                    ts_text,
+                    row.get("method"),
+                    str(row.get("status_code") or ""),
+                    row.get("host"),
+                    row.get("path"),
+                    str(row.get("cached")),
+                    str(row.get("duration_ms") or ""),
+                    str(row.get("bytes_sent") or ""),
+                    row.get("user_agent") or "",
+                )
 
     def _render_stats(self, rows: list[dict]) -> None:
         self._render_grouped_stats(self._host_stats, rows, "host", 50)
@@ -441,6 +486,10 @@ def _build_details_renderable(row: dict):
     ]
     error_items = [
         ("error", _format_value(row.get("error"))),
+        ("error_type", _format_value(row.get("error_type"))),
+        ("error_message", _format_value(row.get("error_message"))),
+        ("traceback", _format_value(row.get("traceback"))),
+        ("context", _format_value(row.get("context"))),
     ]
     group_items = [
         _format_kv_table("Request", request_items),
@@ -463,4 +512,11 @@ def run_logs_ui(bucket: str, prefix: str, start_date: str, end_date: str, limit:
     start = _parse_date(start_date)
     end = _parse_date(end_date)
     rows = load_access_logs(bucket, prefix, start, end, limit)
-    AccessLogApp(rows).run()
+    AccessLogApp(rows, view="access").run()
+
+
+def run_errors_ui(bucket: str, prefix: str, start_date: str, end_date: str, limit: int | None) -> None:
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    rows = load_error_logs(bucket, prefix, start, end, limit)
+    AccessLogApp(rows, view="error").run()

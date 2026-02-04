@@ -156,6 +156,41 @@ import click
     help="Headers to include in access logs (env: PASSSAGE_ACCESS_LOG_HEADERS)",
 )
 @click.option(
+    "--error-logs",
+    is_flag=True,
+    default=True,
+    show_default=True,
+    help="Enable S3 error logs with tracebacks in Parquet format (env: PASSSAGE_ERROR_LOGS)",
+)
+@click.option(
+    "--error-log-prefix",
+    envvar="PASSSAGE_ERROR_LOG_PREFIX",
+    default="__passsage_error_logs__",
+    show_default=True,
+    help="S3 prefix for error logs (env: PASSSAGE_ERROR_LOG_PREFIX)",
+)
+@click.option(
+    "--error-log-dir",
+    envvar="PASSSAGE_ERROR_LOG_DIR",
+    default="/tmp/passsage-errors",
+    show_default=True,
+    help="Local spool directory for error logs (env: PASSSAGE_ERROR_LOG_DIR)",
+)
+@click.option(
+    "--error-log-flush-seconds",
+    envvar="PASSSAGE_ERROR_LOG_FLUSH_SECONDS",
+    default="30",
+    show_default=True,
+    help="Flush interval in seconds for error logs (env: PASSSAGE_ERROR_LOG_FLUSH_SECONDS)",
+)
+@click.option(
+    "--error-log-flush-bytes",
+    envvar="PASSSAGE_ERROR_LOG_FLUSH_BYTES",
+    default="256M",
+    show_default=True,
+    help="Flush size threshold for error logs (env: PASSSAGE_ERROR_LOG_FLUSH_BYTES)",
+)
+@click.option(
     "--health-port",
     envvar="PASSSAGE_HEALTH_PORT",
     type=int,
@@ -195,6 +230,11 @@ def main(
     access_log_flush_seconds,
     access_log_flush_bytes,
     access_log_headers,
+    error_logs,
+    error_log_prefix,
+    error_log_dir,
+    error_log_flush_seconds,
+    error_log_flush_bytes,
     health_port,
     health_host,
 ):
@@ -242,6 +282,11 @@ def main(
             access_log_flush_seconds,
             access_log_flush_bytes,
             access_log_headers,
+            error_logs,
+            error_log_prefix,
+            error_log_dir,
+            error_log_flush_seconds,
+            error_log_flush_bytes,
             health_port,
             health_host,
         )
@@ -269,6 +314,11 @@ def run_proxy(
     access_log_flush_seconds,
     access_log_flush_bytes,
     access_log_headers,
+    error_logs,
+    error_log_prefix,
+    error_log_dir,
+    error_log_flush_seconds,
+    error_log_flush_bytes,
     health_port,
     health_host,
 ):
@@ -297,6 +347,16 @@ def run_proxy(
         os.environ["PASSSAGE_ACCESS_LOG_FLUSH_BYTES"] = str(access_log_flush_bytes)
     if access_log_headers:
         os.environ["PASSSAGE_ACCESS_LOG_HEADERS"] = access_log_headers
+    if error_logs:
+        os.environ["PASSSAGE_ERROR_LOGS"] = "1"
+    if error_log_prefix:
+        os.environ["PASSSAGE_ERROR_LOG_PREFIX"] = error_log_prefix
+    if error_log_dir:
+        os.environ["PASSSAGE_ERROR_LOG_DIR"] = error_log_dir
+    if error_log_flush_seconds:
+        os.environ["PASSSAGE_ERROR_LOG_FLUSH_SECONDS"] = str(error_log_flush_seconds)
+    if error_log_flush_bytes:
+        os.environ["PASSSAGE_ERROR_LOG_FLUSH_BYTES"] = str(error_log_flush_bytes)
     if health_port is not None:
         os.environ["PASSSAGE_HEALTH_PORT"] = str(health_port)
     if health_host:
@@ -395,6 +455,49 @@ def logs(start_date, end_date, limit, s3_bucket, access_log_prefix):
     if not bucket:
         raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
     run_logs_ui(bucket, access_log_prefix, start_date, end_date, limit)
+
+
+@main.command("errors")
+@click.option(
+    "--start-date",
+    default=date.today().isoformat(),
+    show_default=True,
+    help="Start date (YYYY-MM-DD)",
+)
+@click.option(
+    "--end-date",
+    default=date.today().isoformat(),
+    show_default=True,
+    help="End date (YYYY-MM-DD)",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=5000,
+    show_default=True,
+    help="Maximum number of rows to load",
+)
+@click.option(
+    "--s3-bucket",
+    envvar="S3_BUCKET",
+    default="",
+    show_default=True,
+    help="S3 bucket for error logs (env: S3_BUCKET)",
+)
+@click.option(
+    "--error-log-prefix",
+    envvar="PASSSAGE_ERROR_LOG_PREFIX",
+    default="__passsage_error_logs__",
+    show_default=True,
+    help="S3 prefix for error logs (env: PASSSAGE_ERROR_LOG_PREFIX)",
+)
+def errors(start_date, end_date, limit, s3_bucket, error_log_prefix):
+    from passsage.logs_ui import run_errors_ui
+
+    bucket = s3_bucket or os.environ.get("S3_BUCKET", "")
+    if not bucket:
+        raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
+    run_errors_ui(bucket, error_log_prefix, start_date, end_date, limit)
 
 
 if __name__ == "__main__":
