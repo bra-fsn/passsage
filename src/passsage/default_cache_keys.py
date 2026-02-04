@@ -146,6 +146,9 @@ def _strip_signed_query(ctx: Context, remove_prefixes: tuple[str, ...], remove_p
         for (name, value) in pairs
         if not name.lower().startswith(remove_prefixes) and name.lower() not in remove_params
     ]
+    if filtered:
+        # Normalize order to avoid cache misses from param reordering.
+        filtered.sort(key=lambda item: (item[0].lower(), item[0], item[1]))
     query = urlencode(filtered, doseq=True)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
