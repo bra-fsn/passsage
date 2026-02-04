@@ -27,9 +27,9 @@ jobs:
       - name: Start proxy stack
         env:
           PASSSAGE_ALLOW_POLICY_HEADER: "1"
+          PASSSAGE_DEBUG_PROXY: "1"
         run: |
-          docker compose up -d --build --wait localstack
-          docker compose run -d --service-ports --name passsage passsage --debug-proxy
+          docker compose up -d --build --wait
           docker compose ps
 
       - name: Run tests
