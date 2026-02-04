@@ -28,7 +28,8 @@ jobs:
         env:
           PASSSAGE_ALLOW_POLICY_HEADER: "1"
         run: |
-          docker compose up -d --build --wait
+          docker compose up -d --build --wait localstack
+          docker compose run -d --service-ports --name passsage passsage --debug-proxy
           docker compose ps
 
       - name: Run tests
