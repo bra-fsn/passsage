@@ -27,7 +27,7 @@ import boto3
 import pytz
 import requests
 from requests.exceptions import ConnectionError as RequestsConnectionError
-from cachetools import TTLCache
+from cachetools import TTLCache, cached
 from mitmproxy import ctx, http
 from mitmproxy.script import concurrent
 from botocore.exceptions import ClientError
@@ -93,6 +93,15 @@ SIGNED_CACHE_REDIRECT = os.environ.get("PASSSAGE_CACHE_REDIRECT_SIGNED_URL", "")
     "0",
     "false",
     "no",
+)
+CACHE_REDIRECT_SIGNED_URL_EXPIRES = int(
+    os.environ.get("PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES", "3600"), 10
+)
+PRESIGNED_URL_CACHE_MAXSIZE = int(
+    os.environ.get("PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE", "10000"), 10
+)
+PRESIGNED_URL_CACHE_TTL = max(
+    1, int(CACHE_REDIRECT_SIGNED_URL_EXPIRES * 0.2)
 )
 PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
 ACCESS_LOGS = os.environ.get("PASSSAGE_ACCESS_LOGS", "").strip().lower() in (
@@ -925,14 +934,27 @@ def get_cache_url(flow, key_override: str | None = None):
     return f"{S3_URL}/{cache_key}"
 
 
+_presigned_url_cache = TTLCache(
+    maxsize=PRESIGNED_URL_CACHE_MAXSIZE,
+    ttl=PRESIGNED_URL_CACHE_TTL,
+)
+
+
+@cached(
+    cache=_presigned_url_cache,
+    key=lambda flow: getattr(flow, "_cache_key", None) or get_quoted_url(flow),
+)
 def get_cache_redirect_url(flow) -> str:
     cache_key = getattr(flow, "_cache_key", None) or get_quoted_url(flow)
     cache_path_key = get_cache_path_key(cache_key)
     if getattr(ctx.options, "cache_redirect_signed_url", False):
+        expires = getattr(
+            ctx.options, "cache_redirect_signed_url_expires", CACHE_REDIRECT_SIGNED_URL_EXPIRES
+        )
         return get_s3_client().generate_presigned_url(
             "get_object",
             Params={"Bucket": S3_BUCKET, "Key": cache_key},
-            ExpiresIn=3600,
+            ExpiresIn=expires,
         )
     path_prefix = f"/{S3_BUCKET}/" if S3_PATH_STYLE else "/"
     scheme = S3_SCHEME if _S3_ENDPOINT else "https"
@@ -1076,6 +1098,18 @@ class Proxy:
             typespec=bool,
             default=SIGNED_CACHE_REDIRECT,
             help="Redirect cache hits to a signed S3 URL instead of public S3 access",
+        )
+        loader.add_option(
+            name="cache_redirect_signed_url_expires",
+            typespec=int,
+            default=CACHE_REDIRECT_SIGNED_URL_EXPIRES,
+            help="Presigned URL expiration in seconds (env: PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES)",
+        )
+        loader.add_option(
+            name="presigned_url_cache_maxsize",
+            typespec=int,
+            default=PRESIGNED_URL_CACHE_MAXSIZE,
+            help="Max entries for presigned URL TTL cache (env: PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE)",
         )
         loader.add_option(
             name="access_logs",
