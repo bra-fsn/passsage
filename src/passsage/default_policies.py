@@ -35,6 +35,7 @@ def default_rules() -> list["Rule"]:
         RegexRule(r".*by-hash/[A-Z0-9]+/[a-f0-9]+$", StaleIfError),
         # Python hosted packages
         HostContainsRule("files.pythonhosted.org", StaleIfError),
+        PathContainsRule("pypi.org/simple", StaleIfError),
         # cloud metadata endpoints
         HostPrefixRule("169.254.169.", NoCache),
         HostPrefixRule("169.254.170.", NoCache),
