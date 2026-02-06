@@ -231,6 +231,22 @@ import click
     show_default=True,
     help="Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)"
 )
+@click.option(
+    "--mitm-ca-cert",
+    envvar="PASSSAGE_MITM_CA_CERT",
+    default=None,
+    help="mitmproxy CA certificate (PEM file path or inline PEM). "
+    "Written to ~/.mitmproxy/mitmproxy-ca-cert.pem before startup. "
+    "(env: PASSSAGE_MITM_CA_CERT)"
+)
+@click.option(
+    "--mitm-ca",
+    envvar="PASSSAGE_MITM_CA",
+    default=None,
+    help="mitmproxy CA key+cert bundle (PEM file path or inline PEM). "
+    "Written to ~/.mitmproxy/mitmproxy-ca.pem before startup. "
+    "(env: PASSSAGE_MITM_CA)"
+)
 @click.version_option()
 @click.pass_context
 def main(
@@ -265,6 +281,8 @@ def main(
     error_log_flush_bytes,
     health_port,
     health_host,
+    mitm_ca_cert,
+    mitm_ca,
 ):
     """
     Passsage (Pas³age) - S3-backed caching proxy.
@@ -319,7 +337,34 @@ def main(
             error_log_flush_bytes,
             health_port,
             health_host,
+            mitm_ca_cert,
+            mitm_ca,
         )
+
+
+def _read_pem_value(value):
+    """Read PEM content from a file path or return inline PEM directly."""
+    if value.lstrip().startswith("-----BEGIN"):
+        return value
+    path = os.path.expanduser(value)
+    with open(path) as f:
+        return f.read()
+
+
+def _install_mitm_certs(mitm_ca_cert, mitm_ca):
+    """Write mitmproxy CA files to ~/.mitmproxy/ before mitmproxy starts."""
+    mitm_dir = os.path.expanduser("~/.mitmproxy")
+    os.makedirs(mitm_dir, exist_ok=True)
+    if mitm_ca_cert:
+        dest = os.path.join(mitm_dir, "mitmproxy-ca-cert.pem")
+        content = _read_pem_value(mitm_ca_cert)
+        with open(dest, "w") as f:
+            f.write(content)
+    if mitm_ca:
+        dest = os.path.join(mitm_dir, "mitmproxy-ca.pem")
+        content = _read_pem_value(mitm_ca)
+        with open(dest, "w") as f:
+            f.write(content)
 
 
 def run_proxy(
@@ -353,7 +398,12 @@ def run_proxy(
     error_log_flush_bytes,
     health_port,
     health_host,
+    mitm_ca_cert=None,
+    mitm_ca=None,
 ):
+    if mitm_ca_cert or mitm_ca:
+        _install_mitm_certs(mitm_ca_cert, mitm_ca)
+
     if s3_bucket:
         os.environ["S3_BUCKET"] = s3_bucket
     if s3_endpoint:
