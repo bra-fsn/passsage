@@ -9,13 +9,15 @@ ENV HOME=/home/passsage
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    less \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install package
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[ui]"
 
 # Run as non-root
 USER 10001
