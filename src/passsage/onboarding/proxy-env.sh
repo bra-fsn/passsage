@@ -25,34 +25,6 @@ as_root() {
   die "need root privileges for certificate installation (install sudo or run as root)"
 }
 
-detect_proxy_url() {
-  if [ "__PASSSAGE_PUBLIC_PROXY_URL__" != "__PASSSAGE_PUBLIC_PROXY_URL__" ]; then
-    printf '%s' "__PASSSAGE_PUBLIC_PROXY_URL__"
-    return
-  fi
-  if [ -n "${PROXY_URL:-}" ]; then
-    printf '%s' "$PROXY_URL"
-    return
-  fi
-  if [ -n "${HTTPS_PROXY:-}" ]; then
-    printf '%s' "$HTTPS_PROXY"
-    return
-  fi
-  if [ -n "${https_proxy:-}" ]; then
-    printf '%s' "$https_proxy"
-    return
-  fi
-  if [ -n "${HTTP_PROXY:-}" ]; then
-    printf '%s' "$HTTP_PROXY"
-    return
-  fi
-  if [ -n "${http_proxy:-}" ]; then
-    printf '%s' "$http_proxy"
-    return
-  fi
-  printf '%s' "http://localhost:8080"
-}
-
 detect_ca_bundle() {
   for path in \
     /etc/ssl/certs/ca-certificates.crt \
@@ -152,7 +124,7 @@ main() {
   cert="$(write_embedded_cert)"
   install_cert "$cert"
 
-  proxy_url="$(detect_proxy_url)"
+  proxy_url="__PASSSAGE_PUBLIC_PROXY_URL__"
   ca_bundle="$(detect_ca_bundle)"
 
   export HTTP_PROXY="$proxy_url"
