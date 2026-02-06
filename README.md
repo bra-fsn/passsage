@@ -250,6 +250,8 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 | `PASSSAGE_ERROR_LOG_DIR` | Local spool dir for error logs | `/tmp/passsage-errors` |
 | `PASSSAGE_ERROR_LOG_FLUSH_SECONDS` | Flush interval in seconds | `30` |
 | `PASSSAGE_ERROR_LOG_FLUSH_BYTES` | Flush size threshold | `256M` |
+| `PASSSAGE_MITM_CA_CERT` | mitmproxy CA certificate (PEM file path or inline PEM). Written to `~/.mitmproxy/mitmproxy-ca-cert.pem` before startup. | None |
+| `PASSSAGE_MITM_CA` | mitmproxy CA key+cert bundle (PEM file path or inline PEM). Written to `~/.mitmproxy/mitmproxy-ca.pem` before startup. | None |
 
 ### CLI Options
 
