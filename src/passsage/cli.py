@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from datetime import date
+from pathlib import Path
 
 import click
 
@@ -346,25 +347,23 @@ def _read_pem_value(value):
     """Read PEM content from a file path or return inline PEM directly."""
     if value.lstrip().startswith("-----BEGIN"):
         return value
-    path = os.path.expanduser(value)
-    with open(path) as f:
-        return f.read()
+    return Path(os.path.expanduser(value)).read_text()
+
+
+_MITM_CERT_FILES = {
+    "mitm_ca_cert": "mitmproxy-ca-cert.pem",
+    "mitm_ca": "mitmproxy-ca.pem",
+}
 
 
 def _install_mitm_certs(mitm_ca_cert, mitm_ca):
     """Write mitmproxy CA files to ~/.mitmproxy/ before mitmproxy starts."""
-    mitm_dir = os.path.expanduser("~/.mitmproxy")
-    os.makedirs(mitm_dir, exist_ok=True)
-    if mitm_ca_cert:
-        dest = os.path.join(mitm_dir, "mitmproxy-ca-cert.pem")
-        content = _read_pem_value(mitm_ca_cert)
-        with open(dest, "w") as f:
-            f.write(content)
-    if mitm_ca:
-        dest = os.path.join(mitm_dir, "mitmproxy-ca.pem")
-        content = _read_pem_value(mitm_ca)
-        with open(dest, "w") as f:
-            f.write(content)
+    mitm_dir = Path("~/.mitmproxy").expanduser()
+    mitm_dir.mkdir(parents=True, exist_ok=True)
+    values = {"mitm_ca_cert": mitm_ca_cert, "mitm_ca": mitm_ca}
+    for key, filename in _MITM_CERT_FILES.items():
+        if values[key]:
+            (mitm_dir / filename).write_text(_read_pem_value(values[key]))
 
 
 def run_proxy(

@@ -30,6 +30,7 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 from cachetools import TTLCache, cached
 from mitmproxy import ctx, http
 from mitmproxy.script import concurrent
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 from werkzeug.http import parse_date
 
@@ -68,7 +69,7 @@ POLICY_HEADER = "X-Passsage-Policy"
 
 _S3_ENDPOINT = os.environ.get("S3_ENDPOINT_URL")
 S3_REGION = os.environ.get("AWS_DEFAULT_REGION", os.environ.get("AWS_REGION", "us-west-2"))
-S3_BUCKET = os.environ.get("S3_BUCKET", "364189071156-ds-proxy-us-west-2") if not _S3_ENDPOINT else os.environ.get("S3_BUCKET", "proxy-cache")
+S3_BUCKET = os.environ.get("S3_BUCKET", "proxy-cache")
 if _S3_ENDPOINT:
     p = urlparse(_S3_ENDPOINT)
     S3_HOST = p.hostname or "localhost"
@@ -84,38 +85,33 @@ else:
     S3_PATH_STYLE = False
 CACHE_TIMEOUT = 10
 UPSTREAM_TIMEOUT = 10
+
+_TRUTHY = ("1", "true", "yes")
+_FALSY = ("0", "false", "no")
+
+
+def _env_bool(name, default=""):
+    return os.environ.get(name, default).strip().lower() in _TRUTHY
+
+
+def _env_bool_default_true(name):
+    return os.environ.get(name, "1").strip().lower() not in _FALSY
+
+
 HEALTH_PORT = int(os.environ.get("PASSSAGE_HEALTH_PORT", "8082"))
 HEALTH_HOST = os.environ.get("PASSSAGE_HEALTH_HOST", "0.0.0.0")
-HEALTH_CHECK_S3 = os.environ.get("PASSSAGE_HEALTH_CHECK_S3", "1").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-)
-CACHE_REDIRECT = os.environ.get("PASSSAGE_CACHE_REDIRECT", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
-SIGNED_CACHE_REDIRECT = os.environ.get("PASSSAGE_CACHE_REDIRECT_SIGNED_URL", "").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-)
+HEALTH_CHECK_S3 = _env_bool_default_true("PASSSAGE_HEALTH_CHECK_S3")
+CACHE_REDIRECT = _env_bool("PASSSAGE_CACHE_REDIRECT")
+SIGNED_CACHE_REDIRECT = _env_bool_default_true("PASSSAGE_CACHE_REDIRECT_SIGNED_URL")
 CACHE_REDIRECT_SIGNED_URL_EXPIRES = int(
     os.environ.get("PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES", "3600"), 10
 )
 PRESIGNED_URL_CACHE_MAXSIZE = int(
     os.environ.get("PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE", "10000"), 10
 )
-PRESIGNED_URL_CACHE_TTL = max(
-    1, int(CACHE_REDIRECT_SIGNED_URL_EXPIRES * 0.2)
-)
+PRESIGNED_URL_CACHE_TTL = max(1, int(CACHE_REDIRECT_SIGNED_URL_EXPIRES * 0.2))
 PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
-ACCESS_LOGS = os.environ.get("PASSSAGE_ACCESS_LOGS", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
+ACCESS_LOGS = _env_bool("PASSSAGE_ACCESS_LOGS")
 ACCESS_LOG_PREFIX = os.environ.get("PASSSAGE_ACCESS_LOG_PREFIX", "__passsage_logs__").strip()
 ACCESS_LOG_DIR = os.environ.get("PASSSAGE_ACCESS_LOG_DIR", "/tmp/passsage-logs").strip()
 ACCESS_LOG_FLUSH_SECONDS = os.environ.get("PASSSAGE_ACCESS_LOG_FLUSH_SECONDS", "30").strip()
@@ -125,11 +121,7 @@ ACCESS_LOG_HEADERS = os.environ.get(
     "accept,accept-encoding,cache-control,content-type,content-encoding,"
     "etag,last-modified,range,user-agent,via,x-cache,x-cache-lookup,x-amz-request-id",
 ).strip()
-ERROR_LOGS = os.environ.get("PASSSAGE_ERROR_LOGS", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
+ERROR_LOGS = _env_bool("PASSSAGE_ERROR_LOGS")
 ERROR_LOG_PREFIX = os.environ.get("PASSSAGE_ERROR_LOG_PREFIX", "__passsage_error_logs__").strip()
 ERROR_LOG_DIR = os.environ.get("PASSSAGE_ERROR_LOG_DIR", "/tmp/passsage-errors").strip()
 ERROR_LOG_FLUSH_SECONDS = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_SECONDS", "30").strip()
@@ -188,18 +180,16 @@ def get_s3_client(tls=threading.local()):
     This is to utilize urllib's HTTP connection pooling instead of creating a
     new pool for each thread.
     """
-    # suppress `Found credentials in shared credentials file` messages
-    logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
     try:
         return tls.s3
     except AttributeError:
-        from botocore.config import Config
+        logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
         kwargs = {"region_name": S3_REGION}
         if _S3_ENDPOINT:
             kwargs["endpoint_url"] = _S3_ENDPOINT
-            kwargs["config"] = Config(s3={"addressing_style": "path"})
+            kwargs["config"] = BotoConfig(s3={"addressing_style": "path"})
         else:
-            kwargs["config"] = Config(signature_version="s3v4")
+            kwargs["config"] = BotoConfig(signature_version="s3v4")
         tls.s3 = boto3.session.Session().client("s3", **kwargs)
         return tls.s3
 
