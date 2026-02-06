@@ -67,6 +67,7 @@ VIA_HEADER_VALUE = f"1.1 {_VIA_HOSTNAME} ({SERVER_NAME}/{SERVER_VERSION})"
 POLICY_HEADER = "X-Passsage-Policy"
 
 _S3_ENDPOINT = os.environ.get("S3_ENDPOINT_URL")
+S3_REGION = os.environ.get("AWS_DEFAULT_REGION", os.environ.get("AWS_REGION", "us-west-2"))
 S3_BUCKET = os.environ.get("S3_BUCKET", "364189071156-ds-proxy-us-west-2") if not _S3_ENDPOINT else os.environ.get("S3_BUCKET", "proxy-cache")
 if _S3_ENDPOINT:
     p = urlparse(_S3_ENDPOINT)
@@ -76,7 +77,7 @@ if _S3_ENDPOINT:
     S3_URL = f"{S3_SCHEME}://{S3_HOST}:{S3_PORT}/{S3_BUCKET}"
     S3_PATH_STYLE = True
 else:
-    S3_HOST = f"{S3_BUCKET}.s3.us-west-2.amazonaws.com"
+    S3_HOST = f"{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com"
     S3_PORT = 80
     S3_SCHEME = "http"
     S3_URL = f"{S3_SCHEME}://{S3_HOST}"
@@ -192,11 +193,13 @@ def get_s3_client(tls=threading.local()):
     try:
         return tls.s3
     except AttributeError:
-        kwargs = {}
+        from botocore.config import Config
+        kwargs = {"region_name": S3_REGION}
         if _S3_ENDPOINT:
-            from botocore.config import Config
             kwargs["endpoint_url"] = _S3_ENDPOINT
             kwargs["config"] = Config(s3={"addressing_style": "path"})
+        else:
+            kwargs["config"] = Config(signature_version="s3v4")
         tls.s3 = boto3.session.Session().client("s3", **kwargs)
         return tls.s3
 
