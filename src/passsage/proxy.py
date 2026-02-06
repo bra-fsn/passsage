@@ -227,13 +227,35 @@ def s3_head_object(cache_key: str) -> S3HeadResponse:
     return S3HeadResponse(200, headers)
 
 
+def _no_proxy_s3_hosts() -> str:
+    if _S3_ENDPOINT:
+        return S3_HOST
+    hosts = set()
+    if CACHE_REDIRECT:
+        hosts.add(f"{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com")
+        hosts.add(f"{S3_BUCKET}.s3.amazonaws.com")
+        if SIGNED_CACHE_REDIRECT:
+            try:
+                url = get_s3_client().generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": S3_BUCKET, "Key": "__passsage_no_proxy_probe__"},
+                    ExpiresIn=60,
+                )
+                hosts.add(urlparse(url).hostname)
+            except Exception:
+                pass
+    if not hosts:
+        hosts.add(S3_HOST)
+    return ",".join(sorted(hosts))
+
+
 def load_proxy_env_script() -> bytes:
     try:
         from importlib import resources
         script = resources.files("passsage").joinpath("onboarding/proxy-env.sh").read_text()
         public_url = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip() or "http://localhost:8080"
         script = script.replace("__PASSSAGE_PUBLIC_PROXY_URL__", public_url)
-        script = script.replace("__PASSSAGE_S3_HOST__", S3_HOST)
+        script = script.replace("__PASSSAGE_S3_HOST__", _no_proxy_s3_hosts())
         cert_pem = _read_ca_cert_pem()
         if cert_pem:
             script = script.replace("__PASSSAGE_MITM_CA_PEM__", cert_pem)
