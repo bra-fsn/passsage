@@ -183,11 +183,20 @@ You can also source it in one line:
 
 It also tries to write `~/.passsage/proxy-env.sh` for reuse in other shells.
 
-If the proxy is behind a load balancer, set a public URL so the proxy env script
-exports the correct proxy address:
+If the proxy is behind a load balancer or deployed in Kubernetes, the internal
+listen address (e.g. `0.0.0.0:8080`) is not reachable by clients. Set
+`--public-proxy-url` to the externally reachable address so the onboarding
+script exports the correct `HTTP_PROXY`/`HTTPS_PROXY` values:
 
 ```bash
-passsage --public-proxy-url http://proxy.example.com:8080
+passsage --public-proxy-url http://proxy.example.com:3128
+```
+
+You can also set it via the environment variable:
+
+```bash
+export PASSSAGE_PUBLIC_PROXY_URL=http://proxy.example.com:3128
+passsage
 ```
 
 ### With LocalStack (Local Development)
@@ -229,6 +238,7 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 | `PASSSAGE_HOST` | Proxy bind host | `0.0.0.0` |
 | `S3_BUCKET` | S3 bucket name for cache storage | `364189071156-ds-proxy-us-west-2` (AWS) or `proxy-cache` (custom endpoint) |
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
+| `PASSSAGE_PUBLIC_PROXY_URL` | Externally reachable proxy URL for the onboarding script (e.g. `http://proxy.example.com:3128`). Required behind a load balancer or in Kubernetes. | None |
 | `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `0` |
 | `PASSSAGE_ACCESS_LOG_PREFIX` | S3 prefix for access logs | `__passsage_logs__` |
 | `PASSSAGE_ACCESS_LOG_DIR` | Local spool dir for access logs | `/tmp/passsage-logs` |
@@ -255,6 +265,8 @@ Options:
   -m, --mode [regular|transparent|wireguard|upstream]
                                   Proxy mode (default: regular)
   -v, --verbose                   Enable verbose logging
+  --public-proxy-url TEXT         Externally reachable proxy URL for client onboarding
+                                  (env: PASSSAGE_PUBLIC_PROXY_URL)
   --cache-redirect                Redirect cache hits to S3 instead of streaming through the proxy
   --access-logs                   Enable S3 access logs in Parquet format
   --access-log-prefix TEXT        S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)

@@ -1143,7 +1143,12 @@ class Proxy:
             name="public_proxy_url",
             typespec=str,
             default=PUBLIC_PROXY_URL,
-            help="Public proxy URL embedded in mitm.it/proxy-env responses",
+            help="Externally reachable proxy URL (e.g. http://proxy.example.com:3128). "
+                 "Embedded in the mitm.it/proxy-env.sh onboarding script so clients "
+                 "export the correct HTTP_PROXY/HTTPS_PROXY address. Required when the "
+                 "proxy runs behind a load balancer or in Kubernetes where the internal "
+                 "listen address differs from the address clients should connect to. "
+                 "Env: PASSSAGE_PUBLIC_PROXY_URL",
         )
         loader.add_option(
             name="cache_redirect",
