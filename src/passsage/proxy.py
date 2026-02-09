@@ -960,7 +960,7 @@ def _build_error_log_record(
     }
 
 
-def get_quoted_url(flow):
+def _normalize_url(flow) -> str:
     request_ctx = CacheKeyContext(
         url=flow.request.url,
         method=flow.request.method,
@@ -970,22 +970,48 @@ def get_quoted_url(flow):
     return resolver.resolve(request_ctx)
 
 
-def get_cache_key(url: str, vary_key: str | None = None) -> str:
-    base = url
+def _url_ext(url: str, max_len: int = 20) -> str:
+    path = urlparse(url).path.rstrip("/")
+    if not path:
+        return ""
+    last = path.rsplit("/", 1)[-1]
+    dot = last.rfind(".")
+    if dot < 1:
+        return ""
+    ext = last[dot:]
+    if len(ext) > max_len or not all(c.isalnum() or c in ".-_" for c in ext[1:]):
+        return ""
+    return ext
+
+
+def _hashed_s3_key(normalized_url: str, vary_key: str | None = None) -> str:
+    parsed = urlparse(normalized_url)
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "unknown").lower()
+    digest = hashlib.sha224(normalized_url.encode("utf-8")).hexdigest()
+    ext = _url_ext(normalized_url)
     if vary_key:
-        return f"{base}__vary__{vary_key}"
-    return base
+        return f"{scheme}/{host}/{digest}+{vary_key}{ext}"
+    return f"{scheme}/{host}/{digest}{ext}"
 
 
-def get_vary_index_key(url: str) -> str:
-    return f"{url}__vary_index"
+def get_cache_key(normalized_url: str, vary_key: str | None = None) -> str:
+    return _hashed_s3_key(normalized_url, vary_key)
+
+
+def get_vary_index_key(normalized_url: str) -> str:
+    parsed = urlparse(normalized_url)
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "unknown").lower()
+    digest = hashlib.sha224(normalized_url.encode("utf-8")).hexdigest()
+    return f"{scheme}/{host}/_vary/{digest}"
 
 
 def compute_vary_key(vary_header: str, request_headers) -> str | None:
     raw = build_vary_request(vary_header, request_headers)
     if raw is None:
         return None
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha224(raw.encode("utf-8")).hexdigest()
 
 
 def build_vary_request(vary_header: str, request_headers) -> str | None:
@@ -996,14 +1022,9 @@ def build_vary_request(vary_header: str, request_headers) -> str | None:
     return "|".join(parts)
 
 
-def get_cache_path_key(cache_key: str) -> str:
-    return requests.utils.quote(cache_key, safe="/")
-
-
 def get_cache_url(flow, key_override: str | None = None):
-    key = key_override or get_quoted_url(flow)
-    cache_key = get_cache_path_key(key)
-    return f"{S3_URL}/{cache_key}"
+    key = key_override or get_cache_key(_normalize_url(flow))
+    return f"{S3_URL}/{key}"
 
 
 _presigned_url_cache = TTLCache(
@@ -1014,11 +1035,10 @@ _presigned_url_cache = TTLCache(
 
 @cached(
     cache=_presigned_url_cache,
-    key=lambda flow: getattr(flow, "_cache_key", None) or get_quoted_url(flow),
+    key=lambda flow: getattr(flow, "_cache_key", None) or get_cache_key(_normalize_url(flow)),
 )
 def get_cache_redirect_url(flow) -> str:
-    cache_key = getattr(flow, "_cache_key", None) or get_quoted_url(flow)
-    cache_path_key = get_cache_path_key(cache_key)
+    cache_key = getattr(flow, "_cache_key", None) or get_cache_key(_normalize_url(flow))
     if getattr(ctx.options, "cache_redirect_signed_url", False):
         expires = getattr(
             ctx.options, "cache_redirect_signed_url_expires", CACHE_REDIRECT_SIGNED_URL_EXPIRES
@@ -1036,7 +1056,7 @@ def get_cache_redirect_url(flow) -> str:
         netloc = host
     else:
         netloc = f"{host}:{port}"
-    return f"{scheme}://{netloc}{path_prefix}{cache_path_key}"
+    return f"{scheme}://{netloc}{path_prefix}{cache_key}"
 
 
 def cache_redirect_response(flow) -> None:
@@ -1053,11 +1073,10 @@ def cache_redirect(flow):
         # We've been already called, don't rewrite again
         return
     flow._req_orig_url = flow.request.url
-    cache_key = getattr(flow, "_cache_key", None) or get_quoted_url(flow)
+    cache_key = getattr(flow, "_cache_key", None) or get_cache_key(_normalize_url(flow))
     LOG.debug("Cache redirect key=%s", cache_key)
     path_prefix = f"/{S3_BUCKET}/" if S3_PATH_STYLE else "/"
-    cache_path_key = get_cache_path_key(cache_key)
-    flow.request.path = f"{path_prefix}{cache_path_key}"
+    flow.request.path = f"{path_prefix}{cache_key}"
     flow.request.host = S3_HOST
     flow.request.port = S3_PORT
     flow.request.scheme = S3_SCHEME
@@ -1346,7 +1365,7 @@ class Proxy:
         flow._cache_key = None
         flow._cache_vary = None
         try:
-            normalized_url = get_quoted_url(flow)
+            normalized_url = _normalize_url(flow)
             vary_index_key = get_vary_index_key(normalized_url)
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
             vary_index_head = s3_head_object(vary_index_key)
@@ -1712,6 +1731,7 @@ class Proxy:
             f.seek(0)
             extras["Metadata"]["sha224"] = digest
             extras["Metadata"]["stored-at"] = str(time.time())
+            extras["Metadata"]["url"] = url[:512]
             if vary_header:
                 extras["Metadata"]["vary"] = vary_header
             if vary_request:
@@ -1802,7 +1822,7 @@ class Proxy:
             else:
                 vary_key = compute_vary_key(vary_header, flow.request.headers)
                 if vary_key:
-                    normalized_url = get_quoted_url(flow)
+                    normalized_url = _normalize_url(flow)
                     flow._cache_key = get_cache_key(normalized_url, vary_key)
                     flow._cache_vary = vary_header
                     flow._cache_vary_request = build_vary_request(
@@ -1838,7 +1858,7 @@ class Proxy:
                 with ctx._lock:
                     self.cleanup(flow)
                 return
-            normalized_url = get_quoted_url(flow)
+            normalized_url = _normalize_url(flow)
             cache_key = flow._cache_key or get_cache_key(normalized_url)
             LOG.debug("Cache save enqueue key=%s", cache_key)
             ctx._executor.submit(
