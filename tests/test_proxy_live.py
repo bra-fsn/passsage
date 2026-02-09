@@ -38,8 +38,23 @@ def get_method_count(stats: dict, path: str, method: str) -> int:
 
 
 def assert_cached_response(resp: requests.Response) -> None:
+    if "Cache-Status" in resp.headers:
+        assert "Age" in resp.headers
+        return
+    if cache_redirect_enabled():
+        if has_cache_redirect(resp):
+            return
     assert "Cache-Status" in resp.headers
-    assert "Age" in resp.headers
+
+
+def has_cache_redirect(resp: requests.Response) -> bool:
+    candidates = [resp] + list(resp.history or [])
+    return any(r.status_code in (302, 307) and r.headers.get("Location") for r in candidates)
+
+
+def cache_redirect_enabled() -> bool:
+    value = os.environ.get("PASSSAGE_CACHE_REDIRECT", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def policy_headers(policy_name: str) -> dict[str, str]:
@@ -112,7 +127,9 @@ def wait_for_cached_response(
     last_resp = None
     for _ in range(retries):
         last_resp = proxy_get(session, url, headers=headers, timeout=timeout)
-        if "Cache-Status" in last_resp.headers:
+        if "Cache-Status" in last_resp.headers or (
+            cache_redirect_enabled() and has_cache_redirect(last_resp)
+        ):
             return last_resp
         time.sleep(sleep_seconds)
     return last_resp
@@ -135,7 +152,10 @@ def get_cached_without_upstream(
         before = get_method_count(test_server.stats(), path, "GET")
         last_resp = proxy_get(session, url, headers=headers, timeout=timeout, **kwargs)
         after = get_method_count(test_server.stats(), path, "GET")
-        if "Cache-Status" in last_resp.headers and after == before:
+        if (
+            ("Cache-Status" in last_resp.headers or has_cache_redirect(last_resp))
+            and after == before
+        ):
             return last_resp
         time.sleep(sleep_seconds)
     return last_resp
@@ -571,6 +591,9 @@ class TestProxyLive:
             headers=policy_headers("Standard"),
         )
         assert r1.ok and r2.ok
+        if cache_redirect_enabled() and has_cache_redirect(r2):
+            assert_cached_response(r2)
+            return
         assert r2.headers.get("Content-Language") == "en"
         assert r2.headers.get("Content-Disposition") == "inline"
         assert r2.headers.get("Content-Location") == "/headers"
