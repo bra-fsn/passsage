@@ -167,12 +167,12 @@ class TestGetCacheRedirectUrl:
 
 
 # ---------------------------------------------------------------------------
-# cache_redirect_response
+# serve_cache_hit
 # ---------------------------------------------------------------------------
 
-class TestCacheRedirectResponse:
+class TestServeCacheHit:
     def test_redirect_uses_proxy_url(self):
-        from passsage.proxy import cache_redirect_response, _presigned_url_cache
+        from passsage.proxy import serve_cache_hit, _presigned_url_cache
 
         _presigned_url_cache.clear()
 
@@ -182,10 +182,11 @@ class TestCacheRedirectResponse:
             s3_proxy_url="http://xs3lerator.local:8080",
             cache_redirect=True,
             cache_redirect_signed_url=False,
+            no_redirect_user_agents="pip/",
         )
         with patch(f"{MODULE}.ctx") as mock_ctx:
             mock_ctx.options = ctx_options
-            cache_redirect_response(flow)
+            serve_cache_hit(flow)
 
         assert flow.response is not None
         assert flow.response.status_code in (302, 307)
@@ -194,7 +195,7 @@ class TestCacheRedirectResponse:
         assert flow._cache_redirect is True
 
     def test_redirect_302_for_get(self):
-        from passsage.proxy import cache_redirect_response, _presigned_url_cache
+        from passsage.proxy import serve_cache_hit, _presigned_url_cache
 
         _presigned_url_cache.clear()
 
@@ -204,15 +205,16 @@ class TestCacheRedirectResponse:
             s3_proxy_url="http://xs3lerator.local:8080",
             cache_redirect=True,
             cache_redirect_signed_url=False,
+            no_redirect_user_agents="pip/",
         )
         with patch(f"{MODULE}.ctx") as mock_ctx:
             mock_ctx.options = ctx_options
-            cache_redirect_response(flow)
+            serve_cache_hit(flow)
 
         assert flow.response.status_code == 302
 
     def test_redirect_307_for_non_get(self):
-        from passsage.proxy import cache_redirect_response, _presigned_url_cache
+        from passsage.proxy import serve_cache_hit, _presigned_url_cache
 
         _presigned_url_cache.clear()
 
@@ -222,10 +224,11 @@ class TestCacheRedirectResponse:
             s3_proxy_url="http://xs3lerator.local:8080",
             cache_redirect=True,
             cache_redirect_signed_url=False,
+            no_redirect_user_agents="pip/",
         )
         with patch(f"{MODULE}.ctx") as mock_ctx:
             mock_ctx.options = ctx_options
-            cache_redirect_response(flow)
+            serve_cache_hit(flow)
 
         assert flow.response.status_code == 307
 

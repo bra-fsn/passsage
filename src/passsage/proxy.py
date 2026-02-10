@@ -1152,10 +1152,10 @@ def _should_skip_redirect(flow) -> bool:
     return any(ua.startswith(prefix) for prefix in prefixes)
 
 
-def cache_redirect_response(flow) -> None:
+def serve_cache_hit(flow) -> None:
     if _should_skip_redirect(flow):
         LOG.debug("Skipping redirect for user-agent: %s", flow.request.headers.get("user-agent", ""))
-        cache_redirect(flow)
+        rewrite_upstream_to_cache(flow)
         return
     status = 302 if flow.request.method == "GET" else 307
     location = get_cache_redirect_url(flow)
@@ -1165,7 +1165,7 @@ def cache_redirect_response(flow) -> None:
     flow._cache_redirect = True
 
 
-def cache_redirect(flow):
+def rewrite_upstream_to_cache(flow):
     if getattr(flow, "_req_orig_url", None):
         # We've been already called, don't rewrite again
         return
@@ -1588,25 +1588,25 @@ class Proxy:
 
         if cache_hit:
             if policy == NoRefresh:
-                LOG.debug("Cache hit: NoRefresh -> cache_redirect")
+                LOG.debug("Cache hit: NoRefresh -> serve_cache_hit")
                 if getattr(ctx.options, "cache_redirect", False):
-                    cache_redirect_response(flow)
+                    serve_cache_hit(flow)
                     return
-                cache_redirect(flow)
+                rewrite_upstream_to_cache(flow)
                 return
             if cache_fresh and policy in (Standard, StaleIfError):
-                LOG.debug("Cache hit: fresh -> cache_redirect")
+                LOG.debug("Cache hit: fresh -> serve_cache_hit")
                 if getattr(ctx.options, "cache_redirect", False):
-                    cache_redirect_response(flow)
+                    serve_cache_hit(flow)
                     return
-                cache_redirect(flow)
+                rewrite_upstream_to_cache(flow)
                 return
             if policy in (Standard, StaleIfError) and allow_stale_while_revalidate:
-                LOG.debug("Cache hit: stale-while-revalidate -> cache_redirect")
+                LOG.debug("Cache hit: stale-while-revalidate -> serve_cache_hit")
                 if getattr(ctx.options, "cache_redirect", False):
-                    cache_redirect_response(flow)
+                    serve_cache_hit(flow)
                     return
-                cache_redirect(flow)
+                rewrite_upstream_to_cache(flow)
                 return
         else:
             if (flow.request.method == "GET"
@@ -1687,19 +1687,19 @@ class Proxy:
                     and flow._upstream_head.status_code == 404
                     and (policy == StaleIfError or allow_stale_if_error)):
                 if getattr(ctx.options, "cache_redirect", False):
-                    cache_redirect_response(flow)
+                    serve_cache_hit(flow)
                     return
-                cache_redirect(flow)
+                rewrite_upstream_to_cache(flow)
                 return
 
         # On upstream errors or if it's banned, StaleIfError may serve cached content.
         if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
             if cache_hit and (policy == StaleIfError or allow_stale_if_error):
-                LOG.debug("Upstream failed -> cache_redirect (StaleIfError)")
+                LOG.debug("Upstream failed -> rewrite_upstream_to_cache (StaleIfError)")
                 if getattr(ctx.options, "cache_redirect", False):
-                    cache_redirect_response(flow)
+                    serve_cache_hit(flow)
                     return
-                cache_redirect(flow)
+                rewrite_upstream_to_cache(flow)
                 return
 
         # If upstream didn't respond (or banned) and we have a cache miss,
@@ -1740,7 +1740,7 @@ class Proxy:
                     or flow._upstream_head.headers.get("etag") != flow._cache_head.headers.get("x-amz-meta-header-etag")):
                 if flow._cache_key:
                     refresh_cache_metadata(flow._cache_key, flow._cache_head.headers)
-                cache_redirect(flow)
+                rewrite_upstream_to_cache(flow)
                 return
 
 
