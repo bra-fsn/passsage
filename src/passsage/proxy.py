@@ -392,6 +392,68 @@ def save_response(proxy, flow, data: bytes) -> Union[bytes, Iterable[bytes]]:
     return data
 
 
+def _parse_single_range(header: str, total: int) -> tuple[int, int] | None:
+    """Parse a single-range ``Range`` header.  Returns (start, end) inclusive or None."""
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header[len("bytes="):].strip()
+    if "," in spec:
+        return None  # multi-range — not supported
+    try:
+        if spec.startswith("-"):
+            suffix_len = int(spec[1:])
+            if suffix_len <= 0 or suffix_len > total:
+                return None
+            return total - suffix_len, total - 1
+        parts = spec.split("-", 1)
+        start = int(parts[0])
+        end = int(parts[1]) if parts[1] else total - 1
+        end = min(end, total - 1)
+        if start > end or start >= total:
+            return None
+        return start, end
+    except (ValueError, IndexError):
+        return None
+
+
+def _is_unsatisfiable_range(header: str, total: int) -> bool:
+    """Return True when the Range spec is syntactically valid but wholly outside [0, total)."""
+    if not header or not header.startswith("bytes="):
+        return False
+    spec = header[len("bytes="):].strip()
+    if "," in spec:
+        return False  # multi-range — not an error, just unsupported
+    try:
+        if spec.startswith("-"):
+            suffix_len = int(spec[1:])
+            return suffix_len <= 0 or suffix_len > total
+        parts = spec.split("-", 1)
+        start = int(parts[0])
+        return start >= total
+    except (ValueError, IndexError):
+        return False
+
+
+def _make_range_stream(proxy, flow, start: int, end: int):
+    """Return a stream function that saves the full body but serves only [start, end] to the client."""
+    pos = [0]
+
+    def stream_fn(data: bytes):
+        saved = save_response(proxy, flow, data)
+        if not data:
+            return saved  # end-of-stream marker
+        chunk_start = pos[0]
+        chunk_end = chunk_start + len(data) - 1
+        pos[0] += len(data)
+        if chunk_end < start or chunk_start > end:
+            return b""
+        slice_start = max(0, start - chunk_start)
+        slice_end = min(len(data), end - chunk_start + 1)
+        return data[slice_start:slice_end]
+
+    return stream_fn
+
+
 def get_policy(flow):
     if (
         flow.request.headers
@@ -649,7 +711,10 @@ def request_requires_revalidation(request_headers: dict[str, str], freshness: Ca
 
 def apply_cached_metadata(flow: http.HTTPFlow) -> None:
     if (status_code := flow.response.headers.get("x-amz-meta-status-code")):
-        flow.response.status_code = int(status_code)
+        # When S3 returns 206 (honoring a Range header on the cached object),
+        # don't overwrite back to the stored 200 — the 206 is correct.
+        if flow.response.status_code != 206:
+            flow.response.status_code = int(status_code)
     if (reason := flow.response.headers.get("x-amz-meta-reason")):
         flow.response.reason = reason
     for k, v in flow.response.headers.items():
@@ -1341,6 +1406,7 @@ class Proxy:
         flow._allow_stale_while_revalidate = False
         flow._allow_stale_if_error = False
         flow._save_response = True
+        flow._orig_range = None
         policy = flow._policy = get_policy(flow)
         if _is_s3_cache_request(flow):
             # If a client proxies the S3 redirect URL back through us, avoid re-caching
@@ -1525,6 +1591,12 @@ class Proxy:
                 # the upstream doesn't work, we have the chance of serving it.
                 # save the original, we'll need that for returning 304
                 flow._orig_data["if-modified-since"] = flow.request.headers.pop("if-modified-since", None)
+            if flow.request.method == "GET" and "Range" in flow.request.headers:
+                # Strip Range on cache miss so upstream returns the full 200.
+                # We cache the full object and serve the requested range slice
+                # to the client in responseheaders.
+                flow._orig_range = flow.request.headers.pop("Range")
+                LOG.debug("Stripped Range header on cache miss: %s", flow._orig_range)
 
         upstream_failed = False
         flow._upstream_error = None
@@ -1696,8 +1768,40 @@ class Proxy:
         existing_via = flow.response.headers.get("via", "")
         flow.response.headers["via"] = f"{VIA_HEADER_VALUE}, {existing_via}" if existing_via else VIA_HEADER_VALUE
         if flow._save_response:
-            # save the stream if we may want to cache it
-            flow.response.stream = lambda data: save_response(self, flow, data)
+            orig_range = getattr(flow, "_orig_range", None)
+            if (
+                orig_range
+                and flow.response.status_code == 200
+                and flow.response.headers.get("content-length")
+            ):
+                total = int(flow.response.headers["content-length"])
+                parsed = _parse_single_range(orig_range, total)
+                if parsed is not None:
+                    start, end = parsed
+                    length = end - start + 1
+                    # Preserve original 200 so the cache stores the full object as 200
+                    flow._orig_data["status_code"] = 200
+                    flow._orig_data["reason"] = flow.response.reason
+                    flow.response.status_code = 206
+                    flow.response.headers["content-range"] = f"bytes {start}-{end}/{total}"
+                    flow.response.headers["content-length"] = str(length)
+                    flow.response.stream = _make_range_stream(self, flow, start, end)
+                elif _is_unsatisfiable_range(orig_range, total):
+                    flow._orig_data["status_code"] = 200
+                    flow._orig_data["reason"] = flow.response.reason
+                    flow.response.status_code = 416
+                    flow.response.headers["content-range"] = f"bytes */{total}"
+                    flow.response.headers["content-length"] = "0"
+                    # Save full body for caching, but send nothing to client
+                    def _discard_stream(data, _self=self, _flow=flow):
+                        save_response(_self, _flow, data)
+                        return b"" if data else b""
+                    flow.response.stream = _discard_stream
+                else:
+                    # unparseable or multi-range: serve the full 200
+                    flow.response.stream = lambda data: save_response(self, flow, data)
+            else:
+                flow.response.stream = lambda data: save_response(self, flow, data)
         else:
             flow.response.stream = True
         if flow._cached:
@@ -1823,6 +1927,14 @@ class Proxy:
             with ctx._lock:
                 self.cleanup(flow)
             return
+
+        # Safety net: never cache an *upstream* 206 Partial Content response.
+        # When _orig_range is set, we intentionally rewrote 200→206 in
+        # responseheaders (the full body is still being saved via the range
+        # stream).  Only block caching when the upstream genuinely returned 206
+        # (e.g. non-GET, or upstream ignored our Range-stripping).
+        if flow.response.status_code == 206 and not getattr(flow, "_orig_range", None):
+            flow._save_response = False
 
         refresh_patterns = get_refresh_patterns()
         if not any(p.pattern.search(flow.request.url) for p in refresh_patterns):
