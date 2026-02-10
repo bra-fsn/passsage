@@ -111,6 +111,7 @@ PRESIGNED_URL_CACHE_MAXSIZE = int(
 )
 PRESIGNED_URL_CACHE_TTL = max(1, int(CACHE_REDIRECT_SIGNED_URL_EXPIRES * 0.2))
 S3_PROXY_URL = os.environ.get("PASSSAGE_S3_PROXY_URL", "").strip().rstrip("/")
+_S3_PROXY_HOST = urlparse(S3_PROXY_URL).hostname if S3_PROXY_URL else None
 PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
 ACCESS_LOGS = _env_bool("PASSSAGE_ACCESS_LOGS")
 ACCESS_LOG_PREFIX = os.environ.get("PASSSAGE_ACCESS_LOG_PREFIX", "__passsage_logs__").strip()
@@ -442,7 +443,12 @@ def _build_upstream_error_response(status_code: int, title: str, detail: str) ->
 
 
 def _is_s3_cache_request(flow: http.HTTPFlow) -> bool:
-    return flow.request.pretty_host == S3_HOST
+    host = flow.request.pretty_host
+    if host == S3_HOST:
+        return True
+    if _S3_PROXY_HOST and host == _S3_PROXY_HOST:
+        return True
+    return False
 
 
 def parse_cache_control(value: str) -> dict[str, str | bool]:
