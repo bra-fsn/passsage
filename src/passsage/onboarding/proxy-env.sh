@@ -120,9 +120,20 @@ write_env_file() {
 }
 
 main() {
+  skip_cert=0
+  for arg in "$@"; do
+    case "$arg" in
+      --no-certificate) skip_cert=1 ;;
+    esac
+  done
+
   log "mitmproxy certificate installer"
-  cert="$(write_embedded_cert)"
-  install_cert "$cert"
+  if [ "$skip_cert" -eq 0 ]; then
+    cert="$(write_embedded_cert)"
+    install_cert "$cert"
+  else
+    log "skipping certificate installation (--no-certificate)"
+  fi
 
   proxy_url="__PASSSAGE_PUBLIC_PROXY_URL__"
   ca_bundle="$(detect_ca_bundle)"
