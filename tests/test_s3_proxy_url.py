@@ -3,6 +3,7 @@
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 import pytest
 from click.testing import CliRunner
@@ -56,6 +57,7 @@ class FakeRequest:
         self.url = url
         self.method = method
         self.headers = {}
+        self.pretty_host = urlparse(url).hostname or ""
 
 
 class FakeFlow:
@@ -280,3 +282,41 @@ class TestNoProxyS3Hosts:
             hosts = _no_proxy_s3_hosts()
 
         assert "proxy.example.com" in hosts
+
+
+# ---------------------------------------------------------------------------
+# _is_s3_cache_request -- bypass for S3 proxy host
+# ---------------------------------------------------------------------------
+
+class TestIsS3CacheRequest:
+    def test_matches_s3_host(self):
+        from passsage.proxy import _is_s3_cache_request
+
+        flow = FakeFlow("http://my-bucket.s3.us-west-2.amazonaws.com/key")
+        with patch(f"{MODULE}.S3_HOST", "my-bucket.s3.us-west-2.amazonaws.com"), \
+             patch(f"{MODULE}._S3_PROXY_HOST", None):
+            assert _is_s3_cache_request(flow) is True
+
+    def test_matches_s3_proxy_host(self):
+        from passsage.proxy import _is_s3_cache_request
+
+        flow = FakeFlow("http://proxy-objects.ds.system1.company/some/key")
+        with patch(f"{MODULE}.S3_HOST", "my-bucket.s3.us-west-2.amazonaws.com"), \
+             patch(f"{MODULE}._S3_PROXY_HOST", "proxy-objects.ds.system1.company"):
+            assert _is_s3_cache_request(flow) is True
+
+    def test_no_match_for_other_host(self):
+        from passsage.proxy import _is_s3_cache_request
+
+        flow = FakeFlow("https://ftp.uni-hannover.de/debian/file.iso")
+        with patch(f"{MODULE}.S3_HOST", "my-bucket.s3.us-west-2.amazonaws.com"), \
+             patch(f"{MODULE}._S3_PROXY_HOST", "proxy-objects.ds.system1.company"):
+            assert _is_s3_cache_request(flow) is False
+
+    def test_no_match_when_proxy_host_is_none(self):
+        from passsage.proxy import _is_s3_cache_request
+
+        flow = FakeFlow("http://proxy-objects.ds.system1.company/some/key")
+        with patch(f"{MODULE}.S3_HOST", "my-bucket.s3.us-west-2.amazonaws.com"), \
+             patch(f"{MODULE}._S3_PROXY_HOST", None):
+            assert _is_s3_cache_request(flow) is False
