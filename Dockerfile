@@ -17,7 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python dependencies first (this layer is cached until pyproject.toml changes)
 COPY pyproject.toml README.md ./
-RUN mkdir -p src/passsage && touch src/passsage/__init__.py \
+RUN mkdir -p src/passsage \
+    && echo '__version__ = "0.0.0"' > src/passsage/__init__.py \
     && uv pip install --system --no-cache ".[ui]" \
     && rm -rf src/passsage
 
