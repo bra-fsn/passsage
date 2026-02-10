@@ -37,18 +37,21 @@ whether to serve from cache or go upstream. In brief:
   cache redirects and do not require a public bucket policy. Use
   `--cache-redirect-public` (or `PASSSAGE_CACHE_REDIRECT_SIGNED_URL=0`) to redirect
   to public S3 objects instead.
-- When inspecting cached objects with `awslocal`, keys that start with `https://` are
-  treated as URL parameters. Disable that behavior or pass the key via a file:
-
-```bash
-awslocal configure set cli_follow_urlparam false
-awslocal s3api head-object --bucket proxy-cache --key "https://files.pythonhosted.org/..."
-```
-
-```bash
-printf '%s' "https://files.pythonhosted.org/..." > /tmp/passsage-key.txt
-awslocal s3api head-object --bucket proxy-cache --key file:///tmp/passsage-key.txt
-```
+- When `--s3-proxy-url` is set (requires `--cache-redirect`), cache hit redirects
+  point to the given S3 proxy instead of S3 directly. This is useful with a
+  parallelizing proxy such as [xs3lerator](https://github.com/bra-fsn/xs3lerator)
+  that fetches objects via multiple concurrent byte-range requests. As of early
+  2026, a single HTTP stream to S3 within the same region/AZ reaches only
+  **~60 MiB/s** (Standard class) or **~150 MiB/s** (Express One Zone / directory
+  buckets). A parallelizing proxy can sustain several GiB/s from the same bucket,
+  which matters for large cached objects such as ML model checkpoints, datasets,
+  or container images.
+- S3 cache keys use the format `<scheme>/<host>/<sha224>[.<ext>]`
+  (e.g. `https/ftp.bme.hu/a1b2c3d4...56.iso`). The original URL is stored in S3
+  object metadata (`x-amz-meta-url`). Vary-aware keys append
+  `+<sha224-of-vary-values>`. Vary index objects live under `<scheme>/<host>/_vary/`.
+  Keys are POSIX filesystem-safe and bounded at ~340 bytes, so they work both on S3
+  and on a local `mountpoint-s3` mount.
 - When `--cache-redirect` is enabled, clients must be able to fetch cached objects from
   S3 without AWS credentials. Configure a bucket policy to allow unauthenticated
   `s3:GetObject`/`s3:ListBucket` from your network:
@@ -239,6 +242,7 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 | `S3_BUCKET` | S3 bucket name for cache storage | `364189071156-ds-proxy-us-west-2` (AWS) or `proxy-cache` (custom endpoint) |
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
 | `PASSSAGE_PUBLIC_PROXY_URL` | Externally reachable proxy URL for the onboarding script (e.g. `http://proxy.example.com:3128`). Required behind a load balancer or in Kubernetes. | None |
+| `PASSSAGE_S3_PROXY_URL` | Redirect cache hits to this S3 proxy URL instead of S3 directly. Requires `PASSSAGE_CACHE_REDIRECT=1`. The proxy host is automatically added to the `no_proxy` list. | None |
 | `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `0` |
 | `PASSSAGE_ACCESS_LOG_PREFIX` | S3 prefix for access logs | `__passsage_logs__` |
 | `PASSSAGE_ACCESS_LOG_DIR` | Local spool dir for access logs | `/tmp/passsage-logs` |
@@ -270,6 +274,8 @@ Options:
   --public-proxy-url TEXT         Externally reachable proxy URL for client onboarding
                                   (env: PASSSAGE_PUBLIC_PROXY_URL)
   --cache-redirect                Redirect cache hits to S3 instead of streaming through the proxy
+  --s3-proxy-url TEXT             Redirect cache hits to this S3 proxy URL instead of directly
+                                  to S3 (requires --cache-redirect) (env: PASSSAGE_S3_PROXY_URL)
   --access-logs                   Enable S3 access logs in Parquet format
   --access-log-prefix TEXT        S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)
   --access-log-dir TEXT           Local spool directory for access logs
@@ -449,6 +455,86 @@ Configure it via environment variables:
 export PASSSAGE_HEALTH_PORT=8082
 export PASSSAGE_HEALTH_HOST=0.0.0.0
 ```
+
+## Content Delivery Services
+
+Passsage ships with built-in handling for common content delivery and object
+storage services. Two mechanisms work together to make caching effective:
+**URL normalization** removes ephemeral query parameters so that different
+signed URLs for the same object produce a single cache entry, and **default
+caching policies** assign a sensible policy to well-known hosts.
+
+### Presigned URL normalization
+
+Object storage services authenticate access through _presigned URLs_ — URLs
+that embed short-lived credentials, timestamps, and signatures as query
+parameters. Each request for the same object carries a different set of
+parameters, which would produce a unique cache key and defeat caching entirely.
+
+Passsage normalizes presigned URLs by stripping the signature-related query
+parameters _before_ computing the cache key. The original URL (with all
+parameters intact) is still used when talking to the upstream server, so
+authentication continues to work. Only the cache key sees the stripped version.
+
+Normalization rules are applied based on the request hostname using a suffix
+trie for fast matching. The built-in rules cover:
+
+| Service / host suffix | Stripped parameters |
+|---|---|
+| `*.amazonaws.com` (S3, CloudFront signed URLs) | All `X-Amz-*` params (Algorithm, Credential, Date, Expires, Signature, Security-Token, SignedHeaders, …) |
+| `*.r2.cloudflarestorage.com` (Cloudflare R2) | All `X-Amz-*` params (R2 uses S3-compatible signing) |
+| `*.production.cloudflare.docker.com` (Cloudflare Docker registry) | `expires`, `signature`, `version` |
+| `*.pkg-containers.githubusercontent.com` (GitHub Container Registry blobs) | Azure SAS token params: `se`, `sig`, `sp`, `spr`, `sr`, `sv`, `ske`, `skoid`, `sks`, `skt`, `sktid`, `skv`, `hmac` |
+
+After stripping, any remaining query parameters are sorted by key to avoid
+cache misses from different parameter orderings.
+
+**Why this matters for CI/CD pipelines**: build jobs typically depend on
+artifacts hosted on these services — container base images, Python packages,
+Debian packages, pre-built binaries. During high-load periods (e.g. security
+patch rollouts, popular release days), upstream registries can become slow or
+return transient errors. Because Passsage collapses all presigned variants of
+the same object into one cache entry, a single successful fetch serves every
+subsequent build. Combined with the `StaleIfError` policy, pipelines keep
+running from cache even while the upstream is struggling.
+
+### Default caching policies
+
+Passsage assigns caching policies to known hosts and URL patterns out of the
+box. These defaults can be overridden with a policy file (see _Policy
+Overrides_ below).
+
+| Pattern | Policy | Rationale |
+|---|---|---|
+| `*.files.pythonhosted.org` | `StaleIfError` | PyPI package files are immutable once published |
+| `pypi.org/simple/*` | `StaleIfError` | Simple index pages; stale index is better than a build failure |
+| `*.deb`, `/Packages`, `/Packages.gz`, `/Packages.xz`, `/InRelease`, APT by-hash paths | `StaleIfError` | Debian/Ubuntu repository metadata and packages |
+| `mran.microsoft.com/snapshot/*` | `StaleIfError` | MRAN R package snapshots |
+| `*.amazonaws.com` (except CodeArtifact) | `NoCache` | S3 API calls, STS tokens — must not be cached |
+| Cloud metadata endpoints (`169.254.169.*`, `169.254.170.*`, Azure/GCP metadata) | `NoCache` | Instance metadata must always be live |
+| `/mitm.it/*` | `NoCache` | mitmproxy's own certificate distribution page |
+
+### Extending normalization rules
+
+Add custom cache key rules via a policy file (the same file used for policy
+overrides):
+
+```python
+# /path/to/policies.py
+from passsage.cache_key import CallableRule
+
+def strip_my_cdn_token(ctx):
+    if ctx.host and "cdn.example.com" in ctx.host:
+        return ctx.url.split("?", 1)[0]
+    return None
+
+def get_cache_key_rules():
+    return [CallableRule(strip_my_cdn_token)]
+```
+
+Export one of `get_cache_key_rules()`, `CACHE_KEY_RULES`,
+`get_cache_key_resolver()`, or `CACHE_KEY_RESOLVER` from the file. See
+`default_cache_keys.py` for the full built-in implementation.
 
 ## Policy Overrides
 

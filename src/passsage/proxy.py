@@ -110,6 +110,7 @@ PRESIGNED_URL_CACHE_MAXSIZE = int(
     os.environ.get("PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE", "10000"), 10
 )
 PRESIGNED_URL_CACHE_TTL = max(1, int(CACHE_REDIRECT_SIGNED_URL_EXPIRES * 0.2))
+S3_PROXY_URL = os.environ.get("PASSSAGE_S3_PROXY_URL", "").strip().rstrip("/")
 PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
 ACCESS_LOGS = _env_bool("PASSSAGE_ACCESS_LOGS")
 ACCESS_LOG_PREFIX = os.environ.get("PASSSAGE_ACCESS_LOG_PREFIX", "__passsage_logs__").strip()
@@ -221,7 +222,11 @@ def _no_proxy_s3_hosts() -> str:
     if _S3_ENDPOINT:
         return S3_HOST
     hosts = set()
-    if CACHE_REDIRECT:
+    if S3_PROXY_URL:
+        parsed = urlparse(S3_PROXY_URL)
+        if parsed.hostname:
+            hosts.add(parsed.hostname)
+    if CACHE_REDIRECT and not S3_PROXY_URL:
         hosts.add(f"{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com")
         hosts.add(f"{S3_BUCKET}.s3.amazonaws.com")
         if SIGNED_CACHE_REDIRECT:
@@ -1039,6 +1044,9 @@ _presigned_url_cache = TTLCache(
 )
 def get_cache_redirect_url(flow) -> str:
     cache_key = getattr(flow, "_cache_key", None) or get_cache_key(_normalize_url(flow))
+    proxy_url = getattr(ctx.options, "s3_proxy_url", "") or S3_PROXY_URL
+    if proxy_url:
+        return f"{proxy_url.rstrip('/')}/{cache_key}"
     if getattr(ctx.options, "cache_redirect_signed_url", False):
         expires = getattr(
             ctx.options, "cache_redirect_signed_url_expires", CACHE_REDIRECT_SIGNED_URL_EXPIRES
@@ -1188,6 +1196,13 @@ class Proxy:
             typespec=bool,
             default=CACHE_REDIRECT,
             help="Return a redirect to the cached S3 object on cache hits",
+        )
+        loader.add_option(
+            name="s3_proxy_url",
+            typespec=str,
+            default=S3_PROXY_URL,
+            help="Redirect cache hits to this S3 proxy URL instead of S3 directly "
+                 "(env: PASSSAGE_S3_PROXY_URL)",
         )
         loader.add_option(
             name="cache_redirect_signed_url",

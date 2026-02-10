@@ -108,6 +108,14 @@ import click
     help="Redirect cache hits to S3 instead of streaming through the proxy (env: PASSSAGE_CACHE_REDIRECT)"
 )
 @click.option(
+    "--s3-proxy-url",
+    envvar="PASSSAGE_S3_PROXY_URL",
+    default="",
+    show_default=True,
+    help="On cache hit, redirect to this S3 proxy URL instead of S3 directly. "
+    "Requires --cache-redirect. (env: PASSSAGE_S3_PROXY_URL)"
+)
+@click.option(
     "--cache-redirect-signed-url/--cache-redirect-public",
     envvar="PASSSAGE_CACHE_REDIRECT_SIGNED_URL",
     default=True,
@@ -265,6 +273,7 @@ def main(
     policy_file,
     allow_policy_header,
     cache_redirect,
+    s3_proxy_url,
     cache_redirect_signed_url,
     cache_redirect_signed_url_expires,
     presigned_url_cache_maxsize,
@@ -307,6 +316,10 @@ def main(
         passsage -m transparent
     """
     if ctx.invoked_subcommand is None:
+        if s3_proxy_url and not cache_redirect:
+            raise click.UsageError(
+                "--s3-proxy-url requires --cache-redirect"
+            )
         run_proxy(
             port,
             bind,
@@ -321,6 +334,7 @@ def main(
             policy_file,
             allow_policy_header,
             cache_redirect,
+            s3_proxy_url,
             cache_redirect_signed_url,
             cache_redirect_signed_url_expires,
             presigned_url_cache_maxsize,
@@ -380,6 +394,7 @@ def run_proxy(
     policy_file,
     allow_policy_header,
     cache_redirect,
+    s3_proxy_url,
     cache_redirect_signed_url,
     cache_redirect_signed_url_expires,
     presigned_url_cache_maxsize,
@@ -413,6 +428,8 @@ def run_proxy(
         os.environ["PASSSAGE_ALLOW_POLICY_HEADER"] = "1"
     if cache_redirect:
         os.environ["PASSSAGE_CACHE_REDIRECT"] = "1"
+    if s3_proxy_url:
+        os.environ["PASSSAGE_S3_PROXY_URL"] = s3_proxy_url
     os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL"] = "1" if cache_redirect_signed_url else "0"
     os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES"] = str(cache_redirect_signed_url_expires)
     os.environ["PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE"] = str(presigned_url_cache_maxsize)
@@ -478,6 +495,8 @@ def run_proxy(
         args.extend(["--set", "allow_policy_header=true"])
     if cache_redirect:
         args.extend(["--set", "cache_redirect=true"])
+    if s3_proxy_url:
+        args.extend(["--set", f"s3_proxy_url={s3_proxy_url}"])
     if cache_redirect_signed_url:
         args.extend(["--set", "cache_redirect_signed_url=true"])
     args.extend(["--set", f"cache_redirect_signed_url_expires={cache_redirect_signed_url_expires}"])
