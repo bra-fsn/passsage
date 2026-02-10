@@ -8,6 +8,10 @@ on:
     types:
       - published
 
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
