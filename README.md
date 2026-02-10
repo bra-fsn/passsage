@@ -243,6 +243,7 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
 | `PASSSAGE_PUBLIC_PROXY_URL` | Externally reachable proxy URL for the onboarding script (e.g. `http://proxy.example.com:3128`). Required behind a load balancer or in Kubernetes. | None |
 | `PASSSAGE_S3_PROXY_URL` | Redirect cache hits to this S3 proxy URL instead of S3 directly. Requires `PASSSAGE_CACHE_REDIRECT=1`. The proxy host is automatically added to the `no_proxy` list. | None |
+| `PASSSAGE_NO_REDIRECT_USER_AGENTS` | Comma-separated User-Agent prefixes that should not receive cache-hit redirects. Matching clients are served through the proxy instead. Useful for clients like `pip` that ignore `NO_PROXY`. | None |
 | `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `0` |
 | `PASSSAGE_ACCESS_LOG_PREFIX` | S3 prefix for access logs | `__passsage_logs__` |
 | `PASSSAGE_ACCESS_LOG_DIR` | Local spool dir for access logs | `/tmp/passsage-logs` |
@@ -535,6 +536,31 @@ def get_cache_key_rules():
 Export one of `get_cache_key_rules()`, `CACHE_KEY_RULES`,
 `get_cache_key_resolver()`, or `CACHE_KEY_RESOLVER` from the file. See
 `default_cache_keys.py` for the full built-in implementation.
+
+## No-Redirect User Agents
+
+Some HTTP clients (notably `pip`) do not honor the `NO_PROXY` / `no_proxy`
+environment variable. When `--cache-redirect` is enabled, these clients attempt
+to follow the redirect through the proxy itself, so it's better to serve them through the proxy instead.
+
+The `--no-redirect-user-agents` option (or `PASSSAGE_NO_REDIRECT_USER_AGENTS`
+env var) accepts a comma-separated list of User-Agent **prefixes**. When a
+request's `User-Agent` header starts with any of these prefixes, Passsage
+serves the cached content through the proxy instead of issuing a redirect.
+
+```bash
+passsage --cache-redirect --no-redirect-user-agents "pip/"
+```
+
+Or via environment variable:
+
+```bash
+export PASSSAGE_NO_REDIRECT_USER_AGENTS="pip/,legacy-client/"
+passsage --cache-redirect
+```
+
+Note: `uv` (the fast Python package manager) correctly honors `NO_PROXY` and
+does not need this workaround. If possible, prefer `uv` over `pip`.
 
 ## Policy Overrides
 
