@@ -1062,3 +1062,154 @@ class TestRangeRequests:
             "A range request may have overwritten the cached full response."
         )
         assert full2.content == expected_bytes(0, size)
+
+
+# ---------------------------------------------------------------------------
+# No-redirect user-agent tests
+# ---------------------------------------------------------------------------
+
+PIP_UA_SHORT = "pip/25.0.1"
+PIP_UA_FULL = (
+    'pip/25.0.1 {"ci":null,"cpu":"x86_64","distro":{"id":"bookworm","libc":{"lib":"glibc",'
+    '"version":"2.36"},"name":"Debian GNU/Linux","version":"12"},"implementation":{"name":'
+    '"CPython","version":"3.12.12"},"installer":{"name":"pip","version":"25.0.1"},'
+    '"python":"3.12.12","system":{"name":"Linux","release":"6.14.0-37-generic"}}'
+)
+NORMAL_UA = "python-requests/2.32.3"
+
+
+def _proxy_get_ua(
+    session: requests.Session,
+    url: str,
+    user_agent: str,
+    *,
+    allow_redirects: bool = False,
+    **kwargs,
+) -> requests.Response:
+    headers = {"x-clear-ban": "1", "User-Agent": user_agent}
+    return session.get(url, headers=headers, allow_redirects=allow_redirects, **kwargs)
+
+
+@pytest.mark.integration
+class TestNoRedirectUserAgents:
+    """Tests for the no-redirect user-agent feature (cache-redirect mode only).
+
+    When cache-redirect is enabled, matching user-agents (e.g. pip/) must
+    receive the cached content directly (200) instead of a 302/307 redirect.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_cache_redirect(self):
+        if not cache_redirect_enabled():
+            pytest.skip("PASSSAGE_CACHE_REDIRECT not enabled")
+
+    def _prime_cache(self, proxy_session, url):
+        proxy_get(proxy_session, url, timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+    def test_matching_ua_gets_no_redirect(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&case=noredir_match")
+        self._prime_cache(proxy_session, url)
+
+        resp = _proxy_get_ua(proxy_session, url, PIP_UA_SHORT, timeout=30)
+        assert resp.status_code == 200, (
+            f"Expected 200 for matching UA, got {resp.status_code}"
+        )
+        assert not has_cache_redirect(resp), "Matching UA must not receive a redirect"
+
+    def test_non_matching_ua_gets_redirect(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&case=noredir_nomatch")
+        self._prime_cache(proxy_session, url)
+
+        resp = _proxy_get_ua(proxy_session, url, NORMAL_UA, timeout=30)
+        assert resp.status_code in (302, 307), (
+            f"Expected redirect for non-matching UA, got {resp.status_code}"
+        )
+        assert resp.headers.get("Location"), "Redirect must have a Location header"
+
+    def test_matching_ua_content_correct(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&case=noredir_content")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        resp = _proxy_get_ua(proxy_session, url, PIP_UA_SHORT, allow_redirects=True, timeout=30)
+        assert resp.ok
+        assert resp.text == r1.text, "Content served to matching UA must equal the original"
+
+    def test_realistic_pip_ua_full_string(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&case=noredir_pipfull")
+        self._prime_cache(proxy_session, url)
+
+        resp = _proxy_get_ua(proxy_session, url, PIP_UA_FULL, timeout=30)
+        assert resp.status_code == 200, (
+            f"Expected 200 for full pip UA, got {resp.status_code}"
+        )
+        assert not has_cache_redirect(resp)
+
+    def test_prefix_not_exact_match(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&case=noredir_prefix")
+        self._prime_cache(proxy_session, url)
+
+        resp = _proxy_get_ua(proxy_session, url, "pipper/1.0", timeout=30)
+        assert resp.status_code in (302, 307), (
+            f"'pipper/1.0' should not match 'pip/' prefix, got {resp.status_code}"
+        )
+
+    def test_empty_ua_gets_redirect(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&case=noredir_empty")
+        self._prime_cache(proxy_session, url)
+
+        resp = _proxy_get_ua(proxy_session, url, "", timeout=30)
+        assert resp.status_code in (302, 307), (
+            f"Empty UA should get redirect, got {resp.status_code}"
+        )
+
+    def test_binary_content_integrity(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        test_server.reset()
+        size = 4096
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&t=noredir_bin")
+        full = proxy_get(proxy_session, url, timeout=30)
+        assert full.status_code == 200
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        resp = _proxy_get_ua(proxy_session, url, PIP_UA_SHORT, allow_redirects=True, timeout=30)
+        assert resp.ok
+        assert len(resp.content) == size, (
+            f"Expected {size} bytes, got {len(resp.content)}"
+        )
+        assert resp.content == expected_bytes(0, size)
+
+    def test_no_redirect_still_marks_cached(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&case=noredir_cached")
+        self._prime_cache(proxy_session, url)
+
+        before_gets = get_method_count(test_server.stats(), "/policy/Standard", "GET")
+        resp = _proxy_get_ua(proxy_session, url, PIP_UA_SHORT, allow_redirects=True, timeout=30)
+        after_gets = get_method_count(test_server.stats(), "/policy/Standard", "GET")
+        assert resp.ok
+        assert after_gets == before_gets, (
+            "No-redirect response should be served from cache, not upstream"
+        )
