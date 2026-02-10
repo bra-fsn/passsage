@@ -5,6 +5,8 @@ import statistics
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import s3fs
 from rich import box
@@ -98,27 +100,21 @@ def _load_parquet_logs(
     if not paths:
         return []
     dataset = ds.dataset(paths, filesystem=fs, format="parquet", partitioning="hive")
-    table = dataset.to_table()
-    rows = table.to_pylist()
     has_minute_precision = start.minute != 0 or end.minute != 0
     if has_minute_precision:
         start_aware = start.replace(tzinfo=timezone.utc)
         end_aware = end.replace(tzinfo=timezone.utc)
-        filtered = []
-        for row in rows:
-            ts = row.get("timestamp")
-            if ts is None:
-                filtered.append(row)
-                continue
-            if isinstance(ts, datetime):
-                ts_cmp = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
-                if ts_cmp < start_aware or ts_cmp > end_aware:
-                    continue
-            filtered.append(row)
-        rows = filtered
-    if limit:
-        rows = rows[:limit]
-    return rows
+        ts_filter = (
+            (pc.field("timestamp") >= pa.scalar(start_aware, type=pa.timestamp("ms", tz="UTC")))
+            & (pc.field("timestamp") <= pa.scalar(end_aware, type=pa.timestamp("ms", tz="UTC")))
+        )
+        table = dataset.to_table(filter=ts_filter)
+    else:
+        table = dataset.to_table()
+    table = table.sort_by("timestamp")
+    if limit and table.num_rows > limit:
+        table = table.slice(table.num_rows - limit)
+    return table.to_pylist()
 
 
 def load_access_logs(
