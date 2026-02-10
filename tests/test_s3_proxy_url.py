@@ -1,5 +1,6 @@
 """Tests for the --s3-proxy-url / PASSSAGE_S3_PROXY_URL feature."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,6 +8,40 @@ import pytest
 from click.testing import CliRunner
 
 from passsage.cli import main
+
+
+# ---------------------------------------------------------------------------
+# Patch mitmproxy's @concurrent decorator before importing proxy.py.
+# In newer mitmproxy versions the decorator rejects 'requestheaders',
+# which prevents the module from loading outside a live mitmproxy context.
+#
+# proxy.py does `from mitmproxy.script import concurrent` which resolves
+# via `mitmproxy.script.__init__` to the *function*, so we patch the
+# attribute on the package object.
+# ---------------------------------------------------------------------------
+
+
+def _passthrough_decorator(fn):
+    return fn
+
+
+@pytest.fixture(autouse=True)
+def _patch_concurrent():
+    import mitmproxy.script as script_pkg
+
+    orig = script_pkg.concurrent
+    script_pkg.concurrent = _passthrough_decorator
+
+    for key in list(sys.modules):
+        if key.startswith("passsage.proxy"):
+            del sys.modules[key]
+
+    yield
+
+    script_pkg.concurrent = orig
+    for key in list(sys.modules):
+        if key.startswith("passsage.proxy"):
+            del sys.modules[key]
 
 
 MODULE = "passsage.proxy"
@@ -136,7 +171,6 @@ class TestGetCacheRedirectUrl:
 class TestCacheRedirectResponse:
     def test_redirect_uses_proxy_url(self):
         from passsage.proxy import cache_redirect_response, _presigned_url_cache
-        from mitmproxy import http
 
         _presigned_url_cache.clear()
 
@@ -156,6 +190,24 @@ class TestCacheRedirectResponse:
         assert flow.response.headers["Location"] == "http://xs3lerator.local:8080/https/example.com/ccc333"
         assert flow._cached is True
         assert flow._cache_redirect is True
+
+    def test_redirect_302_for_get(self):
+        from passsage.proxy import cache_redirect_response, _presigned_url_cache
+
+        _presigned_url_cache.clear()
+
+        flow = FakeFlow("http://example.com/obj2", method="GET", cache_key="https/example.com/eee555")
+        flow.response = None
+        ctx_options = SimpleNamespace(
+            s3_proxy_url="http://xs3lerator.local:8080",
+            cache_redirect=True,
+            cache_redirect_signed_url=False,
+        )
+        with patch(f"{MODULE}.ctx") as mock_ctx:
+            mock_ctx.options = ctx_options
+            cache_redirect_response(flow)
+
+        assert flow.response.status_code == 302
 
     def test_redirect_307_for_non_get(self):
         from passsage.proxy import cache_redirect_response, _presigned_url_cache
