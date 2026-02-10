@@ -543,13 +543,13 @@ def run_proxy(
     "--start-date",
     default=date.today().isoformat(),
     show_default=True,
-    help="Start date (YYYY-MM-DD)",
+    help="Start date/time (YYYY-MM-DD, YYYY-MM-DDTHH, or YYYY-MM-DDTHH:MM)",
 )
 @click.option(
     "--end-date",
     default=date.today().isoformat(),
     show_default=True,
-    help="End date (YYYY-MM-DD)",
+    help="End date/time (YYYY-MM-DD, YYYY-MM-DDTHH, or YYYY-MM-DDTHH:MM)",
 )
 @click.option(
     "--limit",
@@ -572,13 +572,28 @@ def run_proxy(
     show_default=True,
     help="S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)",
 )
-def logs(start_date, end_date, limit, s3_bucket, access_log_prefix):
+@click.option(
+    "-g", "--grep",
+    default=None,
+    help="Regex to match against all fields (keeps only matching rows)",
+)
+@click.option(
+    "-f", "--filter",
+    "filters",
+    multiple=True,
+    help="Per-field regex filter as field=regex (repeatable, all must match). "
+    "Example: -f host=pypi -f 'status_code=^5'",
+)
+def logs(start_date, end_date, limit, s3_bucket, access_log_prefix, grep, filters):
     from passsage.logs_ui import run_logs_ui
 
     bucket = s3_bucket or os.environ.get("S3_BUCKET", "")
     if not bucket:
         raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
-    run_logs_ui(bucket, access_log_prefix, start_date, end_date, limit)
+    run_logs_ui(
+        bucket, access_log_prefix, start_date, end_date, limit,
+        grep=grep, filters=list(filters) or None,
+    )
 
 
 @main.command("errors")
@@ -586,13 +601,13 @@ def logs(start_date, end_date, limit, s3_bucket, access_log_prefix):
     "--start-date",
     default=date.today().isoformat(),
     show_default=True,
-    help="Start date (YYYY-MM-DD)",
+    help="Start date/time (YYYY-MM-DD, YYYY-MM-DDTHH, or YYYY-MM-DDTHH:MM)",
 )
 @click.option(
     "--end-date",
     default=date.today().isoformat(),
     show_default=True,
-    help="End date (YYYY-MM-DD)",
+    help="End date/time (YYYY-MM-DD, YYYY-MM-DDTHH, or YYYY-MM-DDTHH:MM)",
 )
 @click.option(
     "--limit",
@@ -615,13 +630,28 @@ def logs(start_date, end_date, limit, s3_bucket, access_log_prefix):
     show_default=True,
     help="S3 prefix for error logs (env: PASSSAGE_ERROR_LOG_PREFIX)",
 )
-def errors(start_date, end_date, limit, s3_bucket, error_log_prefix):
+@click.option(
+    "-g", "--grep",
+    default=None,
+    help="Regex to match against all fields (keeps only matching rows)",
+)
+@click.option(
+    "-f", "--filter",
+    "filters",
+    multiple=True,
+    help="Per-field regex filter as field=regex (repeatable, all must match). "
+    "Example: -f error_type=Timeout -f 'host=pypi'",
+)
+def errors(start_date, end_date, limit, s3_bucket, error_log_prefix, grep, filters):
     from passsage.logs_ui import run_errors_ui
 
     bucket = s3_bucket or os.environ.get("S3_BUCKET", "")
     if not bucket:
         raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
-    run_errors_ui(bucket, error_log_prefix, start_date, end_date, limit)
+    run_errors_ui(
+        bucket, error_log_prefix, start_date, end_date, limit,
+        grep=grep, filters=list(filters) or None,
+    )
 
 
 @main.command("cache-keys")

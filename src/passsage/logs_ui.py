@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import statistics
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -15,15 +16,23 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane, Tabs
 
 
-def _parse_date(value: str) -> date:
-    return datetime.strptime(value, "%Y-%m-%d").date()
+def _parse_datetime(value: str) -> datetime:
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Cannot parse datetime: {value!r} (expected YYYY-MM-DD[THH[:MM]])")
 
 
-def _iter_dates(start: date, end: date):
-    cur = start
-    while cur <= end:
-        yield cur
-        cur += timedelta(days=1)
+def _iter_date_hours(start: datetime, end: datetime):
+    cur = start.replace(minute=0, second=0, microsecond=0)
+    end_ceil = end.replace(minute=0, second=0, microsecond=0)
+    if end > end_ceil:
+        end_ceil += timedelta(hours=1)
+    while cur <= end_ceil:
+        yield cur.date(), cur.hour
+        cur += timedelta(hours=1)
 
 
 def _percentile(samples: list[float], pct: float) -> float:
@@ -54,7 +63,13 @@ def _format_timestamp(value) -> str:
     return f"{base}.{frac:02d}{suffix}"
 
 
-def _load_parquet_logs(bucket: str, prefix: str, start: date, end: date, limit: int | None):
+def _load_parquet_logs(
+    bucket: str,
+    prefix: str,
+    start: datetime,
+    end: datetime,
+    limit: int | None,
+):
     endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
     client_kwargs = {}
     config_kwargs = {}
@@ -71,9 +86,13 @@ def _load_parquet_logs(bucket: str, prefix: str, start: date, end: date, limit: 
     )
     base = prefix.strip("/")
     paths: list[str] = []
-    for d in _iter_dates(start, end):
+    seen_date_hours: set[tuple[date, int]] = set()
+    for d, h in _iter_date_hours(start, end):
+        if (d, h) in seen_date_hours:
+            continue
+        seen_date_hours.add((d, h))
         date_part = d.strftime("%Y-%m-%d")
-        pattern = f"{bucket}/{base}/date={date_part}/hour=*/*.parquet"
+        pattern = f"{bucket}/{base}/date={date_part}/hour={h:02d}/*.parquet"
         for key in fs.glob(pattern):
             paths.append(f"s3://{key}")
     if not paths:
@@ -81,16 +100,44 @@ def _load_parquet_logs(bucket: str, prefix: str, start: date, end: date, limit: 
     dataset = ds.dataset(paths, filesystem=fs, format="parquet", partitioning="hive")
     table = dataset.to_table()
     rows = table.to_pylist()
+    has_minute_precision = start.minute != 0 or end.minute != 0
+    if has_minute_precision:
+        start_aware = start.replace(tzinfo=timezone.utc)
+        end_aware = end.replace(tzinfo=timezone.utc)
+        filtered = []
+        for row in rows:
+            ts = row.get("timestamp")
+            if ts is None:
+                filtered.append(row)
+                continue
+            if isinstance(ts, datetime):
+                ts_cmp = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+                if ts_cmp < start_aware or ts_cmp > end_aware:
+                    continue
+            filtered.append(row)
+        rows = filtered
     if limit:
         rows = rows[:limit]
     return rows
 
 
-def load_access_logs(bucket: str, prefix: str, start: date, end: date, limit: int | None):
+def load_access_logs(
+    bucket: str,
+    prefix: str,
+    start: datetime,
+    end: datetime,
+    limit: int | None,
+):
     return _load_parquet_logs(bucket, prefix, start, end, limit)
 
 
-def load_error_logs(bucket: str, prefix: str, start: date, end: date, limit: int | None):
+def load_error_logs(
+    bucket: str,
+    prefix: str,
+    start: datetime,
+    end: datetime,
+    limit: int | None,
+):
     return _load_parquet_logs(bucket, prefix, start, end, limit)
 
 
@@ -520,15 +567,86 @@ def _build_details_renderable(row: dict):
     return Group(*group_items)
 
 
-def run_logs_ui(bucket: str, prefix: str, start_date: str, end_date: str, limit: int | None) -> None:
-    start = _parse_date(start_date)
-    end = _parse_date(end_date)
+def _grep_rows(rows: list[dict], pattern: str) -> list[dict]:
+    compiled = re.compile(pattern, re.IGNORECASE)
+    matched = []
+    for row in rows:
+        for value in row.values():
+            if value is not None and compiled.search(str(value)):
+                matched.append(row)
+                break
+    return matched
+
+
+def _filter_rows(rows: list[dict], filters: list[tuple[str, re.Pattern]]) -> list[dict]:
+    matched = []
+    for row in rows:
+        ok = True
+        for field, compiled in filters:
+            value = row.get(field)
+            if value is None or not compiled.search(str(value)):
+                ok = False
+                break
+        if ok:
+            matched.append(row)
+    return matched
+
+
+def _parse_filters(raw: list[str]) -> list[tuple[str, re.Pattern]]:
+    parsed = []
+    for spec in raw:
+        eq = spec.find("=")
+        if eq < 1:
+            raise ValueError(f"Invalid filter: {spec!r} (expected field=regex)")
+        field = spec[:eq]
+        pattern = spec[eq + 1:]
+        parsed.append((field, re.compile(pattern, re.IGNORECASE)))
+    return parsed
+
+
+def _apply_cli_filters(
+    rows: list[dict],
+    grep: str | None,
+    filters: list[str] | None,
+) -> list[dict]:
+    if grep:
+        rows = _grep_rows(rows, grep)
+    if filters:
+        rows = _filter_rows(rows, _parse_filters(filters))
+    return rows
+
+
+def run_logs_ui(
+    bucket: str,
+    prefix: str,
+    start_date: str,
+    end_date: str,
+    limit: int | None,
+    grep: str | None = None,
+    filters: list[str] | None = None,
+) -> None:
+    start = _parse_datetime(start_date)
+    end = _parse_datetime(end_date)
+    if end.hour == 0 and end.minute == 0 and "T" not in end_date and " " not in end_date.strip():
+        end = end.replace(hour=23, minute=59)
     rows = load_access_logs(bucket, prefix, start, end, limit)
+    rows = _apply_cli_filters(rows, grep, filters)
     AccessLogApp(rows, view="access").run()
 
 
-def run_errors_ui(bucket: str, prefix: str, start_date: str, end_date: str, limit: int | None) -> None:
-    start = _parse_date(start_date)
-    end = _parse_date(end_date)
+def run_errors_ui(
+    bucket: str,
+    prefix: str,
+    start_date: str,
+    end_date: str,
+    limit: int | None,
+    grep: str | None = None,
+    filters: list[str] | None = None,
+) -> None:
+    start = _parse_datetime(start_date)
+    end = _parse_datetime(end_date)
+    if end.hour == 0 and end.minute == 0 and "T" not in end_date and " " not in end_date.strip():
+        end = end.replace(hour=23, minute=59)
     rows = load_error_logs(bucket, prefix, start, end, limit)
+    rows = _apply_cli_filters(rows, grep, filters)
     AccessLogApp(rows, view="error").run()
