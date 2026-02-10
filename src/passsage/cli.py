@@ -116,6 +116,16 @@ import click
     "Requires --cache-redirect. (env: PASSSAGE_S3_PROXY_URL)"
 )
 @click.option(
+    "--no-redirect-user-agents",
+    envvar="PASSSAGE_NO_REDIRECT_USER_AGENTS",
+    default="pip/",
+    show_default=True,
+    help="Comma-separated list of User-Agent prefixes that should not receive "
+    "cache-hit redirects. Matching clients are served through the proxy instead. "
+    "Useful for clients like pip that ignore NO_PROXY. "
+    "(env: PASSSAGE_NO_REDIRECT_USER_AGENTS)"
+)
+@click.option(
     "--cache-redirect-signed-url/--cache-redirect-public",
     envvar="PASSSAGE_CACHE_REDIRECT_SIGNED_URL",
     default=True,
@@ -274,6 +284,7 @@ def main(
     allow_policy_header,
     cache_redirect,
     s3_proxy_url,
+    no_redirect_user_agents,
     cache_redirect_signed_url,
     cache_redirect_signed_url_expires,
     presigned_url_cache_maxsize,
@@ -335,6 +346,7 @@ def main(
             allow_policy_header,
             cache_redirect,
             s3_proxy_url,
+            no_redirect_user_agents,
             cache_redirect_signed_url,
             cache_redirect_signed_url_expires,
             presigned_url_cache_maxsize,
@@ -395,6 +407,7 @@ def run_proxy(
     allow_policy_header,
     cache_redirect,
     s3_proxy_url,
+    no_redirect_user_agents,
     cache_redirect_signed_url,
     cache_redirect_signed_url_expires,
     presigned_url_cache_maxsize,
@@ -430,6 +443,8 @@ def run_proxy(
         os.environ["PASSSAGE_CACHE_REDIRECT"] = "1"
     if s3_proxy_url:
         os.environ["PASSSAGE_S3_PROXY_URL"] = s3_proxy_url
+    if no_redirect_user_agents:
+        os.environ["PASSSAGE_NO_REDIRECT_USER_AGENTS"] = no_redirect_user_agents
     os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL"] = "1" if cache_redirect_signed_url else "0"
     os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES"] = str(cache_redirect_signed_url_expires)
     os.environ["PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE"] = str(presigned_url_cache_maxsize)
@@ -497,6 +512,11 @@ def run_proxy(
         args.extend(["--set", "cache_redirect=true"])
     if s3_proxy_url:
         args.extend(["--set", f"s3_proxy_url={s3_proxy_url}"])
+    if no_redirect_user_agents:
+        for ua_prefix in no_redirect_user_agents.split(","):
+            ua_prefix = ua_prefix.strip()
+            if ua_prefix:
+                args.extend(["--set", f"no_redirect_user_agents={ua_prefix}"])
     if cache_redirect_signed_url:
         args.extend(["--set", "cache_redirect_signed_url=true"])
     args.extend(["--set", f"cache_redirect_signed_url_expires={cache_redirect_signed_url_expires}"])

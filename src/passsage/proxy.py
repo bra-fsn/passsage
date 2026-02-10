@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterable, Union
+from typing import Iterable, Sequence, Union
 from urllib.parse import urlparse
 
 import boto3
@@ -112,6 +112,11 @@ PRESIGNED_URL_CACHE_MAXSIZE = int(
 PRESIGNED_URL_CACHE_TTL = max(1, int(CACHE_REDIRECT_SIGNED_URL_EXPIRES * 0.2))
 S3_PROXY_URL = os.environ.get("PASSSAGE_S3_PROXY_URL", "").strip().rstrip("/")
 _S3_PROXY_HOST = urlparse(S3_PROXY_URL).hostname if S3_PROXY_URL else None
+NO_REDIRECT_USER_AGENTS = frozenset(
+    ua.strip()
+    for ua in os.environ.get("PASSSAGE_NO_REDIRECT_USER_AGENTS", "pip/").split(",")
+    if ua.strip()
+)
 PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
 ACCESS_LOGS = _env_bool("PASSSAGE_ACCESS_LOGS")
 ACCESS_LOG_PREFIX = os.environ.get("PASSSAGE_ACCESS_LOG_PREFIX", "__passsage_logs__").strip()
@@ -1138,7 +1143,19 @@ def get_cache_redirect_url(flow) -> str:
     return f"{scheme}://{netloc}{path_prefix}{cache_key}"
 
 
+def _should_skip_redirect(flow) -> bool:
+    no_redir = getattr(ctx.options, "no_redirect_user_agents", None) or NO_REDIRECT_USER_AGENTS
+    if not no_redir:
+        return False
+    ua = flow.request.headers.get("user-agent", "")
+    return any(ua.startswith(prefix) for prefix in no_redir)
+
+
 def cache_redirect_response(flow) -> None:
+    if _should_skip_redirect(flow):
+        LOG.debug("Skipping redirect for user-agent: %s", flow.request.headers.get("user-agent", ""))
+        cache_redirect(flow)
+        return
     status = 302 if flow.request.method == "GET" else 307
     location = get_cache_redirect_url(flow)
     flow.response = http.Response.make(status, b"", {"Location": location})
@@ -1274,6 +1291,14 @@ class Proxy:
             default=S3_PROXY_URL,
             help="Redirect cache hits to this S3 proxy URL instead of S3 directly "
                  "(env: PASSSAGE_S3_PROXY_URL)",
+        )
+        loader.add_option(
+            name="no_redirect_user_agents",
+            typespec=Sequence[str],
+            default=list(NO_REDIRECT_USER_AGENTS),
+            help="User-Agent prefixes that should not receive cache-hit redirects. "
+                 "Matching clients are served through the proxy instead. "
+                 "(env: PASSSAGE_NO_REDIRECT_USER_AGENTS, comma-separated)",
         )
         loader.add_option(
             name="cache_redirect_signed_url",
