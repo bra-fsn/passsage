@@ -513,10 +513,7 @@ def run_proxy(
     if s3_proxy_url:
         args.extend(["--set", f"s3_proxy_url={s3_proxy_url}"])
     if no_redirect_user_agents:
-        for ua_prefix in no_redirect_user_agents.split(","):
-            ua_prefix = ua_prefix.strip()
-            if ua_prefix:
-                args.extend(["--set", f"no_redirect_user_agents={ua_prefix}"])
+        args.extend(["--set", f"no_redirect_user_agents={no_redirect_user_agents}"])
     if cache_redirect_signed_url:
         args.extend(["--set", "cache_redirect_signed_url=true"])
     args.extend(["--set", f"cache_redirect_signed_url_expires={cache_redirect_signed_url_expires}"])

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterable, Sequence, Union
+from typing import Iterable, Union
 from urllib.parse import urlparse
 
 import boto3
@@ -1144,11 +1144,12 @@ def get_cache_redirect_url(flow) -> str:
 
 
 def _should_skip_redirect(flow) -> bool:
-    no_redir = getattr(ctx.options, "no_redirect_user_agents", None) or NO_REDIRECT_USER_AGENTS
-    if not no_redir:
+    raw = getattr(ctx.options, "no_redirect_user_agents", "") or ""
+    prefixes = [p.strip() for p in raw.split(",") if p.strip()] if raw else list(NO_REDIRECT_USER_AGENTS)
+    if not prefixes:
         return False
     ua = flow.request.headers.get("user-agent", "")
-    return any(ua.startswith(prefix) for prefix in no_redir)
+    return any(ua.startswith(prefix) for prefix in prefixes)
 
 
 def cache_redirect_response(flow) -> None:
@@ -1294,11 +1295,11 @@ class Proxy:
         )
         loader.add_option(
             name="no_redirect_user_agents",
-            typespec=Sequence[str],
-            default=list(NO_REDIRECT_USER_AGENTS),
-            help="User-Agent prefixes that should not receive cache-hit redirects. "
-                 "Matching clients are served through the proxy instead. "
-                 "(env: PASSSAGE_NO_REDIRECT_USER_AGENTS, comma-separated)",
+            typespec=str,
+            default=",".join(NO_REDIRECT_USER_AGENTS),
+            help="Comma-separated User-Agent prefixes that should not receive "
+                 "cache-hit redirects. Matching clients are served through the "
+                 "proxy instead. (env: PASSSAGE_NO_REDIRECT_USER_AGENTS)",
         )
         loader.add_option(
             name="cache_redirect_signed_url",
