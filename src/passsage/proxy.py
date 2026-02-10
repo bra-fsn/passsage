@@ -1170,13 +1170,15 @@ def cache_redirect(flow):
         # We've been already called, don't rewrite again
         return
     flow._req_orig_url = flow.request.url
-    cache_key = getattr(flow, "_cache_key", None) or get_cache_key(_normalize_url(flow))
-    LOG.debug("Cache redirect key=%s", cache_key)
-    path_prefix = f"/{S3_BUCKET}/" if S3_PATH_STYLE else "/"
-    flow.request.path = f"{path_prefix}{cache_key}"
-    flow.request.host = S3_HOST
-    flow.request.port = S3_PORT
-    flow.request.scheme = S3_SCHEME
+    redirect_url = get_cache_redirect_url(flow)
+    LOG.debug("Cache redirect url=%s", redirect_url)
+    parsed = urlparse(redirect_url)
+    flow.request.scheme = parsed.scheme
+    flow.request.host = parsed.hostname
+    flow.request.port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    flow.request.path = parsed.path
+    if parsed.query:
+        flow.request.path = f"{parsed.path}?{parsed.query}"
     # we don't want to save the cache response
     flow._save_response = False
     # mark this response as returned from the cache
