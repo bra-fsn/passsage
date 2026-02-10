@@ -9,7 +9,7 @@ requires mitmproxy's hooks to be registered first, which only happens when
 mitmproxy loads the proxy script.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from passsage.policy import (
     AlwaysUpstream,
