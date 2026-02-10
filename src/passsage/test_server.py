@@ -133,6 +133,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond_headers(send_body)
             return
 
+        if path.startswith("/range-data/"):
+            size_str = path.split("/range-data/", 1)[1] or "0"
+            size_bytes = int(size_str)
+            self._respond_range_data(size_bytes, send_body)
+            return
+
         if path.startswith("/stream/"):
             size_str = path.split("/stream/", 1)[1] or "0"
             size_bytes = int(size_str)
@@ -285,6 +291,86 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if send_body:
             self.wfile.write(body)
+
+    def _respond_range_data(self, total_size: int, send_body: bool) -> None:
+        """Serve deterministic data with full HTTP Range support.
+
+        The content at byte position i is (i % 256).  Any slice can be
+        independently generated without materialising the full body.
+        """
+        range_header = self.headers.get("Range", "")
+        etag = f'"range-data-{total_size}"'
+
+        if not range_header:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(total_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
+            self.end_headers()
+            if send_body:
+                self._write_deterministic(0, total_size)
+            return
+
+        start, end = self._parse_range(range_header, total_size)
+        if start is None:
+            self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+            self.send_header("Content-Range", f"bytes */{total_size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        length = end - start + 1
+        self.send_response(HTTPStatus.PARTIAL_CONTENT)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Content-Range", f"bytes {start}-{end}/{total_size}")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
+        self.end_headers()
+        if send_body:
+            self._write_deterministic(start, length)
+
+    @staticmethod
+    def _parse_range(header: str, total: int) -> tuple[int | None, int | None]:
+        """Parse a single Range: bytes=... header.  Returns (start, end) inclusive or (None, None)."""
+        if not header.startswith("bytes="):
+            return None, None
+        spec = header[len("bytes="):].strip()
+        if "," in spec:
+            return None, None
+        if spec.startswith("-"):
+            suffix_len = int(spec[1:])
+            if suffix_len <= 0 or suffix_len > total:
+                return None, None
+            return total - suffix_len, total - 1
+        parts = spec.split("-", 1)
+        start = int(parts[0])
+        end = int(parts[1]) if parts[1] else total - 1
+        end = min(end, total - 1)
+        if start > end or start >= total:
+            return None, None
+        return start, end
+
+    def _write_deterministic(self, offset: int, length: int) -> None:
+        """Write `length` bytes of the deterministic pattern starting at `offset`."""
+        chunk_size = 64 * 1024
+        written = 0
+        try:
+            while written < length:
+                to_write = min(chunk_size, length - written)
+                pos = offset + written
+                buf = bytearray(to_write)
+                for i in range(to_write):
+                    buf[i] = (pos + i) % 256
+                self.wfile.write(buf)
+                written += to_write
+        except BrokenPipeError:
+            return
 
     def _respond_stream(self, size_bytes: int, bandwidth: float | None, send_body: bool) -> None:
         self.send_response(HTTPStatus.OK)

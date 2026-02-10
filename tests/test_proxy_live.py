@@ -1,5 +1,6 @@
 """Integration tests for the HTTP proxy against a live connection and live S3 backend."""
 
+import hashlib
 import os
 import tempfile
 import time
@@ -740,3 +741,324 @@ class TestProxyLive:
         # Ensures expired upstream certificates are rejected.
         resp = proxy_session.get("https://expired.badssl.com/", timeout=30)
         assert resp.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# Helpers for range tests
+# ---------------------------------------------------------------------------
+
+RANGE_DATA_SIZE = 256 * 1024  # 256 KiB deterministic body
+
+
+def expected_bytes(start: int, length: int) -> bytes:
+    """Generate the expected deterministic content: byte[i] = i % 256."""
+    return bytes((start + i) % 256 for i in range(length))
+
+
+def stream_sha256(resp: requests.Response) -> str:
+    h = hashlib.sha256()
+    for chunk in resp.iter_content(chunk_size=64 * 1024):
+        h.update(chunk)
+    return h.hexdigest()
+
+
+@pytest.mark.integration
+class TestRangeRequests:
+    """HTTP Range request tests against the live proxy."""
+
+    # -- basic range mechanics --
+
+    def test_full_download_no_range(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=full")
+        resp = proxy_get(proxy_session, url, timeout=30)
+        assert resp.status_code == 200
+        assert resp.headers.get("Accept-Ranges") == "bytes"
+        assert len(resp.content) == RANGE_DATA_SIZE
+        assert resp.content == expected_bytes(0, RANGE_DATA_SIZE)
+
+    def test_range_first_byte(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=first")
+        resp = proxy_get(proxy_session, url, headers={"Range": "bytes=0-0"}, timeout=30)
+        assert resp.status_code == 206
+        assert resp.content == expected_bytes(0, 1)
+        assert f"bytes 0-0/{RANGE_DATA_SIZE}" in resp.headers.get("Content-Range", "")
+
+    def test_range_last_byte(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=last")
+        last = RANGE_DATA_SIZE - 1
+        resp = proxy_get(proxy_session, url, headers={"Range": f"bytes={last}-{last}"}, timeout=30)
+        assert resp.status_code == 206
+        assert resp.content == expected_bytes(last, 1)
+        assert f"bytes {last}-{last}/{RANGE_DATA_SIZE}" in resp.headers.get("Content-Range", "")
+
+    def test_range_first_1k(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=1k")
+        resp = proxy_get(proxy_session, url, headers={"Range": "bytes=0-1023"}, timeout=30)
+        assert resp.status_code == 206
+        assert len(resp.content) == 1024
+        assert resp.content == expected_bytes(0, 1024)
+
+    def test_range_last_1k(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=last1k")
+        start = RANGE_DATA_SIZE - 1024
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes={start}-{RANGE_DATA_SIZE - 1}"},
+            timeout=30,
+        )
+        assert resp.status_code == 206
+        assert len(resp.content) == 1024
+        assert resp.content == expected_bytes(start, 1024)
+
+    def test_range_middle_slice(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=mid")
+        start = RANGE_DATA_SIZE // 3
+        end = start + 4096 - 1
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes={start}-{end}"},
+            timeout=30,
+        )
+        assert resp.status_code == 206
+        assert len(resp.content) == 4096
+        assert resp.content == expected_bytes(start, 4096)
+
+    def test_range_entire_file(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=entire")
+        last = RANGE_DATA_SIZE - 1
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes=0-{last}"},
+            timeout=30,
+        )
+        assert resp.status_code in (200, 206)
+        assert len(resp.content) == RANGE_DATA_SIZE
+        assert resp.content == expected_bytes(0, RANGE_DATA_SIZE)
+
+    # -- open-ended and suffix ranges --
+
+    def test_range_open_ended(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=open")
+        start = RANGE_DATA_SIZE - 512
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes={start}-"},
+            timeout=30,
+        )
+        assert resp.status_code == 206
+        assert len(resp.content) == 512
+        assert resp.content == expected_bytes(start, 512)
+
+    def test_range_suffix(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=suffix")
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": "bytes=-256"},
+            timeout=30,
+        )
+        assert resp.status_code == 206
+        assert len(resp.content) == 256
+        assert resp.content == expected_bytes(RANGE_DATA_SIZE - 256, 256)
+
+    # -- boundary / alignment cases --
+
+    def test_range_straddles_256_boundary(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=b256")
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": "bytes=255-256"},
+            timeout=30,
+        )
+        assert resp.status_code == 206
+        assert resp.content == expected_bytes(255, 2)
+
+    def test_range_straddles_4k_boundary(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=b4k")
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": "bytes=4095-4096"},
+            timeout=30,
+        )
+        assert resp.status_code == 206
+        assert resp.content == expected_bytes(4095, 2)
+
+    def test_range_straddles_64k_boundary(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=b64k")
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": "bytes=65535-65536"},
+            timeout=30,
+        )
+        assert resp.status_code == 206
+        assert resp.content == expected_bytes(65535, 2)
+
+    # -- error cases --
+
+    def test_range_unsatisfiable_beyond_end(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=416")
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes={RANGE_DATA_SIZE}-{RANGE_DATA_SIZE + 100}"},
+            timeout=30,
+        )
+        assert resp.status_code == 416
+        assert f"*/{RANGE_DATA_SIZE}" in resp.headers.get("Content-Range", "")
+
+    def test_range_end_clamped_to_file_size(self, proxy_session, test_server, cache_bust_random):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=clamp")
+        far_end = RANGE_DATA_SIZE + 999999
+        start = RANGE_DATA_SIZE - 100
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes={start}-{far_end}"},
+            timeout=30,
+        )
+        assert resp.status_code == 206
+        assert len(resp.content) == 100
+        assert resp.content == expected_bytes(start, 100)
+
+    # -- content integrity: proxy vs direct --
+
+    def test_range_content_matches_full_download(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        size = 8192
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&t=integrity")
+        full = proxy_get(proxy_session, url, timeout=30)
+        assert full.status_code == 200
+        full_body = full.content
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        slices = [
+            (0, 255),
+            (100, 4095),
+            (4096, size - 1),
+            (size - 1, size - 1),
+        ]
+        for start, end in slices:
+            resp = proxy_get(
+                proxy_session, url,
+                headers={"Range": f"bytes={start}-{end}"},
+                timeout=30,
+            )
+            assert resp.status_code == 206, f"bytes={start}-{end} got {resp.status_code}"
+            expected = full_body[start:end + 1]
+            assert resp.content == expected, (
+                f"bytes={start}-{end}: "
+                f"expected {len(expected)} bytes, got {len(resp.content)}"
+            )
+
+    # -- streaming hash: verify large range without holding in memory --
+
+    def test_range_streaming_hash(self, proxy_session, test_server, cache_bust_random):
+        size = 128 * 1024
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&t=hash")
+        start = 1000
+        end = size - 1001
+        length = end - start + 1
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes={start}-{end}"},
+            timeout=30,
+            stream=True,
+        )
+        assert resp.status_code == 206
+        digest = stream_sha256(resp)
+        resp.close()
+        expected_digest = hashlib.sha256(expected_bytes(start, length)).hexdigest()
+        assert digest == expected_digest
+
+    # -- cached range responses --
+
+    def test_range_after_cached_full_download(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=cached")
+        full = proxy_get(proxy_session, url, timeout=30)
+        assert full.status_code == 200
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": "bytes=0-1023"},
+            timeout=30,
+        )
+        assert resp.status_code in (200, 206)
+        body = resp.content[:1024]
+        assert body == expected_bytes(0, 1024)
+
+    def test_range_cached_content_correct(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        url = test_server.url(f"/range-data/{RANGE_DATA_SIZE}?r={cache_bust_random}&t=cached2")
+        proxy_get(proxy_session, url, timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        start = 10000
+        end = 20000
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes={start}-{end}"},
+            timeout=30,
+        )
+        assert resp.status_code in (200, 206)
+        expected = expected_bytes(start, end - start + 1)
+        actual = resp.content[:end - start + 1]
+        assert actual == expected
+
+    # -- 206 must not corrupt the cache --
+
+    def test_cached_partial_must_not_corrupt_full_download(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """A cached 206 partial response must not be served for a subsequent full download."""
+        size = 8192
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&t=partial_corrupt")
+
+        partial = proxy_get(
+            proxy_session, url,
+            headers={"Range": "bytes=0-255"},
+            timeout=30,
+        )
+        assert partial.status_code == 206
+        assert len(partial.content) == 256
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        full = proxy_get(proxy_session, url, timeout=30)
+        assert full.status_code == 200, (
+            f"Expected 200 for full download, got {full.status_code}"
+        )
+        assert len(full.content) == size, (
+            f"Full download returned {len(full.content)} bytes, expected {size}. "
+            "A cached 206 partial response may have corrupted the cache."
+        )
+        assert full.content == expected_bytes(0, size)
+
+    def test_range_request_does_not_overwrite_cached_full(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """A range request on a cached full object must not replace it with partial content."""
+        size = 8192
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&t=overwrite")
+
+        full1 = proxy_get(proxy_session, url, timeout=30)
+        assert full1.status_code == 200
+        assert len(full1.content) == size
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        proxy_get(
+            proxy_session, url,
+            headers={"Range": "bytes=0-255"},
+            timeout=30,
+        )
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        full2 = proxy_get(proxy_session, url, timeout=30)
+        assert full2.status_code == 200, (
+            f"Expected 200 for full download after range, got {full2.status_code}"
+        )
+        assert len(full2.content) == size, (
+            f"Full download after range returned {len(full2.content)} bytes, expected {size}. "
+            "A range request may have overwritten the cached full response."
+        )
+        assert full2.content == expected_bytes(0, size)
