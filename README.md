@@ -125,6 +125,47 @@ Responses are saved to S3 unless caching is disabled by policy or response heade
 (`Cache-Control: no-store` or `private`, or `Vary: *`). When `Vary` is present, cache
 keys include the `Vary` request headers so separate variants are stored and served.
 
+## Example production setup
+
+A typical deployment uses Passsage as the TLS-terminating cache and an S3 parallel proxy
+([xs3lerator](https://github.com/bra-fsn/xs3lerator)) for fast cache-hit delivery. Example
+internal DNS: Passsage at `proxy-cache.example.internal:3128`, xs3lerator at
+`s3-proxy.example.internal:443`. Clients point `HTTP_PROXY`/`HTTPS_PROXY` at Passsage;
+Passsage is configured with `--cache-redirect` and `--s3-proxy-url https://s3-proxy.example.internal`.
+
+```
+┌──────────────┐     ┌──────────────────────┐     ┌────────────┐
+│   Client     │────▶│   Passsage           │────▶│  Upstream  │
+│ (pip, curl,  │◀────│   (caching proxy)    │◀────│  Servers   │
+│  docker...)  │     │   :3128              │     │ (PyPI etc) │
+└──────────────┘     └──────┬──────┬────────┘     └────────────┘
+                            │      │
+                            │      │  uploads cached objects
+                            │      │
+                            │      ▼
+                            │  ┌──────────┐
+                            │  │  AWS S3  │
+                            │  │ (cache)  │
+                            │  └────┬─────┘
+                            │       │
+       302 redirect on      │       │  parallel chunked
+       cache hit            │       │  downloads
+                            │       │
+                            ▼       ▼
+                     ┌──────────────────────┐
+                     │   xs3lerator         │
+                     │   (S3 parallel proxy)│
+                     │   :443               │
+                     └──────────────────────┘
+                                ▲
+                                │ reads / writes
+                                ▼
+                     ┌──────────────────────┐
+                     │   POSIX filesystem   │
+                     │ (local SSD/EBS cache)│
+                     └──────────────────────┘
+```
+
 ## Installation
 
 ```bash
