@@ -251,6 +251,30 @@ import click
     help="Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)"
 )
 @click.option(
+    "--metadata-files",
+    is_flag=True,
+    default=False,
+    envvar="PASSSAGE_METADATA_FILES",
+    show_default=True,
+    help="Write .passsage-meta JSON sidecars alongside cached S3 objects. "
+    "Each sidecar mirrors the S3 object's x-amz-meta-* headers so the "
+    "local mount read path can serve cache lookups without S3 HEAD calls. "
+    "Required when --s3-mount-path is set. "
+    "(env: PASSSAGE_METADATA_FILES)"
+)
+@click.option(
+    "--s3-mount-path",
+    envvar="PASSSAGE_S3_MOUNT_PATH",
+    default="",
+    show_default=True,
+    help="Local path where the S3 cache bucket is mounted (e.g. via "
+    "Mountpoint for Amazon S3). When set, cache existence checks and "
+    "metadata reads use the local filesystem instead of S3 HEAD calls, "
+    "reducing per-request latency from ~13ms to microseconds. "
+    "Requires --metadata-files. Writes still go to S3 via boto3. "
+    "(env: PASSSAGE_S3_MOUNT_PATH)"
+)
+@click.option(
     "--connection-strategy",
     type=click.Choice(["lazy", "eager"]),
     default="lazy",
@@ -316,6 +340,8 @@ def main(
     error_log_flush_bytes,
     health_port,
     health_host,
+    metadata_files,
+    s3_mount_path,
     connection_strategy,
     mitm_ca_cert,
     mitm_ca,
@@ -345,6 +371,10 @@ def main(
         if s3_proxy_url and not cache_redirect:
             raise click.UsageError(
                 "--s3-proxy-url requires --cache-redirect"
+            )
+        if s3_mount_path and not metadata_files:
+            raise click.UsageError(
+                "--s3-mount-path requires --metadata-files"
             )
         run_proxy(
             port,
@@ -379,6 +409,8 @@ def main(
             error_log_flush_bytes,
             health_port,
             health_host,
+            metadata_files,
+            s3_mount_path,
             connection_strategy,
             mitm_ca_cert,
             mitm_ca,
@@ -441,6 +473,8 @@ def run_proxy(
     error_log_flush_bytes,
     health_port,
     health_host,
+    metadata_files=False,
+    s3_mount_path="",
     connection_strategy="lazy",
     mitm_ca_cert=None,
     mitm_ca=None,
@@ -493,6 +527,10 @@ def run_proxy(
         os.environ["PASSSAGE_HEALTH_PORT"] = str(health_port)
     if health_host:
         os.environ["PASSSAGE_HEALTH_HOST"] = health_host
+    if metadata_files:
+        os.environ["PASSSAGE_METADATA_FILES"] = "1"
+    if s3_mount_path:
+        os.environ["PASSSAGE_S3_MOUNT_PATH"] = s3_mount_path
 
     if debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -538,6 +576,10 @@ def run_proxy(
     if public_proxy_url:
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
+    if metadata_files:
+        args.extend(["--set", "metadata_files=true"])
+    if s3_mount_path:
+        args.extend(["--set", f"s3_mount_path={s3_mount_path}"])
     args.extend(["--set", f"connection_strategy={connection_strategy}"])
 
     if verbose:

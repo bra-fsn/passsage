@@ -133,6 +133,9 @@ ERROR_LOG_PREFIX = os.environ.get("PASSSAGE_ERROR_LOG_PREFIX", "__passsage_error
 ERROR_LOG_DIR = os.environ.get("PASSSAGE_ERROR_LOG_DIR", "/tmp/passsage-errors").strip()
 ERROR_LOG_FLUSH_SECONDS = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_SECONDS", "30").strip()
 ERROR_LOG_FLUSH_BYTES = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_BYTES", "256M").strip()
+METADATA_FILES = _env_bool("PASSSAGE_METADATA_FILES")
+S3_MOUNT_PATH = os.environ.get("PASSSAGE_S3_MOUNT_PATH", "").strip()
+_META_SUFFIX = ".passsage-meta"
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -222,6 +225,64 @@ def s3_head_object(cache_key: str) -> S3HeadResponse:
     for key, value in (response.get("Metadata") or {}).items():
         headers[f"x-amz-meta-{key}"] = value
     return S3HeadResponse(200, headers)
+
+
+def _local_mount_path(cache_key: str) -> str:
+    """Return the local filesystem path for a cache key on the S3 mount."""
+    return os.path.join(S3_MOUNT_PATH, cache_key)
+
+
+def _meta_file_path(cache_key: str) -> str:
+    """Return the local filesystem path for a cache key's metadata sidecar."""
+    return _local_mount_path(cache_key) + _META_SUFFIX
+
+
+def _local_head_object(cache_key: str) -> S3HeadResponse:
+    """Read cache metadata from a local mount + sidecar .passsage-meta file.
+
+    Used when S3_MOUNT_PATH is configured, replacing s3_head_object with a
+    local filesystem check that avoids the ~13ms S3 HEAD round-trip.
+    """
+    content_path = _local_mount_path(cache_key)
+    meta_path = _meta_file_path(cache_key)
+    if not os.path.exists(content_path):
+        return S3HeadResponse(404, {})
+    headers: dict[str, str] = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            for key, value in meta.items():
+                headers[f"x-amz-meta-{key}"] = str(value)
+        except Exception as exc:
+            LOG.warning("Failed to read metadata sidecar %s: %s", meta_path, exc)
+    return S3HeadResponse(200, headers)
+
+
+def _write_metadata_sidecar(cache_key: str, metadata: dict[str, str]) -> None:
+    """Write a .passsage-meta JSON sidecar alongside the cached S3 object.
+
+    Called after s3.upload_fileobj / s3.put_object when METADATA_FILES is
+    enabled.  The sidecar mirrors the S3 object's x-amz-meta-* headers so
+    _local_head_object can read them from the local mount without an S3 HEAD.
+    """
+    meta_path = _meta_file_path(cache_key)
+    try:
+        meta_dir = os.path.dirname(meta_path)
+        os.makedirs(meta_dir, exist_ok=True)
+        tmp_path = meta_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(metadata, f, separators=(",", ":"))
+        os.replace(tmp_path, meta_path)
+    except Exception as exc:
+        LOG.warning("Failed to write metadata sidecar %s: %s", meta_path, exc)
+
+
+def cache_head_object(cache_key: str) -> S3HeadResponse:
+    """HEAD a cache object, using the local mount when available, else S3."""
+    if S3_MOUNT_PATH:
+        return _local_head_object(cache_key)
+    return s3_head_object(cache_key)
 
 
 def _no_proxy_s3_hosts() -> str:
@@ -758,6 +819,8 @@ def refresh_cache_metadata(cache_key: str, cache_headers: dict[str, str]) -> Non
     try:
         s3 = get_s3_client()
         s3.copy_object(**copy_args)
+        if METADATA_FILES:
+            _write_metadata_sidecar(cache_key, metadata)
     except Exception as exc:
         LOG.warning("Cache metadata refresh failed for %s: %s", cache_key, exc)
 
@@ -1387,6 +1450,23 @@ class Proxy:
             default=ERROR_LOG_FLUSH_BYTES,
             help="Flush size threshold for error logs (bytes or 1G/500M/10K)",
         )
+        loader.add_option(
+            name="metadata_files",
+            typespec=bool,
+            default=METADATA_FILES,
+            help="Write .passsage-meta JSON sidecars alongside cached S3 objects. "
+                 "Required for the local mount read path (env: PASSSAGE_METADATA_FILES)",
+        )
+        loader.add_option(
+            name="s3_mount_path",
+            typespec=str,
+            default=S3_MOUNT_PATH,
+            help="Local filesystem path where the S3 bucket is mounted (e.g. via "
+                 "mount-s3). When set, cache lookups read from the local mount "
+                 "instead of S3 HEAD calls, reducing latency from ~13ms to "
+                 "microseconds per lookup. Requires --metadata-files "
+                 "(env: PASSSAGE_S3_MOUNT_PATH)",
+        )
 
     @_log_hook_errors("configure")
     def configure(self, updated):
@@ -1483,7 +1563,7 @@ class Proxy:
             normalized_url = _normalize_url(flow)
             vary_index_key = get_vary_index_key(normalized_url)
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
-            vary_index_head = s3_head_object(vary_index_key)
+            vary_index_head = cache_head_object(vary_index_key)
             if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.headers.get("x-amz-meta-vary")):
                 flow._cache_vary = vary_hdr
                 if "*" not in vary_hdr:
@@ -1500,7 +1580,7 @@ class Proxy:
                 flow._cache_key = get_cache_key(normalized_url)
                 LOG.debug("Cache lookup default key=%s", flow._cache_key)
             if flow._cache_key:
-                flow._cache_head = s3_head_object(flow._cache_key)
+                flow._cache_head = cache_head_object(flow._cache_key)
                 LOG.debug(
                     "Cache HEAD status=%s key=%s",
                     flow._cache_head.status_code,
@@ -1920,12 +2000,18 @@ class Proxy:
                 if header in headers:
                     extras[aws_key] = headers[header]
             s3.upload_fileobj(f, S3_BUCKET, cache_key, ExtraArgs=extras)
+            if METADATA_FILES:
+                _write_metadata_sidecar(cache_key, extras["Metadata"])
             if vary_header:
+                vary_index_key = get_vary_index_key(normalized_url)
+                vary_meta = {"vary": vary_header}
                 s3.put_object(
                     Bucket=S3_BUCKET,
-                    Key=get_vary_index_key(normalized_url),
-                    Metadata={"vary": vary_header},
+                    Key=vary_index_key,
+                    Metadata=vary_meta,
                 )
+                if METADATA_FILES:
+                    _write_metadata_sidecar(vary_index_key, vary_meta)
         except Exception as e:
             LOG.error("Cache save error %s, %s", url, e)
             _log_exception(
