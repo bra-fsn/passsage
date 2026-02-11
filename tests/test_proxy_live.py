@@ -257,11 +257,29 @@ class TestProxyLive:
         assert get_method_count(stats, "/policy/NoCache", "GET") == 2
         assert "Cache-Status" not in r2.headers
 
+    def test_response_includes_x_request_id_header(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        # Ensures every response includes X-Request-Id for correlation with access logs.
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}")
+        r = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert r.ok
+        assert "X-Request-Id" in r.headers
+        request_id = r.headers["X-Request-Id"]
+        assert request_id and request_id.strip()
+        r2 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert r2.ok
+        assert "X-Request-Id" in r2.headers
+        assert r2.headers["X-Request-Id"] and r2.headers["X-Request-Id"].strip()
+
     def test_upstream_connection_refused(self, proxy_session):
         url = "http://127.0.0.1:1/connection-refused"
         resp = proxy_get(proxy_session, url, timeout=UPSTREAM_CLIENT_TIMEOUT)
         assert resp.status_code == 502
         assert "Upstream connection failed" in resp.text
+        assert "X-Request-Id" in resp.headers
+        assert resp.headers["X-Request-Id"].strip()
 
     @pytest.mark.parametrize(
         ("policy_name", "expect_cached", "expect_status"),
