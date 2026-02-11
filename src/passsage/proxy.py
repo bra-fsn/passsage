@@ -281,9 +281,18 @@ def _write_metadata_sidecar(cache_key: str, metadata: dict[str, str]) -> None:
 
 
 def cache_head_object(cache_key: str) -> S3HeadResponse:
-    """HEAD a cache object, using the local mount when available, else S3."""
+    """HEAD a cache object, using the local mount when available, else S3.
+
+    Falls back to s3_head_object when the local mount finds the content file
+    but the metadata sidecar is missing (mount-s3 negative caching or write
+    propagation delay).
+    """
     if S3_MOUNT_PATH:
-        return _local_head_object(cache_key)
+        result = _local_head_object(cache_key)
+        if result.status_code == 200 and not result.headers:
+            LOG.debug("Local mount hit without metadata, falling back to S3 HEAD: %s", cache_key)
+            return s3_head_object(cache_key)
+        return result
     return s3_head_object(cache_key)
 
 
