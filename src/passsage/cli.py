@@ -641,16 +641,29 @@ def run_proxy(
     help="Raw DuckDB SQL WHERE expression for advanced filtering. "
     "Example: -w \"status_code >= 500 AND duration_ms > 1000\"",
 )
-def logs(start_date, end_date, s3_bucket, access_log_prefix, grep, filters, where):
-    from passsage.logs_ui import run_logs_ui
-
+@click.option(
+    "-o", "--output",
+    "output_format",
+    type=click.Choice(["csv", "json"]),
+    default=None,
+    help="Stream matching rows to stdout as csv or json (one JSON object per line) instead of opening the TUI.",
+)
+def logs(start_date, end_date, s3_bucket, access_log_prefix, grep, filters, where, output_format):
     bucket = s3_bucket or os.environ.get("S3_BUCKET", "")
     if not bucket:
         raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
-    run_logs_ui(
-        bucket, access_log_prefix, start_date, end_date,
-        grep=grep, filters=list(filters) or None, where=where,
-    )
+    if output_format is not None:
+        from passsage.logs_ui import stream_logs_output
+        stream_logs_output(
+            bucket, access_log_prefix, start_date, end_date, output_format,
+            grep=grep, filters=list(filters) or None, where=where, view="access",
+        )
+    else:
+        from passsage.logs_ui import run_logs_ui
+        run_logs_ui(
+            bucket, access_log_prefix, start_date, end_date,
+            grep=grep, filters=list(filters) or None, where=where,
+        )
 
 
 @main.command("errors")
@@ -698,16 +711,29 @@ def logs(start_date, end_date, s3_bucket, access_log_prefix, grep, filters, wher
     help="Raw DuckDB SQL WHERE expression for advanced filtering. "
     "Example: -w \"error_type = 'ConnectionError'\"",
 )
-def errors(start_date, end_date, s3_bucket, error_log_prefix, grep, filters, where):
-    from passsage.logs_ui import run_errors_ui
-
+@click.option(
+    "-o", "--output",
+    "output_format",
+    type=click.Choice(["csv", "json"]),
+    default=None,
+    help="Stream matching rows to stdout as csv or json (one JSON object per line) instead of opening the TUI.",
+)
+def errors(start_date, end_date, s3_bucket, error_log_prefix, grep, filters, where, output_format):
     bucket = s3_bucket or os.environ.get("S3_BUCKET", "")
     if not bucket:
         raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
-    run_errors_ui(
-        bucket, error_log_prefix, start_date, end_date,
-        grep=grep, filters=list(filters) or None, where=where,
-    )
+    if output_format is not None:
+        from passsage.logs_ui import stream_logs_output
+        stream_logs_output(
+            bucket, error_log_prefix, start_date, end_date, output_format,
+            grep=grep, filters=list(filters) or None, where=where, view="error",
+        )
+    else:
+        from passsage.logs_ui import run_errors_ui
+        run_errors_ui(
+            bucket, error_log_prefix, start_date, end_date,
+            grep=grep, filters=list(filters) or None, where=where,
+        )
 
 
 @main.command("cache-keys", help="""\

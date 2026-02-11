@@ -1,5 +1,7 @@
+import csv
 import json
 import os
+import sys
 from datetime import datetime
 
 import duckdb
@@ -852,6 +854,57 @@ class AccessLogApp(App):
             if detail:
                 row = detail
         self.push_screen(DetailsScreen(_build_details_renderable(row)))
+
+
+# ---------------------------------------------------------------------------
+# Streamed output (no TUI, memory-efficient via DuckDB row iteration)
+# ---------------------------------------------------------------------------
+
+def _row_to_csv_cells(row: tuple) -> list[str]:
+    return ["" if v is None else str(v) for v in row]
+
+
+def stream_logs_output(
+    bucket: str,
+    prefix: str,
+    start_date: str,
+    end_date: str,
+    output_format: str,
+    *,
+    grep: str | None = None,
+    filters: list[str] | None = None,
+    where: str | None = None,
+    view: str = "access",
+) -> None:
+    """Stream query results to stdout as csv or json (one JSON object per line). One row in memory at a time."""
+    conn = _init_duckdb_connection()
+    sql = _build_query(
+        bucket, prefix, start_date, end_date,
+        grep=grep, filters=filters, where=where,
+        view=view,
+    )
+    result = conn.execute(sql)
+    columns = [desc[0] for desc in result.description]
+    out = sys.stdout
+
+    if output_format == "csv":
+        writer = csv.writer(out)
+        writer.writerow(columns)
+        while True:
+            row = result.fetchone()
+            if row is None:
+                break
+            writer.writerow(_row_to_csv_cells(row))
+    elif output_format == "json":
+        while True:
+            row = result.fetchone()
+            if row is None:
+                break
+            obj = dict(zip(columns, row))
+            line = json.dumps(obj, default=str)
+            out.write(line + "\n")
+    else:
+        raise ValueError(f"Unsupported output format: {output_format!r}")
 
 
 # ---------------------------------------------------------------------------
