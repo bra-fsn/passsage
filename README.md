@@ -296,6 +296,7 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 | `PASSSAGE_ERROR_LOG_DIR` | Local spool dir for error logs | `/tmp/passsage-errors` |
 | `PASSSAGE_ERROR_LOG_FLUSH_SECONDS` | Flush interval in seconds | `30` |
 | `PASSSAGE_ERROR_LOG_FLUSH_BYTES` | Flush size threshold | `256M` |
+| `PASSSAGE_CONNECTION_STRATEGY` | Mitmproxy connection strategy: `lazy` (default) or `eager` | `lazy` |
 | `PASSSAGE_MITM_CA_CERT` | mitmproxy CA certificate (PEM file path or inline PEM). Written to `~/.mitmproxy/mitmproxy-ca-cert.pem` before startup. | None |
 | `PASSSAGE_MITM_CA` | mitmproxy CA key+cert bundle (PEM file path or inline PEM). Written to `~/.mitmproxy/mitmproxy-ca.pem` before startup. | None |
 
@@ -331,6 +332,8 @@ Options:
   --error-log-flush-bytes TEXT    Flush size threshold for error logs
   --health-port INTEGER           Health endpoint port (env: PASSSAGE_HEALTH_PORT, 0 disables)
   --health-host TEXT              Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)
+  --connection-strategy [lazy|eager]
+                                  Upstream TLS connection strategy (default: lazy)
   --web                           Enable mitmproxy web interface
   --version                       Show the version and exit.
   --help                          Show this message and exit.
@@ -602,6 +605,20 @@ passsage --cache-redirect
 
 Note: `uv` (the fast Python package manager) correctly honors `NO_PROXY` and
 does not need this workaround. If possible, prefer `uv` over `pip`.
+
+## Important: Do Not Use S3 Object Expiration
+
+**Never enable S3 lifecycle expiration rules on the whole cache bucket (you can expire the logs though).** Passsage
+stores each cached response as an S3 object with associated metadata: a vary
+index object (`_vary/` prefix). S3 lifecycle rules delete objects
+independently — an expiration rule could remove the vary index but leave
+the content object (or vice versa). This leads to cache corruption: stale
+metadata pointing to missing content, or orphaned content with no metadata.
+
+If you need to control cache size, use a cleanup script that deletes all
+related objects atomically (content + vary index), or use
+S3 Intelligent-Tiering to move cold objects to cheaper storage without
+deleting them.
 
 ## Policy Overrides
 
