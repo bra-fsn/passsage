@@ -4,10 +4,6 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 
-# Create non-root user with home
-RUN useradd -r -u 10001 -g root -m -d /home/passsage passsage
-ENV HOME=/home/passsage
-
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -25,9 +21,6 @@ RUN mkdir -p src/passsage \
 # Copy source and install package only (dependencies already satisfied)
 COPY src/ ./src/
 RUN uv pip install --system --no-cache --no-deps .
-
-# Run as non-root
-USER 10001
 
 # Expose proxy port
 EXPOSE 8080
