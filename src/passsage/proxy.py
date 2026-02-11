@@ -1861,6 +1861,9 @@ class Proxy:
 
     @_log_hook_errors("responseheaders")
     def responseheaders(self, flow):
+        request_id = getattr(flow, "id", None)
+        if request_id is not None:
+            flow.response.headers["X-Request-Id"] = str(request_id)
         if getattr(flow, "_cache_redirect", False):
             flow.response.headers["x-proxy-policy"] = flow._policy.__name__
             existing_via = flow.response.headers.get("via", "")
