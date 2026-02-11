@@ -549,13 +549,6 @@ def run_proxy(
     help="End date/time (YYYY-MM-DD, YYYY-MM-DDTHH, or YYYY-MM-DDTHH:MM)",
 )
 @click.option(
-    "--limit",
-    type=int,
-    default=5000,
-    show_default=True,
-    help="Maximum number of rows to load",
-)
-@click.option(
     "--s3-bucket",
     envvar="S3_BUCKET",
     default="",
@@ -572,7 +565,7 @@ def run_proxy(
 @click.option(
     "-g", "--grep",
     default=None,
-    help="Regex to match against all fields (keeps only matching rows)",
+    help="Regex to match against all string fields (keeps only matching rows)",
 )
 @click.option(
     "-f", "--filter",
@@ -581,15 +574,21 @@ def run_proxy(
     help="Per-field regex filter as field=regex (repeatable, all must match). "
     "Example: -f host=pypi -f 'status_code=^5'",
 )
-def logs(start_date, end_date, limit, s3_bucket, access_log_prefix, grep, filters):
+@click.option(
+    "-w", "--where",
+    default=None,
+    help="Raw DuckDB SQL WHERE expression for advanced filtering. "
+    "Example: -w \"status_code >= 500 AND duration_ms > 1000\"",
+)
+def logs(start_date, end_date, s3_bucket, access_log_prefix, grep, filters, where):
     from passsage.logs_ui import run_logs_ui
 
     bucket = s3_bucket or os.environ.get("S3_BUCKET", "")
     if not bucket:
         raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
     run_logs_ui(
-        bucket, access_log_prefix, start_date, end_date, limit,
-        grep=grep, filters=list(filters) or None,
+        bucket, access_log_prefix, start_date, end_date,
+        grep=grep, filters=list(filters) or None, where=where,
     )
 
 
@@ -605,13 +604,6 @@ def logs(start_date, end_date, limit, s3_bucket, access_log_prefix, grep, filter
     default=date.today().isoformat(),
     show_default=True,
     help="End date/time (YYYY-MM-DD, YYYY-MM-DDTHH, or YYYY-MM-DDTHH:MM)",
-)
-@click.option(
-    "--limit",
-    type=int,
-    default=5000,
-    show_default=True,
-    help="Maximum number of rows to load",
 )
 @click.option(
     "--s3-bucket",
@@ -630,7 +622,7 @@ def logs(start_date, end_date, limit, s3_bucket, access_log_prefix, grep, filter
 @click.option(
     "-g", "--grep",
     default=None,
-    help="Regex to match against all fields (keeps only matching rows)",
+    help="Regex to match against all string fields (keeps only matching rows)",
 )
 @click.option(
     "-f", "--filter",
@@ -639,19 +631,56 @@ def logs(start_date, end_date, limit, s3_bucket, access_log_prefix, grep, filter
     help="Per-field regex filter as field=regex (repeatable, all must match). "
     "Example: -f error_type=Timeout -f 'host=pypi'",
 )
-def errors(start_date, end_date, limit, s3_bucket, error_log_prefix, grep, filters):
+@click.option(
+    "-w", "--where",
+    default=None,
+    help="Raw DuckDB SQL WHERE expression for advanced filtering. "
+    "Example: -w \"error_type = 'ConnectionError'\"",
+)
+def errors(start_date, end_date, s3_bucket, error_log_prefix, grep, filters, where):
     from passsage.logs_ui import run_errors_ui
 
     bucket = s3_bucket or os.environ.get("S3_BUCKET", "")
     if not bucket:
         raise click.ClickException("S3 bucket is required (set S3_BUCKET or --s3-bucket).")
     run_errors_ui(
-        bucket, error_log_prefix, start_date, end_date, limit,
-        grep=grep, filters=list(filters) or None,
+        bucket, error_log_prefix, start_date, end_date,
+        grep=grep, filters=list(filters) or None, where=where,
     )
 
 
-@main.command("cache-keys")
+@main.command("cache-keys", help="""\
+Detect query parameters that fragment the cache and cause unnecessary misses.
+
+Scans access logs for GET requests that were cache misses and had query strings.
+Each query parameter is analyzed across all requests to find parameters with many
+distinct values appearing across multiple URL paths — these are strong candidates
+for cache key stripping (e.g. tracking IDs, session tokens, cache-busters).
+
+\b
+Output columns:
+  host              upstream hostname
+  param             query parameter name
+  distinct_values   number of unique values seen for this parameter
+  paths             number of distinct URL paths where this parameter appeared
+  misses            total cache-miss requests containing this parameter
+
+\b
+Examples:
+  # Analyze today's logs
+  passsage cache-keys --s3-bucket my-proxy-cache
+
+  # Analyze a date range with stricter thresholds
+  passsage cache-keys --start-date 2026-02-01 --end-date 2026-02-10 \\
+      --min-distinct 50 --min-misses 500
+
+  # Find params causing misses on a specific bucket
+  passsage cache-keys --s3-bucket 211125321544-us-west-2-proxy-cache \\
+      --min-paths 5 --top 20
+
+Once identified, add high-entropy parameters to the proxy's cache key strip list
+so they are ignored when computing cache keys, improving hit rates.
+""")
 @click.option(
     "--start-date",
     default=date.today().isoformat(),
@@ -677,19 +706,6 @@ def errors(start_date, end_date, limit, s3_bucket, error_log_prefix, grep, filte
     default="__passsage_logs__",
     show_default=True,
     help="S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)",
-)
-@click.option(
-    "--db-path",
-    default="/tmp/passsage-cache-key-audit.sqlite",
-    show_default=True,
-    help="SQLite file used for aggregation",
-)
-@click.option(
-    "--batch-size",
-    type=int,
-    default=5000,
-    show_default=True,
-    help="Rows per parquet batch to scan",
 )
 @click.option(
     "--min-distinct",
@@ -719,25 +735,15 @@ def errors(start_date, end_date, limit, s3_bucket, error_log_prefix, grep, filte
     show_default=True,
     help="Maximum number of candidates to show",
 )
-@click.option(
-    "--reset-db",
-    is_flag=True,
-    default=False,
-    show_default=True,
-    help="Delete the SQLite file before scanning",
-)
 def cache_keys(
     start_date,
     end_date,
     s3_bucket,
     access_log_prefix,
-    db_path,
-    batch_size,
     min_distinct,
     min_paths,
     min_misses,
     top,
-    reset_db,
 ):
     from passsage.log_analysis import analyze_cache_fragmentation
 
@@ -749,13 +755,10 @@ def cache_keys(
         prefix=access_log_prefix,
         start_date=start_date,
         end_date=end_date,
-        db_path=db_path,
-        batch_size=batch_size,
         min_distinct=min_distinct,
         min_paths=min_paths,
         min_misses=min_misses,
         top=top,
-        reset_db=reset_db,
     )
     if not candidates:
         click.echo("No candidates found.")
