@@ -1040,6 +1040,11 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "cache_head_etag": cache_head.headers.get("x-amz-meta-header-etag") if cache_head else None,
         "cache_head_last_modified": cache_head.headers.get("x-amz-meta-last-modified") if cache_head else None,
         "cache_head_method": cache_head.headers.get("x-amz-meta-method") if cache_head else None,
+        "serve_reason": getattr(flow, "_serve_reason", None),
+        "cached_method": getattr(flow, "_cached_method", None),
+        "vary_index_key": getattr(flow, "_vary_index_key", None),
+        "cache_save": getattr(flow, "_cache_saved", False),
+        "range_stripped": getattr(flow, "_range_stripped", False),
         "error": error,
         "duration_ms": duration_ms,
         "bytes_sent": content_length,
@@ -1105,6 +1110,7 @@ def _build_error_log_record(
         "cache_redirect": getattr(flow, "_cache_redirect", None) if flow else None,
         "cache_key": getattr(flow, "_cache_key", None) if flow else None,
         "cache_vary": getattr(flow, "_cache_vary", None) if flow else None,
+        "serve_reason": getattr(flow, "_serve_reason", None) if flow else None,
         "cache_head_status": cache_head.status_code if cache_head else None,
         "upstream_head_status": upstream_head.status_code if upstream_head else None,
         "upstream_error": str(upstream_error) if upstream_error else None,
@@ -1526,12 +1532,18 @@ class Proxy:
         flow._allow_stale_if_error = False
         flow._save_response = True
         flow._orig_range = None
+        flow._range_stripped = False
+        flow._serve_reason = "upstream_served"
+        flow._cached_method = None
+        flow._vary_index_key = None
+        flow._cache_saved = False
         policy = flow._policy = get_policy(flow)
         if _is_s3_cache_request(flow):
             # If a client proxies the S3 redirect URL back through us, avoid re-caching
             # the cached object again and create a loop. Force NoCache for S3 host.
             flow._save_response = False
             flow._policy = NoCache
+            flow._serve_reason = "no_cache_s3_request"
             return
         if flow.request.pretty_host == "mitm.it" and flow.request.path in ("/proxy-env", "/proxy-env.sh"):
             public_url = getattr(ctx.options, "public_proxy_url", "").strip()
@@ -1565,6 +1577,7 @@ class Proxy:
         if (flow.request.method not in ("GET", "HEAD")
                 or policy == NoCache):
             flow._save_response = False
+            flow._serve_reason = "no_cache_policy" if policy == NoCache else "no_cache_method"
             return
 
         # Look up the object in the cache (Vary-aware)
@@ -1573,6 +1586,7 @@ class Proxy:
         try:
             normalized_url = _normalize_url(flow)
             vary_index_key = get_vary_index_key(normalized_url)
+            flow._vary_index_key = vary_index_key
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
             vary_index_head = cache_head_object(vary_index_key)
             if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.headers.get("x-amz-meta-vary")):
@@ -1616,6 +1630,7 @@ class Proxy:
             # If we got non-2xx or 404 from the S3, the proxy is not
             # functional, so return this as an error
             flow._save_response = False
+            flow._serve_reason = "cache_head_error"
             flow.response = http.Response.make(
                 flow._cache_head.status_code,
                 f"Got {flow._cache_head.status_code} error while accessing\n{S3_URL}\nplease check its permissions!",
@@ -1632,6 +1647,7 @@ class Proxy:
                 cached_method = True
             elif meta_method == "GET" or meta_method == flow.request.method:
                 cached_method = True
+        flow._cached_method = cached_method
         if flow._cache_head is not None:
             LOG.debug(
                 "Cache metadata status=%s method_meta=%s etag_meta=%s lastmod_meta=%s",
@@ -1679,6 +1695,7 @@ class Proxy:
 
         if cache_hit:
             if policy == NoRefresh:
+                flow._serve_reason = "cache_hit_norefresh"
                 LOG.debug("Cache hit: NoRefresh -> serve_cache_hit")
                 if getattr(ctx.options, "cache_redirect", False):
                     serve_cache_hit(flow)
@@ -1686,6 +1703,7 @@ class Proxy:
                 rewrite_upstream_to_cache(flow)
                 return
             if cache_fresh and policy in (Standard, StaleIfError):
+                flow._serve_reason = "cache_hit_fresh"
                 LOG.debug("Cache hit: fresh -> serve_cache_hit")
                 if getattr(ctx.options, "cache_redirect", False):
                     serve_cache_hit(flow)
@@ -1693,6 +1711,7 @@ class Proxy:
                 rewrite_upstream_to_cache(flow)
                 return
             if policy in (Standard, StaleIfError) and allow_stale_while_revalidate:
+                flow._serve_reason = "cache_hit_stale_while_revalidate"
                 LOG.debug("Cache hit: stale-while-revalidate -> serve_cache_hit")
                 if getattr(ctx.options, "cache_redirect", False):
                     serve_cache_hit(flow)
@@ -1715,6 +1734,7 @@ class Proxy:
                 # We cache the full object and serve the requested range slice
                 # to the client in responseheaders.
                 flow._orig_range = flow.request.headers.pop("Range")
+                flow._range_stripped = True
                 LOG.debug("Stripped Range header on cache miss: %s", flow._orig_range)
 
         upstream_failed = False
@@ -1777,6 +1797,7 @@ class Proxy:
             if (not upstream_failed and cache_hit
                     and flow._upstream_head.status_code == 404
                     and (policy == StaleIfError or allow_stale_if_error)):
+                flow._serve_reason = "stale_if_error_upstream_404"
                 if getattr(ctx.options, "cache_redirect", False):
                     serve_cache_hit(flow)
                     return
@@ -1786,6 +1807,7 @@ class Proxy:
         # On upstream errors or if it's banned, StaleIfError may serve cached content.
         if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
             if cache_hit and (policy == StaleIfError or allow_stale_if_error):
+                flow._serve_reason = "stale_if_error_upstream_failed"
                 LOG.debug("Upstream failed -> rewrite_upstream_to_cache (StaleIfError)")
                 if getattr(ctx.options, "cache_redirect", False):
                     serve_cache_hit(flow)
@@ -1796,6 +1818,7 @@ class Proxy:
         # If upstream didn't respond (or banned) and we have a cache miss,
         # return a 504 HTTP error
         if upstream_failed:
+            flow._serve_reason = "upstream_failed"
             flow._save_response = False
             if _is_tls_verify_error(flow._upstream_error):
                 detail = str(flow._upstream_error) if flow._upstream_error else "unknown"
@@ -1829,6 +1852,7 @@ class Proxy:
             if not (flow._upstream_head.headers.get("last-modified")
                     != flow._cache_head.headers.get("x-amz-meta-last-modified")
                     or flow._upstream_head.headers.get("etag") != flow._cache_head.headers.get("x-amz-meta-header-etag")):
+                flow._serve_reason = "cache_hit_revalidated"
                 if flow._cache_key:
                     refresh_cache_metadata(flow._cache_key, flow._cache_head.headers)
                 rewrite_upstream_to_cache(flow)
@@ -1866,6 +1890,7 @@ class Proxy:
                     timeout=CACHE_TIMEOUT,
                 )
                 if http_2xx(cached_resp):
+                    flow._serve_reason = "stale_if_error_fallback"
                     flow.response = http.Response.make(
                         cached_resp.status_code,
                         cached_resp.content,
@@ -2118,6 +2143,7 @@ class Proxy:
                 return
             normalized_url = _normalize_url(flow)
             cache_key = flow._cache_key or get_cache_key(normalized_url)
+            flow._cache_saved = True
             LOG.debug("Cache save enqueue key=%s", cache_key)
             ctx._executor.submit(
                 self._save_to_cache,
