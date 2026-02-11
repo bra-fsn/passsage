@@ -32,9 +32,10 @@ def default_rules() -> list["Rule"]:
         SuffixRule("/Packages.gz", StaleIfError),
         SuffixRule("/Packages.xz", StaleIfError),
         SuffixRule("/InRelease", StaleIfError),
-        RegexRule(r".*by-hash/[A-Z0-9]+/[a-f0-9]+$", StaleIfError),
-        # Python hosted packages
-        HostContainsRule("files.pythonhosted.org", StaleIfError),
+        RegexRule(r".*by-hash/[A-Z0-9]+/[a-f0-9]+$", NoRefresh),
+        # Python hosted packages (immutable content-addressed archives)
+        HostContainsRule("files.pythonhosted.org", NoRefresh),
+        # Python package index (mutable, new versions appear)
         PathContainsRule("pypi.org/simple", StaleIfError),
         # cloud metadata endpoints
         HostPrefixRule("169.254.169.", NoCache),
