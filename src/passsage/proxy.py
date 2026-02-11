@@ -1847,11 +1847,21 @@ class Proxy:
                 and policy in (Standard, StaleIfError)
                 and flow._upstream_head
                 and (http_2xx(flow._upstream_head) or flow._upstream_head.status_code == 304)):
-            # if any of lastmod or etag changed, we must re-fetch the object,
-            # otherwise return the stored variant (revalidated)
-            if not (flow._upstream_head.headers.get("last-modified")
-                    != flow._cache_head.headers.get("x-amz-meta-last-modified")
-                    or flow._upstream_head.headers.get("etag") != flow._cache_head.headers.get("x-amz-meta-header-etag")):
+            # Decide whether the upstream content is the same as our cached copy.
+            # ETag is the authoritative validator: if both sides have one and they
+            # match, the content is identical regardless of Last-Modified differences
+            # (e.g. cache stored None but upstream now returns a value).
+            upstream_etag = flow._upstream_head.headers.get("etag")
+            cached_etag = flow._cache_head.headers.get("x-amz-meta-header-etag")
+            upstream_lastmod = flow._upstream_head.headers.get("last-modified")
+            cached_lastmod = flow._cache_head.headers.get("x-amz-meta-last-modified")
+            if upstream_etag and cached_etag:
+                content_unchanged = upstream_etag == cached_etag
+            elif upstream_lastmod or cached_lastmod:
+                content_unchanged = upstream_lastmod == cached_lastmod
+            else:
+                content_unchanged = False
+            if content_unchanged:
                 flow._serve_reason = "cache_hit_revalidated"
                 if flow._cache_key:
                     refresh_cache_metadata(flow._cache_key, flow._cache_head.headers)
