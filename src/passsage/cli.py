@@ -251,6 +251,20 @@ import click
     help="Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)"
 )
 @click.option(
+    "--connection-strategy",
+    type=click.Choice(["lazy", "eager"]),
+    default="lazy",
+    envvar="PASSSAGE_CONNECTION_STRATEGY",
+    show_default=True,
+    help="When to establish upstream TLS connections. "
+    "'lazy' defers the upstream connection until data actually needs to be sent, "
+    "which avoids a wasted TLS handshake on cache hits (saves ~50-200ms per "
+    "HTTPS request served from cache). "
+    "'eager' connects to upstream immediately on CONNECT, which allows protocol "
+    "detection and accurate TLS ALPN negotiation but adds latency to cache hits. "
+    "(env: PASSSAGE_CONNECTION_STRATEGY)"
+)
+@click.option(
     "--mitm-ca-cert",
     envvar="PASSSAGE_MITM_CA_CERT",
     default=None,
@@ -302,6 +316,7 @@ def main(
     error_log_flush_bytes,
     health_port,
     health_host,
+    connection_strategy,
     mitm_ca_cert,
     mitm_ca,
 ):
@@ -364,6 +379,7 @@ def main(
             error_log_flush_bytes,
             health_port,
             health_host,
+            connection_strategy,
             mitm_ca_cert,
             mitm_ca,
         )
@@ -425,6 +441,7 @@ def run_proxy(
     error_log_flush_bytes,
     health_port,
     health_host,
+    connection_strategy="lazy",
     mitm_ca_cert=None,
     mitm_ca=None,
 ):
@@ -520,6 +537,8 @@ def run_proxy(
     args.extend(["--set", f"presigned_url_cache_maxsize={presigned_url_cache_maxsize}"])
     if public_proxy_url:
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
+
+    args.extend(["--set", f"connection_strategy={connection_strategy}"])
 
     if verbose:
         args.extend(["-v"])
