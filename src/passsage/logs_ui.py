@@ -425,6 +425,11 @@ def _build_details_renderable(row: dict):
         ("cache_head_etag", _format_value(row.get("cache_head_etag"))),
         ("cache_head_last_modified", _format_value(row.get("cache_head_last_modified"))),
         ("cache_head_method", _format_value(row.get("cache_head_method"))),
+        ("serve_reason", _format_value(row.get("serve_reason"))),
+        ("cached_method", _format_value(row.get("cached_method"))),
+        ("vary_index_key", _format_value(row.get("vary_index_key"))),
+        ("cache_save", _format_value(row.get("cache_save"))),
+        ("range_stripped", _format_value(row.get("range_stripped"))),
     ]
     upstream_items = [
         ("upstream_head_status", _format_value(row.get("upstream_head_status"))),
