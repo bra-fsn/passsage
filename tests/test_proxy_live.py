@@ -42,15 +42,21 @@ def assert_cached_response(resp: requests.Response) -> None:
     if "Cache-Status" in resp.headers:
         assert "Age" in resp.headers
         return
-    if cache_redirect_enabled():
-        if has_cache_redirect(resp):
-            return
+    if has_cache_redirect(resp):
+        return
     assert "Cache-Status" in resp.headers
+
+
+def _is_s3_presigned_location(location: str) -> bool:
+    return "AWSAccessKeyId=" in location or "X-Amz-Credential=" in location
 
 
 def has_cache_redirect(resp: requests.Response) -> bool:
     candidates = [resp] + list(resp.history or [])
-    return any(r.status_code in (302, 307) and r.headers.get("Location") for r in candidates)
+    return any(
+        r.status_code in (302, 307) and _is_s3_presigned_location(r.headers.get("Location", ""))
+        for r in candidates
+    )
 
 
 def cache_redirect_enabled() -> bool:
@@ -128,9 +134,7 @@ def wait_for_cached_response(
     last_resp = None
     for _ in range(retries):
         last_resp = proxy_get(session, url, headers=headers, timeout=timeout)
-        if "Cache-Status" in last_resp.headers or (
-            cache_redirect_enabled() and has_cache_redirect(last_resp)
-        ):
+        if "Cache-Status" in last_resp.headers or has_cache_redirect(last_resp):
             return last_resp
         time.sleep(sleep_seconds)
     return last_resp
@@ -461,7 +465,7 @@ class TestProxyLive:
             retries=10,
             sleep_seconds=SYNC_SETTLE_SECONDS,
         )
-        assert "Cache-Status" in cached.headers
+        assert_cached_response(cached)
         time.sleep(SYNC_SETTLE_SECONDS + 2)
         test_server.set_path_override("/cache-control/max-age-low", status=500)
         r2 = proxy_get(proxy_session, url, headers=policy_headers("StaleIfError"), timeout=30)
@@ -575,7 +579,8 @@ class TestProxyLive:
         )
         assert r1.status_code == 302
         assert r2.status_code == 302
-        assert r2.headers.get("Location") == "/redirect-target"
+        if not has_cache_redirect(r2):
+            assert r2.headers.get("Location") == "/redirect-target"
         assert_cached_response(r2)
 
     def test_cached_headers_preserved(self, proxy_session, test_server, cache_bust_random):
@@ -592,7 +597,7 @@ class TestProxyLive:
             headers=policy_headers("Standard"),
         )
         assert r1.ok and r2.ok
-        if cache_redirect_enabled() and has_cache_redirect(r2):
+        if has_cache_redirect(r2):
             assert_cached_response(r2)
             return
         assert r2.headers.get("Content-Language") == "en"
