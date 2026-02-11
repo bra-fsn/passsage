@@ -52,7 +52,7 @@ dev = [
     "twine>=4.0",
 ]
 ui = [
-    "s3fs",
+    "duckdb",
     "textual",
 ]
 all = [
