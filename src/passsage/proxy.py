@@ -263,19 +263,21 @@ def _write_metadata_sidecar(cache_key: str, metadata: dict[str, str]) -> None:
     """Write a .passsage-meta JSON sidecar alongside the cached S3 object.
 
     Called after s3.upload_fileobj / s3.put_object when METADATA_FILES is
-    enabled.  The sidecar mirrors the S3 object's x-amz-meta-* headers so
-    _local_head_object can read them from the local mount without an S3 HEAD.
+    enabled.  The sidecar is stored as a separate S3 object so that
+    mount-s3 exposes it on the local filesystem automatically.
+    _local_head_object can then read it without an S3 HEAD call.
     """
-    meta_path = _meta_file_path(cache_key)
+    sidecar_key = cache_key + _META_SUFFIX
     try:
-        meta_dir = os.path.dirname(meta_path)
-        os.makedirs(meta_dir, exist_ok=True)
-        tmp_path = meta_path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(metadata, f, separators=(",", ":"))
-        os.replace(tmp_path, meta_path)
+        body = json.dumps(metadata, separators=(",", ":")).encode()
+        get_s3_client().put_object(
+            Bucket=S3_BUCKET,
+            Key=sidecar_key,
+            Body=body,
+            ContentType="application/json",
+        )
     except Exception as exc:
-        LOG.warning("Failed to write metadata sidecar %s: %s", meta_path, exc)
+        LOG.warning("Failed to write metadata sidecar s3://%s/%s: %s", S3_BUCKET, sidecar_key, exc)
 
 
 def cache_head_object(cache_key: str) -> S3HeadResponse:
