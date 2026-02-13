@@ -1,7 +1,5 @@
 .PHONY: install dev test test-local lint format build clean publish publish-test docker-build docker-run
 
-S3_MOUNT_HOST_PATH ?= /tmp/passsage-s3mount
-
 install:
 	pip install -e .
 
@@ -12,21 +10,9 @@ test:
 	pytest -v
 
 test-local:
-	docker compose build
-	docker compose up -d localstack --wait
-	@mkdir -p $(S3_MOUNT_HOST_PATH)
-	@if ! mountpoint -q $(S3_MOUNT_HOST_PATH); then \
-		echo "test:test" > /tmp/.passwd-s3fs && chmod 600 /tmp/.passwd-s3fs; \
-		s3fs proxy-cache $(S3_MOUNT_HOST_PATH) \
-			-o passwd_file=/tmp/.passwd-s3fs \
-			-o url=http://localhost:4566 \
-			-o use_path_request_style \
-			-o allow_other; \
-	fi
-	S3_MOUNT_HOST_PATH=$(S3_MOUNT_HOST_PATH) \
-	PASSSAGE_ALLOW_POLICY_HEADER=1 \
-	PASSSAGE_DEBUG_PROXY=1 \
-		docker compose up -d passsage --wait
+	docker compose build passsage-base
+	PASSSAGE_ALLOW_POLICY_HEADER=1 PASSSAGE_DEBUG_PROXY=1 \
+		docker compose up -d --build --wait
 	docker compose ps
 	PROXY_URL=http://localhost:8080 \
 	PASSSAGE_TEST_SERVER_BIND_HOST=0.0.0.0 \

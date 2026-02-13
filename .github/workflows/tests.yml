@@ -32,37 +32,13 @@ jobs:
         run: |
           uv pip install --system -e ".[dev]"
 
-      - name: Install s3fs
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q s3fs
-
-      - name: Build images
-        run: docker compose build
-
-      - name: Start localstack
-        run: |
-          docker compose up -d localstack --wait
-          docker compose ps
-
-      - name: Mount S3 bucket via s3fs
-        run: |
-          sudo mkdir -p /tmp/passsage-s3mount
-          echo "test:test" | sudo tee /tmp/.passwd-s3fs > /dev/null
-          sudo chmod 600 /tmp/.passwd-s3fs
-          sudo s3fs proxy-cache /tmp/passsage-s3mount \
-            -o passwd_file=/tmp/.passwd-s3fs \
-            -o url=http://localhost:4566 \
-            -o use_path_request_style \
-            -o allow_other
-          ls /tmp/passsage-s3mount/
-
-      - name: Start passsage
+      - name: Start proxy stack
         env:
           PASSSAGE_ALLOW_POLICY_HEADER: "1"
           PASSSAGE_DEBUG_PROXY: "1"
         run: |
-          docker compose up -d passsage --wait
+          docker compose build passsage-base
+          docker compose up -d --build --wait
           docker compose ps
 
       - name: Run tests

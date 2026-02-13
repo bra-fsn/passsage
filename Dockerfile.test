@@ -1,0 +1,12 @@
+FROM passsage:base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fuse \
+    s3fs \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["passsage"]
