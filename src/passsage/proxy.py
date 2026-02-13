@@ -1926,6 +1926,12 @@ class Proxy:
                 )
 
         flow.response.headers["x-proxy-policy"] = flow._policy.__name__
+        if getattr(flow, "_serve_reason", None) == "no_cache_s3_request":
+            flow.response.headers["x-passsage-warning"] = (
+                "no_proxy-bypass: this request to "
+                + flow.request.pretty_host
+                + " should bypass the proxy (check client no_proxy setting)"
+            )
         # Identify proxy via Via (RFC 7230); do not rewrite Server header
         existing_via = flow.response.headers.get("via", "")
         flow.response.headers["via"] = f"{VIA_HEADER_VALUE}, {existing_via}" if existing_via else VIA_HEADER_VALUE
@@ -2097,12 +2103,6 @@ class Proxy:
             return
         if (flow.request.method not in ("GET", "HEAD")
                 or flow._policy == NoCache or flow._cached):
-            if getattr(flow, "_serve_reason", None) == "no_cache_s3_request" and flow.response:
-                flow.response.headers["x-passsage-warning"] = (
-                    "no_proxy-bypass: this request to "
-                    + flow.request.pretty_host
-                    + " should bypass the proxy (check client no_proxy setting)"
-                )
             self.log_response(flow)
             with ctx._lock:
                 self.cleanup(flow)
