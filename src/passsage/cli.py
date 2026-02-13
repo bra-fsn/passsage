@@ -707,6 +707,247 @@ def errors(start_date, end_date, s3_bucket, error_log_prefix, grep, filters, whe
         )
 
 
+@main.group("cache", invoke_without_command=True)
+@click.option(
+    "--memcached-servers",
+    envvar="PASSSAGE_MEMCACHED_SERVERS",
+    default="",
+    show_default=False,
+    help="Comma-separated memcached servers (host:port); "
+    "e.g. cache-0.cache:11211,cache-1.cache:11211 (env: PASSSAGE_MEMCACHED_SERVERS)",
+)
+@click.pass_context
+def cache(ctx, memcached_servers):
+    """Inspect and manipulate the memcached metadata cache.
+
+    \b
+    Passsage stores response metadata in memcached to speed up cache-hit
+    lookups.  This command group lets you inspect or remove those entries
+    for a given URL.
+
+    \b
+    Examples:
+        # Show cached metadata for a URL
+        passsage cache get https://pypi.org/simple/requests/
+
+        # Delete cached metadata for a URL
+        passsage cache delete https://pypi.org/simple/requests/
+
+        # Show only the derived keys (no memcached connection needed)
+        passsage cache get --keys-only https://pypi.org/simple/requests/
+    """
+    ctx.ensure_object(dict)
+    ctx.obj["memcached_servers"] = memcached_servers
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+def _make_memcached_client(servers_str):
+    """Create a standalone HashClient from a comma-separated server string."""
+    from passsage.proxy import _parse_memcached_servers
+
+    servers = _parse_memcached_servers(servers_str)
+    if not servers:
+        return None
+    from pymemcache.client.hash import HashClient
+
+    return HashClient(servers, connect_timeout=2, timeout=2)
+
+
+def _resolve_cache_keys(url):
+    """Normalize a URL and return (normalized_url, cache_key, vary_index_key, memcached keys)."""
+    from passsage.proxy import (
+        _memcached_key,
+        get_cache_key,
+        get_vary_index_key,
+    )
+    from passsage.cache_key import (
+        Context as CacheKeyContext,
+        get_default_cache_key_resolver,
+    )
+
+    request_ctx = CacheKeyContext(url=url, method="GET")
+    resolver = get_default_cache_key_resolver()
+    normalized_url = resolver.resolve(request_ctx)
+    cache_key = get_cache_key(normalized_url)
+    vary_index_key = get_vary_index_key(normalized_url)
+    return {
+        "url": url,
+        "normalized_url": normalized_url,
+        "cache_key": cache_key,
+        "vary_index_key": vary_index_key,
+        "memcached_key": _memcached_key(cache_key),
+        "memcached_vary_key": _memcached_key(vary_index_key),
+    }
+
+
+@cache.command("get")
+@click.argument("url")
+@click.option(
+    "--keys-only",
+    is_flag=True,
+    default=False,
+    help="Only show derived keys without connecting to memcached.",
+)
+@click.option(
+    "-o", "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+@click.pass_context
+def cache_get(ctx, url, keys_only, output_format):
+    """Show memcached metadata for a URL.
+
+    Derives the cache key and vary-index key from URL, then fetches the
+    stored metadata from memcached.
+
+    \b
+    Examples:
+        passsage cache get https://pypi.org/simple/requests/
+        passsage cache get --keys-only https://example.com/path
+        passsage cache get -o json https://pypi.org/simple/requests/
+    """
+    import json as json_mod
+
+    keys = _resolve_cache_keys(url)
+
+    if keys_only:
+        if output_format == "json":
+            click.echo(json_mod.dumps(keys, indent=2))
+        else:
+            click.echo(f"url:                {keys['url']}")
+            click.echo(f"normalized_url:     {keys['normalized_url']}")
+            click.echo(f"cache_key:          {keys['cache_key']}")
+            click.echo(f"vary_index_key:     {keys['vary_index_key']}")
+            click.echo(f"memcached_key:      {keys['memcached_key']}")
+            click.echo(f"memcached_vary_key: {keys['memcached_vary_key']}")
+        return
+
+    servers = ctx.obj["memcached_servers"]
+    if not servers:
+        raise click.ClickException(
+            "Memcached servers required (set PASSSAGE_MEMCACHED_SERVERS or --memcached-servers)."
+        )
+    mc = _make_memcached_client(servers)
+    if mc is None:
+        raise click.ClickException("Failed to create memcached client.")
+
+    metadata_raw = mc.get(keys["memcached_key"])
+    vary_raw = mc.get(keys["memcached_vary_key"])
+
+    metadata = None
+    if metadata_raw is not None:
+        metadata = json_mod.loads(metadata_raw)
+
+    vary_data = None
+    if vary_raw is not None:
+        vary_data = json_mod.loads(vary_raw)
+
+    result = {
+        **keys,
+        "metadata": metadata,
+        "vary_index": vary_data,
+    }
+
+    if output_format == "json":
+        click.echo(json_mod.dumps(result, indent=2))
+    else:
+        click.echo(f"url:                {keys['url']}")
+        click.echo(f"normalized_url:     {keys['normalized_url']}")
+        click.echo(f"cache_key:          {keys['cache_key']}")
+        click.echo(f"vary_index_key:     {keys['vary_index_key']}")
+        click.echo(f"memcached_key:      {keys['memcached_key']}")
+        click.echo(f"memcached_vary_key: {keys['memcached_vary_key']}")
+        click.echo()
+        if metadata is not None:
+            click.echo("metadata:")
+            for k, v in metadata.items():
+                click.echo(f"  {k}: {v}")
+        else:
+            click.echo("metadata: (not found)")
+        click.echo()
+        if vary_data is not None:
+            click.echo("vary_index:")
+            for k, v in vary_data.items():
+                click.echo(f"  {k}: {v}")
+        else:
+            click.echo("vary_index: (not found)")
+
+
+@cache.command("delete")
+@click.argument("url")
+@click.option(
+    "--yes", "-y",
+    is_flag=True,
+    default=False,
+    help="Skip confirmation prompt.",
+)
+@click.option(
+    "--vary-only",
+    is_flag=True,
+    default=False,
+    help="Only delete the vary-index entry.",
+)
+@click.option(
+    "--metadata-only",
+    is_flag=True,
+    default=False,
+    help="Only delete the metadata entry.",
+)
+@click.pass_context
+def cache_delete(ctx, url, yes, vary_only, metadata_only):
+    """Delete memcached metadata for a URL.
+
+    Derives the cache key and vary-index key from URL, then deletes
+    the corresponding entries from memcached.  By default both the
+    metadata entry and the vary-index entry are removed.
+
+    \b
+    Examples:
+        passsage cache delete https://pypi.org/simple/requests/
+        passsage cache delete -y https://example.com/path
+        passsage cache delete --metadata-only https://example.com/path
+    """
+    keys = _resolve_cache_keys(url)
+
+    servers = ctx.obj["memcached_servers"]
+    if not servers:
+        raise click.ClickException(
+            "Memcached servers required (set PASSSAGE_MEMCACHED_SERVERS or --memcached-servers)."
+        )
+    mc = _make_memcached_client(servers)
+    if mc is None:
+        raise click.ClickException("Failed to create memcached client.")
+
+    targets = []
+    if not vary_only:
+        targets.append(("metadata", keys["memcached_key"]))
+    if not metadata_only:
+        targets.append(("vary_index", keys["memcached_vary_key"]))
+
+    if not targets:
+        raise click.ClickException("Nothing to delete (--vary-only and --metadata-only cancel out).")
+
+    if not yes:
+        click.echo(f"url:            {keys['url']}")
+        click.echo(f"normalized_url: {keys['normalized_url']}")
+        click.echo(f"Will delete:")
+        for label, mc_key in targets:
+            click.echo(f"  {label}: {mc_key}")
+        if not click.confirm("Proceed?"):
+            raise SystemExit(0)
+
+    for label, mc_key in targets:
+        deleted = mc.delete(mc_key, noreply=False)
+        if deleted:
+            click.echo(f"Deleted {label}: {mc_key}")
+        else:
+            click.echo(f"Not found {label}: {mc_key}")
+
+
 @main.command("cache-keys", help="""\
 Detect query parameters that fragment the cache and cause unnecessary misses.
 
