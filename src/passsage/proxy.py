@@ -142,6 +142,7 @@ ERROR_LOG_PREFIX = os.environ.get("PASSSAGE_ERROR_LOG_PREFIX", "__passsage_error
 ERROR_LOG_DIR = os.environ.get("PASSSAGE_ERROR_LOG_DIR", "/tmp/passsage-errors").strip()
 ERROR_LOG_FLUSH_SECONDS = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_SECONDS", "30").strip()
 ERROR_LOG_FLUSH_BYTES = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_BYTES", "256M").strip()
+MOUNT_S3_PATH = os.environ.get("PASSSAGE_MOUNT_S3_PATH", "").strip()
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -1075,6 +1076,8 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "vary_index_key": getattr(flow, "_vary_index_key", None),
         "cache_save": getattr(flow, "_cache_saved", False),
         "range_stripped": getattr(flow, "_range_stripped", False),
+        "mount_served": getattr(flow, "_mount_served", False),
+        "mount_miss": getattr(flow, "_mount_miss", False),
         "error": error,
         "duration_ms": duration_ms,
         "bytes_sent": content_length,
@@ -1257,6 +1260,78 @@ def rewrite_upstream_to_cache(flow):
     flow._save_response = False
     # mark this response as returned from the cache
     flow._cached = True
+
+
+_MOUNT_CHUNK_SIZE = 64 * 1024
+
+
+def _mount_file_chunks(path: Path):
+    with open(path, "rb") as fh:
+        while chunk := fh.read(_MOUNT_CHUNK_SIZE):
+            yield chunk
+
+
+def _serve_from_mount(flow) -> bool:
+    """Try to serve a cache hit from the local S3 mount path.
+
+    Returns True if the response was served, False if the mount file is
+    missing (the caller should fall through to upstream).
+    """
+    mount_path = getattr(ctx.options, "mount_s3_path", "") or ""
+    if not mount_path:
+        return False
+    cache_key = flow._cache_key
+    if not cache_key:
+        return False
+    local_path = Path(mount_path) / cache_key
+    if not local_path.is_file():
+        if not getattr(flow, "_mount_miss", False):
+            LOG.warning("Mount file missing mount=%s key=%s", mount_path, cache_key)
+            flow._mount_miss = True
+        return False
+    try:
+        size = local_path.stat().st_size
+    except OSError as exc:
+        LOG.warning("Mount file stat failed path=%s: %s", local_path, exc)
+        flow._mount_miss = True
+        return False
+
+    ct = "application/octet-stream"
+    headers = {}
+    if flow._cache_head:
+        ct = flow._cache_head.headers.get("content-type", ct)
+        for k, v in flow._cache_head.headers.items():
+            if k.startswith("x-amz-meta-"):
+                headers[k] = v
+
+    flow.response = http.Response.make(200, b"", {"Content-Type": ct})
+    flow.response.headers["content-length"] = str(size)
+    for k, v in headers.items():
+        flow.response.headers[k] = v
+
+    if flow.request.method != "HEAD":
+        flow.response.stream = _mount_file_chunks(local_path)
+
+    flow._save_response = False
+    flow._cached = True
+    flow._mount_served = True
+    return True
+
+
+def _serve_cached(flow) -> bool:
+    """Serve a cache hit via mount path, redirect, or upstream rewrite.
+
+    Returns True if the response was served.  Returns False only when
+    mount_s3_path is configured but the file is missing on the mount —
+    the caller should fall through to let the request go upstream.
+    """
+    if getattr(ctx.options, "mount_s3_path", ""):
+        return _serve_from_mount(flow)
+    if getattr(ctx.options, "cache_redirect", False):
+        serve_cache_hit(flow)
+    else:
+        rewrite_upstream_to_cache(flow)
+    return True
 
 
 def release_banned():
@@ -1467,6 +1542,14 @@ class Proxy:
             default="",
             help="Comma-separated memcached servers (host:port) for metadata/vary cache; e.g. cache-0.cache:11211,cache-1.cache:11211",
         )
+        loader.add_option(
+            name="mount_s3_path",
+            typespec=str,
+            default=MOUNT_S3_PATH,
+            help="Local mount path for the S3 bucket. When set, cache hits are "
+                 "streamed from this path instead of redirecting to S3. "
+                 "(env: PASSSAGE_MOUNT_S3_PATH)",
+        )
 
     @_log_hook_errors("configure")
     def configure(self, updated):
@@ -1522,6 +1605,8 @@ class Proxy:
         flow._cached_method = None
         flow._vary_index_key = None
         flow._cache_saved = False
+        flow._mount_served = False
+        flow._mount_miss = False
         policy = flow._policy = get_policy(flow)
         if _is_s3_cache_request(flow):
             flow._save_response = False
@@ -1698,27 +1783,18 @@ class Proxy:
             if policy == NoRefresh:
                 flow._serve_reason = "cache_hit_norefresh"
                 LOG.debug("Cache hit: NoRefresh -> serve_cache_hit")
-                if getattr(ctx.options, "cache_redirect", False):
-                    serve_cache_hit(flow)
+                if _serve_cached(flow):
                     return
-                rewrite_upstream_to_cache(flow)
-                return
             if cache_fresh and policy in (Standard, StaleIfError):
                 flow._serve_reason = "cache_hit_fresh"
                 LOG.debug("Cache hit: fresh -> serve_cache_hit")
-                if getattr(ctx.options, "cache_redirect", False):
-                    serve_cache_hit(flow)
+                if _serve_cached(flow):
                     return
-                rewrite_upstream_to_cache(flow)
-                return
             if policy in (Standard, StaleIfError) and allow_stale_while_revalidate:
                 flow._serve_reason = "cache_hit_stale_while_revalidate"
                 LOG.debug("Cache hit: stale-while-revalidate -> serve_cache_hit")
-                if getattr(ctx.options, "cache_redirect", False):
-                    serve_cache_hit(flow)
+                if _serve_cached(flow):
                     return
-                rewrite_upstream_to_cache(flow)
-                return
         else:
             if (flow.request.method == "GET"
                     and flow.request.headers.get("if-modified-since")):
@@ -1799,22 +1875,16 @@ class Proxy:
                     and flow._upstream_head.status_code == 404
                     and (policy == StaleIfError or allow_stale_if_error)):
                 flow._serve_reason = "stale_if_error_upstream_404"
-                if getattr(ctx.options, "cache_redirect", False):
-                    serve_cache_hit(flow)
+                if _serve_cached(flow):
                     return
-                rewrite_upstream_to_cache(flow)
-                return
 
         # On upstream errors or if it's banned, StaleIfError may serve cached content.
         if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
             if cache_hit and (policy == StaleIfError or allow_stale_if_error):
                 flow._serve_reason = "stale_if_error_upstream_failed"
                 LOG.debug("Upstream failed -> rewrite_upstream_to_cache (StaleIfError)")
-                if getattr(ctx.options, "cache_redirect", False):
-                    serve_cache_hit(flow)
+                if _serve_cached(flow):
                     return
-                rewrite_upstream_to_cache(flow)
-                return
 
         # If upstream didn't respond (or banned) and we have a cache miss,
         # return a 504 HTTP error
@@ -1866,11 +1936,8 @@ class Proxy:
                 flow._serve_reason = "cache_hit_revalidated"
                 if flow._cache_key:
                     refresh_cache_metadata(flow._cache_key, flow._cache_head.headers)
-                if getattr(ctx.options, "cache_redirect", False):
-                    serve_cache_hit(flow)
+                if _serve_cached(flow):
                     return
-                rewrite_upstream_to_cache(flow)
-                return
             flow._serve_reason = "cache_revalidated_content_changed"
 
 
@@ -1935,7 +2002,9 @@ class Proxy:
         # Identify proxy via Via (RFC 7230); do not rewrite Server header
         existing_via = flow.response.headers.get("via", "")
         flow.response.headers["via"] = f"{VIA_HEADER_VALUE}, {existing_via}" if existing_via else VIA_HEADER_VALUE
-        if flow._save_response:
+        if getattr(flow, "_mount_served", False):
+            pass  # stream already configured in requestheaders
+        elif flow._save_response:
             orig_range = getattr(flow, "_orig_range", None)
             if (
                 orig_range
@@ -1975,7 +2044,8 @@ class Proxy:
         if flow._cached:
             # this is a cached response, rewrite headers from cache (origin Server preserved)
             LOG.debug("Cache response: serving from cache")
-            flow.response.headers["cache-status"] = f"{SERVER_NAME};hit;detail=stored"
+            detail = "mount" if getattr(flow, "_mount_served", False) else "stored"
+            flow.response.headers["cache-status"] = f"{SERVER_NAME};hit;detail={detail}"
             apply_cached_metadata(flow)
             if (stored_dt := cache_stored_at(flow.response.headers)):
                 stored_dt = stored_dt.astimezone(pytz.utc)

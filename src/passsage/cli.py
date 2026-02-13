@@ -288,6 +288,15 @@ import click
     help="Comma-separated memcached servers (host:port) for metadata/vary cache; "
     "e.g. cache-0.cache:11211,cache-1.cache:11211 (env: PASSSAGE_MEMCACHED_SERVERS)"
 )
+@click.option(
+    "--mount-s3-path",
+    envvar="PASSSAGE_MOUNT_S3_PATH",
+    default="",
+    show_default=False,
+    help="Local mount path for the S3 bucket. When set, cache hits are streamed "
+    "from this path instead of redirecting to S3. Requires mitmproxy with "
+    "iterable stream support. (env: PASSSAGE_MOUNT_S3_PATH)"
+)
 @click.version_option()
 @click.pass_context
 def main(
@@ -328,6 +337,7 @@ def main(
     mitm_ca_cert,
     mitm_ca,
     memcached_servers,
+    mount_s3_path,
 ):
     """
     Passsage (Pas³age) - S3-backed caching proxy.
@@ -392,6 +402,7 @@ def main(
             mitm_ca_cert,
             mitm_ca,
             memcached_servers,
+            mount_s3_path,
         )
 
 
@@ -455,6 +466,7 @@ def run_proxy(
     mitm_ca_cert=None,
     mitm_ca=None,
     memcached_servers="",
+    mount_s3_path="",
 ):
     if mitm_ca_cert or mitm_ca:
         _install_mitm_certs(mitm_ca_cert, mitm_ca)
@@ -552,6 +564,9 @@ def run_proxy(
     args.extend(["--set", f"connection_strategy={connection_strategy}"])
     if memcached_servers:
         args.extend(["--set", f"memcached_servers={memcached_servers}"])
+    if mount_s3_path:
+        os.environ["PASSSAGE_MOUNT_S3_PATH"] = mount_s3_path
+        args.extend(["--set", f"mount_s3_path={mount_s3_path}"])
 
     if verbose:
         args.extend(["-v"])
