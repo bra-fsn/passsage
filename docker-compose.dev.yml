@@ -10,6 +10,4 @@ services:
     volumes:
       - ./src:/app/src:ro
       - ./pyproject.toml:/app/pyproject.toml:ro
-    environment:
-      - S3_ENDPOINT_URL=http://localstack:4566
-      - S3_BUCKET=proxy-cache
+      - ${S3_MOUNT_HOST_PATH:-/tmp/passsage-s3mount}:/s3mount:ro
