@@ -27,7 +27,7 @@ import boto3
 import pytz
 import requests
 from requests.exceptions import ConnectionError as RequestsConnectionError
-from cachetools import TTLCache, cached
+from cachetools import TTLCache
 from mitmproxy import ctx, http
 from mitmproxy.script import concurrent
 from botocore.config import Config as BotoConfig
@@ -110,22 +110,6 @@ def _env_bool_default_true(name):
 HEALTH_PORT = int(os.environ.get("PASSSAGE_HEALTH_PORT", "8082"))
 HEALTH_HOST = os.environ.get("PASSSAGE_HEALTH_HOST", "0.0.0.0")
 HEALTH_CHECK_S3 = _env_bool_default_true("PASSSAGE_HEALTH_CHECK_S3")
-CACHE_REDIRECT = _env_bool("PASSSAGE_CACHE_REDIRECT")
-SIGNED_CACHE_REDIRECT = _env_bool_default_true("PASSSAGE_CACHE_REDIRECT_SIGNED_URL")
-CACHE_REDIRECT_SIGNED_URL_EXPIRES = int(
-    os.environ.get("PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES", "3600"), 10
-)
-PRESIGNED_URL_CACHE_MAXSIZE = int(
-    os.environ.get("PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE", "10000"), 10
-)
-PRESIGNED_URL_CACHE_TTL = max(1, int(CACHE_REDIRECT_SIGNED_URL_EXPIRES * 0.2))
-S3_PROXY_URL = os.environ.get("PASSSAGE_S3_PROXY_URL", "").strip().rstrip("/")
-_S3_PROXY_HOST = urlparse(S3_PROXY_URL).hostname if S3_PROXY_URL else None
-NO_REDIRECT_USER_AGENTS = frozenset(
-    ua.strip()
-    for ua in os.environ.get("PASSSAGE_NO_REDIRECT_USER_AGENTS", "pip/").split(",")
-    if ua.strip()
-)
 PUBLIC_PROXY_URL = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip()
 ACCESS_LOGS = _env_bool("PASSSAGE_ACCESS_LOGS")
 ACCESS_LOG_PREFIX = os.environ.get("PASSSAGE_ACCESS_LOG_PREFIX", "__passsage_logs__").strip()
@@ -212,53 +196,43 @@ def get_s3_client(tls=threading.local()):
 
 
 @dataclass
-class S3HeadResponse:
+class CacheMeta:
+    """Result of a cache metadata lookup.
+
+    *status_code* is 200 when metadata was found, 404 otherwise.
+    *meta* is the parsed JSON metadata dict (empty on miss).
+    *source* tracks where the metadata came from ("memcached" or "s3").
+    """
     status_code: int
-    headers: dict
+    meta: dict
     source: str = ""
 
 
-def s3_head_object(cache_key: str) -> S3HeadResponse:
+def _s3_get_json(key: str) -> dict | None:
+    """Read a JSON object from S3.  Returns the parsed dict or None on 404."""
     s3 = get_s3_client()
     try:
-        response = s3.head_object(Bucket=S3_BUCKET, Key=cache_key)
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(resp["Body"].read())
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code in ("404", "NoSuchKey", "NotFound"):
-            return S3HeadResponse(404, {})
+            return None
         raise
-    headers = {}
-    http_headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
-    headers.update(http_headers)
-    for key, value in (response.get("Metadata") or {}).items():
-        headers[f"x-amz-meta-{key}"] = value
-    return S3HeadResponse(200, headers)
+
+
+def _s3_put_json(key: str, data: dict) -> None:
+    """Write a JSON object to S3."""
+    get_s3_client().put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=json.dumps(data).encode("utf-8"),
+        ContentType="application/json",
+    )
 
 
 def _no_proxy_s3_hosts() -> str:
-    if _S3_ENDPOINT:
-        return S3_HOST
-    hosts = set()
-    if S3_PROXY_URL:
-        parsed = urlparse(S3_PROXY_URL)
-        if parsed.hostname:
-            hosts.add(parsed.hostname)
-    if CACHE_REDIRECT and not S3_PROXY_URL:
-        hosts.add(f"{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com")
-        hosts.add(f"{S3_BUCKET}.s3.amazonaws.com")
-        if SIGNED_CACHE_REDIRECT:
-            try:
-                url = get_s3_client().generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": S3_BUCKET, "Key": "__passsage_no_proxy_probe__"},
-                    ExpiresIn=60,
-                )
-                hosts.add(urlparse(url).hostname)
-            except Exception:
-                pass
-    if not hosts:
-        hosts.add(S3_HOST)
-    return ",".join(sorted(hosts))
+    return S3_HOST
 
 
 def load_proxy_env_script() -> bytes:
@@ -521,12 +495,7 @@ def _build_upstream_error_response(status_code: int, title: str, detail: str) ->
 
 
 def _is_s3_cache_request(flow: http.HTTPFlow) -> bool:
-    host = flow.request.pretty_host
-    if host == S3_HOST:
-        return True
-    if _S3_PROXY_HOST and host == _S3_PROXY_HOST:
-        return True
-    return False
+    return flow.request.pretty_host == S3_HOST
 
 
 def parse_cache_control(value: str) -> dict[str, str | bool]:
@@ -563,13 +532,11 @@ class RefreshPattern:
     max_seconds: int
     options: set[str]
 
-    def ttl_seconds(self, now: datetime, headers: dict[str, str]) -> int:
-        if (lastmod := headers.get("x-amz-meta-last-modified") or headers.get("last-modified")):
+    def ttl_seconds(self, now: datetime, meta: dict) -> int:
+        lastmod = meta.get("last_modified")
+        if lastmod:
             lastmod_dt = parse_date(lastmod)
-            if lastmod_dt:
-                age = max(0, int((now - lastmod_dt).total_seconds()))
-            else:
-                age = 0
+            age = max(0, int((now - lastmod_dt).total_seconds())) if lastmod_dt else 0
         else:
             age = 0
         ttl = self.min_seconds + int(age * (self.percent / 100))
@@ -603,14 +570,13 @@ def parse_refresh_patterns(spec: str) -> list[RefreshPattern]:
     return patterns
 
 
-def cache_stored_at(headers: dict[str, str]) -> datetime | None:
-    if (stored := headers.get("x-amz-meta-stored-at")):
+def cache_stored_at(meta: dict) -> datetime | None:
+    stored = meta.get("stored_at")
+    if stored is not None:
         try:
             return datetime.fromtimestamp(float(stored), tz=pytz.utc)
-        except ValueError:
+        except (ValueError, TypeError, OSError):
             return None
-    if (s3_lastmod := headers.get("last-modified")):
-        return parse_date(s3_lastmod)
     return None
 
 
@@ -627,15 +593,16 @@ class CacheFreshness:
 
 def cache_ttl_seconds(
     url: str,
-    headers: dict[str, str],
+    meta: dict,
     refresh_patterns: list[RefreshPattern],
     now: datetime,
     stored_at: datetime,
 ) -> int | None:
     for pattern in refresh_patterns:
         if pattern.pattern.search(url):
-            return pattern.ttl_seconds(now, headers)
-    cc = parse_cache_control(headers.get("cache-control", ""))
+            return pattern.ttl_seconds(now, meta)
+    hdrs = meta.get("headers", {})
+    cc = parse_cache_control(hdrs.get("cache-control", ""))
     if "no-store" in cc:
         return None
     if "no-cache" in cc:
@@ -650,11 +617,11 @@ def cache_ttl_seconds(
             return int(max_age)
         except ValueError:
             return None
-    if (exp := headers.get("expires")):
+    if (exp := hdrs.get("expires")):
         exp_dt = parse_date(exp)
         if exp_dt:
             return max(0, int((exp_dt - stored_at).total_seconds()))
-    if (lastmod := headers.get("x-amz-meta-last-modified") or headers.get("last-modified")):
+    if (lastmod := meta.get("last_modified")):
         lastmod_dt = parse_date(lastmod)
         if lastmod_dt:
             lifetime = max(0, int((now - lastmod_dt).total_seconds() * 0.1))
@@ -663,10 +630,10 @@ def cache_ttl_seconds(
 
 
 def cache_freshness(
-    url: str, headers: dict[str, str], refresh_patterns: list[RefreshPattern]
+    url: str, meta: dict, refresh_patterns: list[RefreshPattern]
 ) -> CacheFreshness:
     now = datetime.now(tz=pytz.utc)
-    stored_at = cache_stored_at(headers)
+    stored_at = cache_stored_at(meta)
     if stored_at is None:
         return CacheFreshness(
             age_seconds=0,
@@ -678,8 +645,9 @@ def cache_freshness(
             allow_stale_if_error=False,
         )
     age_seconds = max(0, int((now - stored_at).total_seconds()))
-    cc = parse_cache_control(headers.get("cache-control", ""))
-    ttl_seconds = cache_ttl_seconds(url, headers, refresh_patterns, now, stored_at)
+    hdrs = meta.get("headers", {})
+    cc = parse_cache_control(hdrs.get("cache-control", ""))
+    ttl_seconds = cache_ttl_seconds(url, meta, refresh_patterns, now, stored_at)
     is_fresh = ttl_seconds is not None and age_seconds < ttl_seconds
     stale_while_revalidate_seconds = parse_cache_control_seconds(cc, "stale-while-revalidate")
     stale_if_error_seconds = parse_cache_control_seconds(cc, "stale-if-error")
@@ -735,57 +703,33 @@ def _normalize_etag(value: str | None) -> str | None:
 
 
 def apply_cached_metadata(flow: http.HTTPFlow) -> None:
-    if (status_code := flow.response.headers.get("x-amz-meta-status-code")):
-        # When S3 returns 206 (honoring a Range header on the cached object),
-        # don't overwrite back to the stored 200 — the 206 is correct.
+    """Apply cached metadata from flow._cache_head to the response."""
+    meta = getattr(flow, "_cache_head", None)
+    if not meta or not meta.meta:
+        return
+    m = meta.meta
+    if (status_code := m.get("status_code")):
         if flow.response.status_code != 206:
             flow.response.status_code = int(status_code)
-    if (reason := flow.response.headers.get("x-amz-meta-reason")):
+    if (reason := m.get("reason")):
         flow.response.reason = reason
-    for k, v in flow.response.headers.items():
-        if not k.startswith("x-amz-meta-header-"):
-            continue
-        k = k.replace("x-amz-meta-header-", "")
+    for k, v in m.get("headers", {}).items():
         flow.response.headers[k] = v
-    if (lastmod := flow.response.headers.get("x-amz-meta-last-modified")):
+    if (lastmod := m.get("last_modified")):
         flow.response.headers["last-modified"] = lastmod
 
 
-def refresh_cache_metadata(cache_key: str, cache_headers: dict[str, str]) -> None:
-    metadata: dict[str, str] = {}
-    for key, value in cache_headers.items():
-        if key.lower().startswith("x-amz-meta-"):
-            metadata[key[len("x-amz-meta-"):]] = value
-    if not metadata:
-        return
-    metadata["stored-at"] = str(time.time())
-    copy_args = {
-        "Bucket": S3_BUCKET,
-        "Key": cache_key,
-        "CopySource": {"Bucket": S3_BUCKET, "Key": cache_key},
-        "Metadata": metadata,
-        "MetadataDirective": "REPLACE",
-    }
-    header_map = {
-        "content-type": "ContentType",
-        "content-encoding": "ContentEncoding",
-        "cache-control": "CacheControl",
-        "expires": "Expires",
-    }
-    for header, aws_key in header_map.items():
-        if header in cache_headers:
-            copy_args[aws_key] = cache_headers[header]
+def refresh_cache_metadata(cache_key: str, meta: dict) -> None:
+    """Update stored_at timestamp in the .meta JSON and sync to memcached."""
+    meta = dict(meta)
+    meta["stored_at"] = time.time()
     try:
-        s3 = get_s3_client()
-        s3.copy_object(**copy_args)
+        _s3_put_json(f"{cache_key}.meta", meta)
     except Exception as exc:
         LOG.warning("Cache metadata refresh failed for %s: %s", cache_key, exc)
     mc = _get_memcached_client()
     if mc:
         try:
-            meta = {k: v for k, v in cache_headers.items() if k.lower().startswith("x-amz-meta-")}
-            meta = {k[len("x-amz-meta-"):]: v for k, v in meta.items()}
-            meta["stored-at"] = str(time.time())
             _memcached_set_metadata(mc, cache_key, meta)
         except Exception as exc:
             LOG.debug("Memcached set on metadata refresh failed: %s", exc)
@@ -816,54 +760,46 @@ def _memcached_set_metadata(mc, cache_key: str, meta: dict) -> None:
     mc.set(_memcached_key(cache_key), json.dumps(meta), expire=0)
 
 
-def get_cache_metadata(cache_key: str) -> S3HeadResponse:
+def get_cache_metadata(cache_key: str) -> CacheMeta:
     mc = _get_memcached_client()
     if mc:
         try:
             raw = mc.get(_memcached_key(cache_key))
             if raw is not None:
                 meta = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
-                headers = {f"x-amz-meta-{k}": str(v) for k, v in meta.items()}
-                return S3HeadResponse(200, headers, source="memcached")
+                return CacheMeta(200, meta, source="memcached")
         except Exception as exc:
             LOG.debug("Memcached get for cache metadata failed: %s", exc)
-    head = s3_head_object(cache_key)
-    head.source = "s3"
-    if mc and head.status_code == 200:
+    data = _s3_get_json(f"{cache_key}.meta")
+    if data is None:
+        return CacheMeta(404, {}, source="s3")
+    if mc:
         try:
-            meta = {
-                k[len("x-amz-meta-"):]: v
-                for k, v in head.headers.items()
-                if k.lower().startswith("x-amz-meta-")
-            }
-            if meta:
-                _memcached_set_metadata(mc, cache_key, meta)
+            _memcached_set_metadata(mc, cache_key, data)
         except Exception as exc:
             LOG.debug("Memcached write-back for cache metadata failed: %s", exc)
-    return head
+    return CacheMeta(200, data, source="s3")
 
 
-def get_vary_index(vary_index_key: str) -> S3HeadResponse:
+def get_vary_index(vary_index_key: str) -> CacheMeta:
     mc = _get_memcached_client()
     if mc:
         try:
             raw = mc.get(_memcached_key(vary_index_key))
             if raw is not None:
                 data = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
-                vary = data.get("vary", "")
-                return S3HeadResponse(200, {"x-amz-meta-vary": vary}, source="memcached")
+                return CacheMeta(200, data, source="memcached")
         except Exception as exc:
             LOG.debug("Memcached get for vary index failed: %s", exc)
-    head = s3_head_object(vary_index_key)
-    head.source = "s3"
-    if mc and head.status_code == 200:
+    data = _s3_get_json(vary_index_key)
+    if data is None:
+        return CacheMeta(404, {}, source="s3")
+    if mc:
         try:
-            vary = head.headers.get("x-amz-meta-vary", "")
-            if vary:
-                mc.set(_memcached_key(vary_index_key), json.dumps({"vary": vary}), expire=0)
+            mc.set(_memcached_key(vary_index_key), json.dumps(data), expire=0)
         except Exception as exc:
             LOG.debug("Memcached write-back for vary index failed: %s", exc)
-    return head
+    return CacheMeta(200, data, source="s3")
 
 
 def get_refresh_patterns() -> list[RefreshPattern]:
@@ -1056,7 +992,6 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "content_encoding": response.headers.get("content-encoding") if response else None,
         "policy": getattr(flow, "_policy", None).__name__ if getattr(flow, "_policy", None) else None,
         "cached": getattr(flow, "_cached", None),
-        "cache_redirect": getattr(flow, "_cache_redirect", None),
         "cache_key": getattr(flow, "_cache_key", None),
         "cache_vary": getattr(flow, "_cache_vary", None),
         "cache_hit": getattr(flow, "_cache_hit", None),
@@ -1067,9 +1002,9 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "upstream_error": str(upstream_error) if upstream_error else None,
         "upstream_head_time_ms": upstream_head_time,
         "cache_head_status": cache_head.status_code if cache_head else None,
-        "cache_head_etag": cache_head.headers.get("x-amz-meta-header-etag") if cache_head else None,
-        "cache_head_last_modified": cache_head.headers.get("x-amz-meta-last-modified") if cache_head else None,
-        "cache_head_method": cache_head.headers.get("x-amz-meta-method") if cache_head else None,
+        "cache_head_etag": cache_head.meta.get("headers", {}).get("etag") if cache_head else None,
+        "cache_head_last_modified": cache_head.meta.get("last_modified") if cache_head else None,
+        "cache_head_method": cache_head.meta.get("method") if cache_head else None,
         "metadata_source": getattr(flow, "_metadata_source", None),
         "serve_reason": getattr(flow, "_serve_reason", None),
         "cached_method": getattr(flow, "_cached_method", None),
@@ -1140,7 +1075,6 @@ def _build_error_log_record(
         "response_headers": response_headers,
         "policy": policy.__name__ if policy else None,
         "cached": getattr(flow, "_cached", None) if flow else None,
-        "cache_redirect": getattr(flow, "_cache_redirect", None) if flow else None,
         "cache_key": getattr(flow, "_cache_key", None) if flow else None,
         "cache_vary": getattr(flow, "_cache_vary", None) if flow else None,
         "serve_reason": getattr(flow, "_serve_reason", None) if flow else None,
@@ -1180,88 +1114,6 @@ def build_vary_request(vary_header: str, request_headers) -> str | None:
     return "|".join(parts)
 
 
-def get_cache_url(flow, key_override: str | None = None):
-    key = key_override or get_cache_key(_normalize_url(flow))
-    return f"{S3_URL}/{key}"
-
-
-_presigned_url_cache = TTLCache(
-    maxsize=PRESIGNED_URL_CACHE_MAXSIZE,
-    ttl=PRESIGNED_URL_CACHE_TTL,
-)
-
-
-@cached(
-    cache=_presigned_url_cache,
-    key=lambda flow: getattr(flow, "_cache_key", None) or get_cache_key(_normalize_url(flow)),
-)
-def get_cache_redirect_url(flow) -> str:
-    cache_key = getattr(flow, "_cache_key", None) or get_cache_key(_normalize_url(flow))
-    proxy_url = getattr(ctx.options, "s3_proxy_url", "") or S3_PROXY_URL
-    if proxy_url:
-        return f"{proxy_url.rstrip('/')}/{cache_key}"
-    if getattr(ctx.options, "cache_redirect_signed_url", False):
-        expires = getattr(
-            ctx.options, "cache_redirect_signed_url_expires", CACHE_REDIRECT_SIGNED_URL_EXPIRES
-        )
-        return get_s3_client().generate_presigned_url(
-            "get_object",
-            Params={"Bucket": S3_BUCKET, "Key": cache_key},
-            ExpiresIn=expires,
-        )
-    path_prefix = f"/{S3_BUCKET}/" if S3_PATH_STYLE else "/"
-    scheme = S3_SCHEME if _S3_ENDPOINT else "https"
-    port = S3_PORT if _S3_ENDPOINT else 443
-    host = S3_HOST
-    if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
-        netloc = host
-    else:
-        netloc = f"{host}:{port}"
-    return f"{scheme}://{netloc}{path_prefix}{cache_key}"
-
-
-def _should_skip_redirect(flow) -> bool:
-    raw = getattr(ctx.options, "no_redirect_user_agents", "") or ""
-    prefixes = [p.strip() for p in raw.split(",") if p.strip()] if raw else list(NO_REDIRECT_USER_AGENTS)
-    if not prefixes:
-        return False
-    ua = flow.request.headers.get("user-agent", "")
-    return any(ua.startswith(prefix) for prefix in prefixes)
-
-
-def serve_cache_hit(flow) -> None:
-    if _should_skip_redirect(flow):
-        LOG.debug("Skipping redirect for user-agent: %s", flow.request.headers.get("user-agent", ""))
-        rewrite_upstream_to_cache(flow)
-        return
-    status = 302 if flow.request.method == "GET" else 307
-    location = get_cache_redirect_url(flow)
-    flow.response = http.Response.make(status, b"", {"Location": location})
-    flow._save_response = False
-    flow._cached = True
-    flow._cache_redirect = True
-
-
-def rewrite_upstream_to_cache(flow):
-    if getattr(flow, "_req_orig_url", None):
-        # We've been already called, don't rewrite again
-        return
-    flow._req_orig_url = flow.request.url
-    redirect_url = get_cache_redirect_url(flow)
-    LOG.debug("Cache redirect url=%s", redirect_url)
-    parsed = urlparse(redirect_url)
-    flow.request.scheme = parsed.scheme
-    flow.request.host = parsed.hostname
-    flow.request.port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    flow.request.path = parsed.path
-    if parsed.query:
-        flow.request.path = f"{parsed.path}?{parsed.query}"
-    # we don't want to save the cache response
-    flow._save_response = False
-    # mark this response as returned from the cache
-    flow._cached = True
-
-
 _MOUNT_CHUNK_SIZE = 64 * 1024
 
 
@@ -1272,14 +1124,12 @@ def _mount_file_chunks(path: Path):
 
 
 def _serve_from_mount(flow) -> bool:
-    """Try to serve a cache hit from the local S3 mount path.
+    """Serve a cache hit from the local S3 mount path.
 
     Returns True if the response was served, False if the mount file is
     missing (the caller should fall through to upstream).
     """
-    mount_path = getattr(ctx.options, "mount_s3_path", "") or ""
-    if not mount_path:
-        return False
+    mount_path = ctx.options.mount_s3_path
     cache_key = flow._cache_key
     if not cache_key:
         return False
@@ -1296,18 +1146,12 @@ def _serve_from_mount(flow) -> bool:
         flow._mount_miss = True
         return False
 
-    ct = "application/octet-stream"
-    headers = {}
-    if flow._cache_head:
-        ct = flow._cache_head.headers.get("content-type", ct)
-        for k, v in flow._cache_head.headers.items():
-            if k.startswith("x-amz-meta-"):
-                headers[k] = v
+    meta = flow._cache_head.meta if flow._cache_head else {}
+    cached_headers = meta.get("headers", {})
+    ct = cached_headers.get("content-type", "application/octet-stream")
 
     flow.response = http.Response.make(200, b"", {"Content-Type": ct})
     flow.response.headers["content-length"] = str(size)
-    for k, v in headers.items():
-        flow.response.headers[k] = v
 
     if flow.request.method != "HEAD":
         flow.response.stream = _mount_file_chunks(local_path)
@@ -1317,21 +1161,6 @@ def _serve_from_mount(flow) -> bool:
     flow._mount_served = True
     return True
 
-
-def _serve_cached(flow) -> bool:
-    """Serve a cache hit via mount path, redirect, or upstream rewrite.
-
-    Returns True if the response was served.  Returns False only when
-    mount_s3_path is configured but the file is missing on the mount —
-    the caller should fall through to let the request go upstream.
-    """
-    if getattr(ctx.options, "mount_s3_path", ""):
-        return _serve_from_mount(flow)
-    if getattr(ctx.options, "cache_redirect", False):
-        serve_cache_hit(flow)
-    else:
-        rewrite_upstream_to_cache(flow)
-    return True
 
 
 def release_banned():
@@ -1432,45 +1261,6 @@ class Proxy:
                  "Env: PASSSAGE_PUBLIC_PROXY_URL",
         )
         loader.add_option(
-            name="cache_redirect",
-            typespec=bool,
-            default=CACHE_REDIRECT,
-            help="Return a redirect to the cached S3 object on cache hits",
-        )
-        loader.add_option(
-            name="s3_proxy_url",
-            typespec=str,
-            default=S3_PROXY_URL,
-            help="Redirect cache hits to this S3 proxy URL instead of S3 directly "
-                 "(env: PASSSAGE_S3_PROXY_URL)",
-        )
-        loader.add_option(
-            name="no_redirect_user_agents",
-            typespec=str,
-            default=",".join(NO_REDIRECT_USER_AGENTS),
-            help="Comma-separated User-Agent prefixes that should not receive "
-                 "cache-hit redirects. Matching clients are served through the "
-                 "proxy instead. (env: PASSSAGE_NO_REDIRECT_USER_AGENTS)",
-        )
-        loader.add_option(
-            name="cache_redirect_signed_url",
-            typespec=bool,
-            default=SIGNED_CACHE_REDIRECT,
-            help="Redirect cache hits to a signed S3 URL instead of public S3 access",
-        )
-        loader.add_option(
-            name="cache_redirect_signed_url_expires",
-            typespec=int,
-            default=CACHE_REDIRECT_SIGNED_URL_EXPIRES,
-            help="Presigned URL expiration in seconds (env: PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES)",
-        )
-        loader.add_option(
-            name="presigned_url_cache_maxsize",
-            typespec=int,
-            default=PRESIGNED_URL_CACHE_MAXSIZE,
-            help="Max entries for presigned URL TTL cache (env: PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE)",
-        )
-        loader.add_option(
             name="access_logs",
             typespec=bool,
             default=ACCESS_LOGS,
@@ -1546,9 +1336,8 @@ class Proxy:
             name="mount_s3_path",
             typespec=str,
             default=MOUNT_S3_PATH,
-            help="Local mount path for the S3 bucket. When set, cache hits are "
-                 "streamed from this path instead of redirecting to S3. "
-                 "(env: PASSSAGE_MOUNT_S3_PATH)",
+            help="Local mount path for the S3 bucket (required). Cache hits are "
+                 "streamed from this path. (env: PASSSAGE_MOUNT_S3_PATH)",
         )
 
     @_log_hook_errors("configure")
@@ -1593,7 +1382,6 @@ class Proxy:
         flow._access_log_start = time.time()
         # we mark this flow as cached only if it returns data from the cache
         flow._cached = False
-        flow._cache_redirect = False
         flow._cache_hit = False
         flow._cache_fresh = False
         flow._allow_stale_while_revalidate = False
@@ -1670,7 +1458,7 @@ class Proxy:
                 vary_index_head.source,
                 vary_index_key,
             )
-            if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.headers.get("x-amz-meta-vary")):
+            if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.meta.get("vary")):
                 flow._cache_vary = vary_hdr
                 if "*" not in vary_hdr:
                     vary_key = compute_vary_key(vary_hdr, flow.request.headers)
@@ -1697,8 +1485,8 @@ class Proxy:
         except Exception as e:
             # if S3 is unavailable, go to upstream directly
             LOG.warning(
-                "HTTP HEAD to\n%s\nhas failed with:\n%s",
-                get_cache_url(flow),
+                "Cache metadata lookup failed for key=%s: %s",
+                flow._cache_key,
                 e,
             )
             _log_exception(
@@ -1725,26 +1513,27 @@ class Proxy:
         # only HEAD can be served
         cached_method = False
         if http_2xx(flow._cache_head):
-            meta_method = flow._cache_head.headers.get("x-amz-meta-method")
+            meta_method = flow._cache_head.meta.get("method")
             if meta_method is None:
                 cached_method = True
             elif meta_method == "GET" or meta_method == flow.request.method:
                 cached_method = True
         flow._cached_method = cached_method
         if flow._cache_head is not None:
+            m = flow._cache_head.meta
             LOG.debug(
                 "Cache metadata status=%s method_meta=%s etag_meta=%s lastmod_meta=%s",
-                getattr(flow._cache_head, "status_code", None),
-                flow._cache_head.headers.get("x-amz-meta-method"),
-                flow._cache_head.headers.get("x-amz-meta-header-etag"),
-                flow._cache_head.headers.get("x-amz-meta-last-modified"),
+                flow._cache_head.status_code,
+                m.get("method"),
+                m.get("headers", {}).get("etag"),
+                m.get("last_modified"),
             )
             LOG.debug("Cache method match cached_method=%s", cached_method)
 
         refresh_patterns = get_refresh_patterns()
         cache_hit = http_2xx(flow._cache_head) and cached_method
         freshness = (
-            cache_freshness(flow.request.url, flow._cache_head.headers, refresh_patterns)
+            cache_freshness(flow.request.url, flow._cache_head.meta, refresh_patterns)
             if cache_hit
             else None
         )
@@ -1782,18 +1571,18 @@ class Proxy:
         if cache_hit:
             if policy == NoRefresh:
                 flow._serve_reason = "cache_hit_norefresh"
-                LOG.debug("Cache hit: NoRefresh -> serve_cache_hit")
-                if _serve_cached(flow):
+                LOG.debug("Cache hit: NoRefresh -> serve from mount")
+                if _serve_from_mount(flow):
                     return
             if cache_fresh and policy in (Standard, StaleIfError):
                 flow._serve_reason = "cache_hit_fresh"
-                LOG.debug("Cache hit: fresh -> serve_cache_hit")
-                if _serve_cached(flow):
+                LOG.debug("Cache hit: fresh -> serve from mount")
+                if _serve_from_mount(flow):
                     return
             if policy in (Standard, StaleIfError) and allow_stale_while_revalidate:
                 flow._serve_reason = "cache_hit_stale_while_revalidate"
-                LOG.debug("Cache hit: stale-while-revalidate -> serve_cache_hit")
-                if _serve_cached(flow):
+                LOG.debug("Cache hit: stale-while-revalidate -> serve from mount")
+                if _serve_from_mount(flow):
                     return
         else:
             if (flow.request.method == "GET"
@@ -1838,9 +1627,10 @@ class Proxy:
                         or k.lower() in ("x-sleep", "x-status-code")):
                     upstream_hdrs[k] = v
             if cache_hit and policy in (Standard, StaleIfError):
-                if (etag := flow._cache_head.headers.get("x-amz-meta-header-etag")):
+                cm = flow._cache_head.meta
+                if (etag := cm.get("headers", {}).get("etag")):
                     upstream_hdrs["If-None-Match"] = etag
-                if (lastmod := flow._cache_head.headers.get("x-amz-meta-last-modified")):
+                if (lastmod := cm.get("last_modified")):
                     upstream_hdrs["If-Modified-Since"] = lastmod
             try:
                 timeout = getattr(ctx.options, "upstream_head_timeout", UPSTREAM_TIMEOUT)
@@ -1875,15 +1665,15 @@ class Proxy:
                     and flow._upstream_head.status_code == 404
                     and (policy == StaleIfError or allow_stale_if_error)):
                 flow._serve_reason = "stale_if_error_upstream_404"
-                if _serve_cached(flow):
+                if _serve_from_mount(flow):
                     return
 
         # On upstream errors or if it's banned, StaleIfError may serve cached content.
         if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
             if cache_hit and (policy == StaleIfError or allow_stale_if_error):
                 flow._serve_reason = "stale_if_error_upstream_failed"
-                LOG.debug("Upstream failed -> rewrite_upstream_to_cache (StaleIfError)")
-                if _serve_cached(flow):
+                LOG.debug("Upstream failed -> serve from mount (StaleIfError)")
+                if _serve_from_mount(flow):
                     return
 
         # If upstream didn't respond (or banned) and we have a cache miss,
@@ -1923,9 +1713,9 @@ class Proxy:
             # match, the content is identical regardless of Last-Modified differences
             # (e.g. cache stored None but upstream now returns a value).
             upstream_etag = _normalize_etag(flow._upstream_head.headers.get("etag"))
-            cached_etag = _normalize_etag(flow._cache_head.headers.get("x-amz-meta-header-etag"))
+            cached_etag = _normalize_etag(flow._cache_head.meta.get("headers", {}).get("etag"))
             upstream_lastmod = flow._upstream_head.headers.get("last-modified")
-            cached_lastmod = flow._cache_head.headers.get("x-amz-meta-last-modified")
+            cached_lastmod = flow._cache_head.meta.get("last_modified")
             if upstream_etag and cached_etag:
                 content_unchanged = upstream_etag == cached_etag
             elif upstream_lastmod or cached_lastmod:
@@ -1934,9 +1724,13 @@ class Proxy:
                 content_unchanged = False
             if content_unchanged:
                 flow._serve_reason = "cache_hit_revalidated"
-                if flow._cache_key:
-                    refresh_cache_metadata(flow._cache_key, flow._cache_head.headers)
-                if _serve_cached(flow):
+                if _serve_from_mount(flow):
+                    if flow._cache_key:
+                        ctx._executor.submit(
+                            refresh_cache_metadata,
+                            flow._cache_key,
+                            flow._cache_head.meta,
+                        )
                     return
             flow._serve_reason = "cache_revalidated_content_changed"
 
@@ -1946,18 +1740,6 @@ class Proxy:
         request_id = getattr(flow, "id", None)
         if request_id is not None:
             flow.response.headers["x-request-id"] = str(request_id)
-        if getattr(flow, "_cache_redirect", False):
-            flow.response.headers["x-proxy-policy"] = flow._policy.__name__
-            existing_via = flow.response.headers.get("via", "")
-            flow.response.headers["via"] = (
-                f"{VIA_HEADER_VALUE}, {existing_via}" if existing_via else VIA_HEADER_VALUE
-            )
-            flow.response.headers["cache-status"] = f"{SERVER_NAME};hit;detail=redirect"
-            if flow._cache_head and (stored_dt := cache_stored_at(flow._cache_head.headers)):
-                stored_dt = stored_dt.astimezone(pytz.utc)
-                age_seconds = int((datetime.now(tz=pytz.utc) - stored_dt).total_seconds())
-                flow.response.headers["age"] = str(max(0, age_seconds))
-            return
         if (
             not flow._cached
             and flow._cache_head
@@ -1968,29 +1750,8 @@ class Proxy:
             )
             and (flow._policy == StaleIfError or getattr(flow, "_allow_stale_if_error", False))
         ):
-            cache_key = flow._cache_key or get_cache_key(flow.request.url)
-            try:
-                cached_resp = requests.get(
-                    get_cache_url(flow, cache_key),
-                    timeout=CACHE_TIMEOUT,
-                )
-                if http_2xx(cached_resp):
-                    flow._serve_reason = "stale_if_error_fallback"
-                    flow.response = http.Response.make(
-                        cached_resp.status_code,
-                        cached_resp.content,
-                        dict(cached_resp.headers),
-                    )
-                    flow._cached = True
-                    flow._save_response = False
-            except Exception as e:
-                LOG.debug("Cache fallback fetch failed: %s", e)
-                _log_exception(
-                    e,
-                    flow=flow,
-                    context={"hook": "responseheaders", "stage": "cache_fallback"},
-                    error_type="cache_fallback_error",
-                )
+            if _serve_from_mount(flow):
+                flow._serve_reason = "stale_if_error_fallback"
 
         flow.response.headers["x-proxy-policy"] = flow._policy.__name__
         if getattr(flow, "_serve_reason", None) == "no_cache_s3_request":
@@ -2042,18 +1803,16 @@ class Proxy:
         else:
             flow.response.stream = True
         if flow._cached:
-            # this is a cached response, rewrite headers from cache (origin Server preserved)
             LOG.debug("Cache response: serving from cache")
-            detail = "mount" if getattr(flow, "_mount_served", False) else "stored"
-            flow.response.headers["cache-status"] = f"{SERVER_NAME};hit;detail={detail}"
+            flow.response.headers["cache-status"] = f"{SERVER_NAME};hit;detail=mount"
             apply_cached_metadata(flow)
-            if (stored_dt := cache_stored_at(flow.response.headers)):
+            meta = flow._cache_head.meta if flow._cache_head else {}
+            if (stored_dt := cache_stored_at(meta)):
                 stored_dt = stored_dt.astimezone(pytz.utc)
                 age_seconds = int((datetime.now(tz=pytz.utc) - stored_dt).total_seconds())
                 flow.response.headers["age"] = str(max(0, age_seconds))
         else:
             LOG.debug("Cache response: not cached")
-            apply_cached_metadata(flow)
         if flow.response.headers.get("last-modified"):
             # if the response has a last-modified header and we got
             # if-modified-since, compare the two and return 304 accordingly
@@ -2084,69 +1843,74 @@ class Proxy:
         normalized_url,
     ):
         try:
-            extras = {"Metadata": {
-                "status-code": str(status_code),
-                "reason": reason,
-                "method": method,
-            }}
             s3 = get_s3_client()
             f.flush()
             f.seek(0)
-            extras["Metadata"]["sha224"] = digest
-            extras["Metadata"]["stored-at"] = str(time.time())
-            extras["Metadata"]["url"] = url[:512]
-            if vary_header:
-                extras["Metadata"]["vary"] = vary_header
-            if vary_request:
-                extras["Metadata"]["vary-request"] = vary_request
-            if "last-modified" in headers:
-                extras["Metadata"]["last-modified"] = headers["last-modified"]
-            # cache any headers, which we'll return unmodified when responding
-            # from the cache. S3 limits the size of metadata and possibly
-            # responds with MetadataTooLarge if it gets too large...
+
+            # 1. Upload the data object (immutable, no metadata)
+            extra_args = {}
+            s3_header_map = {
+                "content-type": "ContentType",
+                "content-encoding": "ContentEncoding",
+            }
+            for header, aws_key in s3_header_map.items():
+                if header in headers:
+                    extra_args[aws_key] = headers[header]
+            s3.upload_fileobj(f, S3_BUCKET, cache_key, ExtraArgs=extra_args or None)
+
+            # 2. Build and write the .meta JSON
+            cached_headers = {}
             for k in (
-                "location",
                 "etag",
                 "vary",
+                "cache-control",
+                "content-type",
+                "content-encoding",
+                "content-length",
                 "content-language",
                 "content-disposition",
                 "content-location",
                 "content-range",
                 "accept-ranges",
+                "location",
                 "link",
-                "cache-control",
+                "expires",
             ):
-                if k not in headers:
-                    continue
-                extras["Metadata"][f"header-{k}"] = headers[k]
-            # map HTTP headers to AWS S3 ExtraArgs
-            m = {
-                "content-type": "ContentType",
-                "content-encoding": "ContentEncoding",
-                "cache-control": "CacheControl",
-                "expires": "Expires",
+                if k in headers:
+                    cached_headers[k] = headers[k]
+
+            meta = {
+                "status_code": int(status_code),
+                "reason": reason,
+                "method": method,
+                "sha224": digest,
+                "stored_at": time.time(),
+                "url": url[:512],
+                "last_modified": headers.get("last-modified"),
+                "headers": cached_headers,
             }
-            for header, aws_key in m.items():
-                if header in headers:
-                    extras[aws_key] = headers[header]
-            s3.upload_fileobj(f, S3_BUCKET, cache_key, ExtraArgs=extras)
+            if vary_header:
+                meta["vary"] = vary_header
+            if vary_request:
+                meta["vary_request"] = vary_request
+
+            _s3_put_json(f"{cache_key}.meta", meta)
+
             mc = _get_memcached_client()
             if mc:
                 try:
-                    _memcached_set_metadata(mc, cache_key, extras["Metadata"])
+                    _memcached_set_metadata(mc, cache_key, meta)
                 except Exception as mc_exc:
                     LOG.debug("Memcached set after cache save failed: %s", mc_exc)
+
+            # 3. Write the vary index (if applicable)
             if vary_header:
                 vary_index_key = get_vary_index_key(normalized_url)
-                vary_meta = {"vary": vary_header}
-                s3.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=vary_index_key,
-                    Metadata=vary_meta,
-                )
+                vary_data = {"vary": vary_header}
+                _s3_put_json(vary_index_key, vary_data)
                 if mc:
                     try:
-                        mc.set(_memcached_key(vary_index_key), json.dumps(vary_meta), expire=0)
+                        mc.set(_memcached_key(vary_index_key), json.dumps(vary_data), expire=0)
                     except Exception as mc_exc:
                         LOG.debug("Memcached set for vary index failed: %s", mc_exc)
         except Exception as e:
@@ -2223,14 +1987,11 @@ class Proxy:
             and flow.request.method == "GET"
             and flow._counter in self.hashes
         ):
-            # check if the downloaded file and the cached are the same and if
-            # so, don't save it again
-            if self.hashes[flow._counter].hexdigest() == flow._cache_head.headers.get("x-amz-meta-sha224"):
+            if self.hashes[flow._counter].hexdigest() == flow._cache_head.meta.get("sha224"):
                 flow._save_response = False
-        if flow._cache_head:
-            # only store HEAD responses if we haven't yet completed a GET
+        if flow._cache_head and flow._cache_head.meta:
             if (flow.request.method == "HEAD"
-                    and flow._cache_head.headers["x-amz-meta-method"] == "GET"):
+                    and flow._cache_head.meta.get("method") == "GET"):
                 flow._save_response = False
         if flow._save_response:
             # save in the background

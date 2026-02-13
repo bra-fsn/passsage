@@ -100,55 +100,6 @@ import click
     help="Allow client policy override via X-Passsage-Policy (env: PASSSAGE_ALLOW_POLICY_HEADER)"
 )
 @click.option(
-    "--cache-redirect",
-    is_flag=True,
-    default=False,
-    envvar="PASSSAGE_CACHE_REDIRECT",
-    show_default=True,
-    help="Redirect cache hits to S3 instead of streaming through the proxy (env: PASSSAGE_CACHE_REDIRECT)"
-)
-@click.option(
-    "--s3-proxy-url",
-    envvar="PASSSAGE_S3_PROXY_URL",
-    default="",
-    show_default=True,
-    help="On cache hit, redirect to this S3 proxy URL instead of S3 directly. "
-    "Requires --cache-redirect. (env: PASSSAGE_S3_PROXY_URL)"
-)
-@click.option(
-    "--no-redirect-user-agents",
-    envvar="PASSSAGE_NO_REDIRECT_USER_AGENTS",
-    default="pip/",
-    show_default=True,
-    help="Comma-separated list of User-Agent prefixes that should not receive "
-    "cache-hit redirects. Matching clients are served through the proxy instead. "
-    "Useful for clients like pip that ignore NO_PROXY. "
-    "(env: PASSSAGE_NO_REDIRECT_USER_AGENTS)"
-)
-@click.option(
-    "--cache-redirect-signed-url/--cache-redirect-public",
-    envvar="PASSSAGE_CACHE_REDIRECT_SIGNED_URL",
-    default=True,
-    show_default=True,
-    help="Redirect cache hits to signed S3 URLs (env: PASSSAGE_CACHE_REDIRECT_SIGNED_URL)"
-)
-@click.option(
-    "--cache-redirect-signed-url-expires",
-    type=int,
-    default=3600,
-    envvar="PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES",
-    show_default=True,
-    help="Presigned URL expiration in seconds (env: PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES)",
-)
-@click.option(
-    "--presigned-url-cache-maxsize",
-    type=int,
-    default=10000,
-    envvar="PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE",
-    show_default=True,
-    help="Max entries for presigned URL TTL cache (env: PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE)",
-)
-@click.option(
     "--public-proxy-url",
     envvar="PASSSAGE_PUBLIC_PROXY_URL",
     default="",
@@ -291,11 +242,9 @@ import click
 @click.option(
     "--mount-s3-path",
     envvar="PASSSAGE_MOUNT_S3_PATH",
-    default="",
-    show_default=False,
-    help="Local mount path for the S3 bucket. When set, cache hits are streamed "
-    "from this path instead of redirecting to S3. Requires mitmproxy with "
-    "iterable stream support. (env: PASSSAGE_MOUNT_S3_PATH)"
+    required=True,
+    help="Local mount path for the S3 bucket (required). Cache hits are streamed "
+    "from this path. (env: PASSSAGE_MOUNT_S3_PATH)"
 )
 @click.version_option()
 @click.pass_context
@@ -313,12 +262,6 @@ def main(
     web,
     policy_file,
     allow_policy_header,
-    cache_redirect,
-    s3_proxy_url,
-    no_redirect_user_agents,
-    cache_redirect_signed_url,
-    cache_redirect_signed_url_expires,
-    presigned_url_cache_maxsize,
     public_proxy_url,
     access_logs,
     access_log_prefix,
@@ -361,10 +304,6 @@ def main(
         passsage -m transparent
     """
     if ctx.invoked_subcommand is None:
-        if s3_proxy_url and not cache_redirect:
-            raise click.UsageError(
-                "--s3-proxy-url requires --cache-redirect"
-            )
         run_proxy(
             port,
             bind,
@@ -378,12 +317,6 @@ def main(
             web,
             policy_file,
             allow_policy_header,
-            cache_redirect,
-            s3_proxy_url,
-            no_redirect_user_agents,
-            cache_redirect_signed_url,
-            cache_redirect_signed_url_expires,
-            presigned_url_cache_maxsize,
             public_proxy_url,
             access_logs,
             access_log_prefix,
@@ -442,12 +375,6 @@ def run_proxy(
     web,
     policy_file,
     allow_policy_header,
-    cache_redirect,
-    s3_proxy_url,
-    no_redirect_user_agents,
-    cache_redirect_signed_url,
-    cache_redirect_signed_url_expires,
-    presigned_url_cache_maxsize,
     public_proxy_url,
     access_logs,
     access_log_prefix,
@@ -479,15 +406,6 @@ def run_proxy(
         os.environ["PASSSAGE_POLICY_FILE"] = policy_file
     if allow_policy_header:
         os.environ["PASSSAGE_ALLOW_POLICY_HEADER"] = "1"
-    if cache_redirect:
-        os.environ["PASSSAGE_CACHE_REDIRECT"] = "1"
-    if s3_proxy_url:
-        os.environ["PASSSAGE_S3_PROXY_URL"] = s3_proxy_url
-    if no_redirect_user_agents:
-        os.environ["PASSSAGE_NO_REDIRECT_USER_AGENTS"] = no_redirect_user_agents
-    os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL"] = "1" if cache_redirect_signed_url else "0"
-    os.environ["PASSSAGE_CACHE_REDIRECT_SIGNED_URL_EXPIRES"] = str(cache_redirect_signed_url_expires)
-    os.environ["PASSSAGE_PRESIGNED_URL_CACHE_MAXSIZE"] = str(presigned_url_cache_maxsize)
     if public_proxy_url:
         os.environ["PASSSAGE_PUBLIC_PROXY_URL"] = public_proxy_url
     if access_logs:
@@ -548,25 +466,14 @@ def run_proxy(
         args.extend(["--set", f"policy_file={policy_file}"])
     if allow_policy_header:
         args.extend(["--set", "allow_policy_header=true"])
-    if cache_redirect:
-        args.extend(["--set", "cache_redirect=true"])
-    if s3_proxy_url:
-        args.extend(["--set", f"s3_proxy_url={s3_proxy_url}"])
-    if no_redirect_user_agents:
-        args.extend(["--set", f"no_redirect_user_agents={no_redirect_user_agents}"])
-    if cache_redirect_signed_url:
-        args.extend(["--set", "cache_redirect_signed_url=true"])
-    args.extend(["--set", f"cache_redirect_signed_url_expires={cache_redirect_signed_url_expires}"])
-    args.extend(["--set", f"presigned_url_cache_maxsize={presigned_url_cache_maxsize}"])
     if public_proxy_url:
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
     args.extend(["--set", f"connection_strategy={connection_strategy}"])
     if memcached_servers:
         args.extend(["--set", f"memcached_servers={memcached_servers}"])
-    if mount_s3_path:
-        os.environ["PASSSAGE_MOUNT_S3_PATH"] = mount_s3_path
-        args.extend(["--set", f"mount_s3_path={mount_s3_path}"])
+    os.environ["PASSSAGE_MOUNT_S3_PATH"] = mount_s3_path
+    args.extend(["--set", f"mount_s3_path={mount_s3_path}"])
 
     if verbose:
         args.extend(["-v"])

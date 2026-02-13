@@ -30,85 +30,17 @@ See https://docs.mitmproxy.org/stable/concepts/how-mitmproxy-works/ for the deta
 Passsage resolves each request to a cache policy, then uses S3 object metadata to decide
 whether to serve from cache or go upstream. In brief:
 
-- Cache hits are served by rewriting the request to the S3 object (Cache-Status is set to
-  `hit` and `Age` is derived from the stored timestamp).
-- Optionally, cache hits can be redirected to S3 (to avoid proxying bytes), using
-  `--cache-redirect` or `PASSSAGE_CACHE_REDIRECT=1`. Signed URLs are the default for
-  cache redirects and do not require a public bucket policy. Use
-  `--cache-redirect-public` (or `PASSSAGE_CACHE_REDIRECT_SIGNED_URL=0`) to redirect
-  to public S3 objects instead.
-- When `--s3-proxy-url` is set (requires `--cache-redirect`), cache hit redirects
-  point to the given S3 proxy instead of S3 directly. This is useful with a
-  parallelizing proxy such as [xs3lerator](https://github.com/bra-fsn/xs3lerator)
-  that fetches objects via multiple concurrent byte-range requests. As of early
-  2026, a single HTTP stream to S3 within the same region/AZ reaches only
-  **~60 MiB/s** (Standard class) or **~150 MiB/s** (Express One Zone / directory
-  buckets). A parallelizing proxy can sustain several GiB/s from the same bucket,
-  which matters for large cached objects such as ML model checkpoints, datasets,
-  or container images.
+- Cache hits are streamed from a local mount of the S3 bucket (`--mount-s3-path`,
+  required). The mount is typically provided by `mountpoint-s3` or `s3fs`.
+  `Cache-Status` is set to `hit` and `Age` is derived from the stored timestamp.
+- Object metadata is stored in separate `.meta` JSON objects in S3 and cached in
+  memcached for fast lookups. The data objects themselves are immutable.
 - S3 cache keys use the format `<scheme>/<host>/<sha224>[.<ext>]`
-  (e.g. `https/ftp.bme.hu/a1b2c3d4...56.iso`). The original URL is stored in S3
-  object metadata (`x-amz-meta-url`). Vary-aware keys append
-  `+<sha224-of-vary-values>`. Vary index objects live under `<scheme>/<host>/_vary/`.
+  (e.g. `https/ftp.bme.hu/a1b2c3d4...56.iso`). Metadata lives at
+  `<key>.meta`. Vary-aware keys append `+<sha224-of-vary-values>`.
+  Vary index objects live under `<scheme>/<host>/_vary/`.
   Keys are POSIX filesystem-safe and bounded at ~340 bytes, so they work both on S3
   and on a local `mountpoint-s3` mount.
-- When `--cache-redirect` is enabled, clients must be able to fetch cached objects from
-  S3 without AWS credentials. Configure a bucket policy to allow unauthenticated
-  `s3:GetObject`/`s3:ListBucket` from your network:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "vpc_access",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "*"
-      },
-      "Action": [
-        "s3:GetObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::your-bucket/*",
-        "arn:aws:s3:::your-bucket"
-      ],
-      "Condition": {
-        "StringEquals": {
-          "aws:SourceVpc": [
-            "vpc-xxxxxxxx",
-            "vpc-yyyyyyyy"
-          ]
-        }
-      }
-    },
-    {
-      "Sid": "ip_access",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "*"
-      },
-      "Action": [
-        "s3:GetObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::your-bucket/*",
-        "arn:aws:s3:::your-bucket"
-      ],
-      "Condition": {
-        "IpAddress": {
-          "aws:SourceIp": [
-            "203.0.113.10/32",
-            "198.51.100.42/32"
-          ]
-        }
-      }
-    }
-  ]
-}
-```
 - `NoRefresh` serves from cache immediately on a hit (no revalidation).
 - `Standard` revalidates with an upstream `HEAD` when stale; if the cached `ETag`/`Last-Modified`
   matches, the cached object is served.
@@ -127,11 +59,9 @@ keys include the `Vary` request headers so separate variants are stored and serv
 
 ## Example production setup
 
-A typical deployment uses Passsage as the TLS-terminating cache and an S3 parallel proxy
-([xs3lerator](https://github.com/bra-fsn/xs3lerator)) for fast cache-hit delivery. Example
-internal DNS: Passsage at `proxy-cache.example.internal:3128`, xs3lerator at
-`s3-proxy.example.internal:443`. Clients point `HTTP_PROXY`/`HTTPS_PROXY` at Passsage;
-Passsage is configured with `--cache-redirect` and `--s3-proxy-url https://s3-proxy.example.internal`.
+A typical deployment uses Passsage as the TLS-terminating cache with the S3 bucket
+mounted locally via `mountpoint-s3` or `s3fs`. Cache hits are streamed directly from
+the FUSE mount. Clients point `HTTP_PROXY`/`HTTPS_PROXY` at Passsage.
 
 ```
 ┌──────────────┐     ┌──────────────────────┐     ┌────────────┐
@@ -140,29 +70,19 @@ Passsage is configured with `--cache-redirect` and `--s3-proxy-url https://s3-pr
 │  docker...)  │     │   :3128              │     │ (PyPI etc) │
 └──────────────┘     └──────┬──────┬────────┘     └────────────┘
                             │      │
-                            │      │  uploads cached objects
-                            │      │
+                    reads   │      │  writes cached objects +
+                    cached  │      │  .meta JSON + vary index
+                    data    │      │
                             │      ▼
                             │  ┌──────────┐
                             │  │  AWS S3  │
                             │  │ (cache)  │
-                            │  └────┬─────┘
-                            │       │
-       302 redirect on      │       │  parallel chunked
-       cache hit            │       │  downloads
-                            │       │
-                            ▼       ▼
+                            │  └──────────┘
+                            │
+                            ▼
                      ┌──────────────────────┐
-                     │   xs3lerator         │
-                     │   (S3 parallel proxy)│
-                     │   :443               │
-                     └──────────────────────┘
-                                ▲
-                                │ reads / writes
-                                ▼
-                     ┌──────────────────────┐
-                     │   POSIX filesystem   │
-                     │ (local SSD/EBS cache)│
+                     │   FUSE mount         │
+                     │ (mountpoint-s3/s3fs) │
                      └──────────────────────┘
 ```
 
@@ -271,7 +191,7 @@ awslocal s3api put-bucket-policy --bucket proxy-cache --policy '{
 Run Passsage:
 
 ```bash
-passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
+passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache --mount-s3-path /mnt/s3
 ```
 
 ### Environment Variables
@@ -283,8 +203,8 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache
 | `S3_BUCKET` | S3 bucket name for cache storage | `364189071156-ds-proxy-us-west-2` (AWS) or `proxy-cache` (custom endpoint) |
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
 | `PASSSAGE_PUBLIC_PROXY_URL` | Externally reachable proxy URL for the onboarding script (e.g. `http://proxy.example.com:3128`). Required behind a load balancer or in Kubernetes. | None |
-| `PASSSAGE_S3_PROXY_URL` | Redirect cache hits to this S3 proxy URL instead of S3 directly. Requires `PASSSAGE_CACHE_REDIRECT=1`. The proxy host is automatically added to the `no_proxy` list. | None |
-| `PASSSAGE_NO_REDIRECT_USER_AGENTS` | Comma-separated User-Agent prefixes that should not receive cache-hit redirects. Matching clients are served through the proxy instead. Useful for clients like `pip` that ignore `NO_PROXY`. | None |
+| `PASSSAGE_MOUNT_S3_PATH` | Local mount path for the S3 bucket (required). Cache hits are streamed from this path. | (required) |
+| `PASSSAGE_MEMCACHED_SERVERS` | Comma-separated memcached servers (host:port) for metadata caching. | None |
 | `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `0` |
 | `PASSSAGE_ACCESS_LOG_PREFIX` | S3 prefix for access logs | `__passsage_logs__` |
 | `PASSSAGE_ACCESS_LOG_DIR` | Local spool dir for access logs | `/tmp/passsage-logs` |
@@ -316,9 +236,10 @@ Options:
   -v, --verbose                   Enable verbose logging
   --public-proxy-url TEXT         Externally reachable proxy URL for client onboarding
                                   (env: PASSSAGE_PUBLIC_PROXY_URL)
-  --cache-redirect                Redirect cache hits to S3 instead of streaming through the proxy
-  --s3-proxy-url TEXT             Redirect cache hits to this S3 proxy URL instead of directly
-                                  to S3 (requires --cache-redirect) (env: PASSSAGE_S3_PROXY_URL)
+  --mount-s3-path TEXT            Local mount path for S3 bucket (required)
+                                  (env: PASSSAGE_MOUNT_S3_PATH)
+  --memcached-servers TEXT        Comma-separated memcached servers (host:port)
+                                  (env: PASSSAGE_MEMCACHED_SERVERS)
   --access-logs                   Enable S3 access logs in Parquet format
   --access-log-prefix TEXT        S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)
   --access-log-dir TEXT           Local spool directory for access logs
@@ -399,6 +320,44 @@ Find these requests in the access logs:
 passsage logs --start-date 2026-02-01 --end-date 2026-02-14 \
     -f serve_reason=no_cache_s3_request
 ```
+
+For clients that are known to not honor `no_proxy` reliably (e.g. `pip`), the proxy
+can stream the response directly instead of issuing a redirect. This is controlled by
+the `--no-redirect-user-agents` option (defaults to `pip/`).
+
+#### `no_proxy` client compatibility
+
+There is no standard for how clients handle the `no_proxy` environment variable.
+Behavior varies across tools and languages:
+
+| Client | `no_proxy` | `NO_PROXY` | `*` matches all | Leading dot stripped | CIDR |
+|---|---|---|---|---|---|
+| curl | Yes | Yes | Yes | Yes | No |
+| wget | Yes | No | No | No | No |
+| Python requests | Yes | Yes | Yes | Yes | No |
+| Go net/http | Yes | Yes | Yes | No | Yes |
+| Ruby Net::HTTP | Yes | Yes | No | Yes | Yes |
+| Node.js (native) | No | No | N/A | N/A | N/A |
+
+Known issues:
+
+- **pip**: Ignores `no_proxy` when proxy is set via `pip.ini` config rather than
+  environment variables. Build isolation (`pyproject.toml`) loses proxy config
+  entirely. This is why passsage defaults `--no-redirect-user-agents` to `pip/`.
+- **npm 10.x**: Had a regression ignoring proxy environment variables entirely.
+- **yarn**: Ignores `no_proxy` when proxy is set in config files.
+- **Node.js**: Does not use proxy environment variables without third-party packages.
+- **Java**: Uses system properties (`http.nonProxyHosts`), ignores `no_proxy` env var.
+
+Safest `no_proxy` format (works across all clients):
+
+```bash
+export no_proxy="localhost,127.0.0.1,::1,objects.example.com"
+```
+
+Use lowercase `no_proxy`, comma-separated exact hostnames, no leading dots,
+no wildcards, no CIDR blocks. For a detailed analysis of cross-client differences, see
+[We need to talk: Can we standardize NO_PROXY?](https://about.gitlab.com/blog/we-need-to-talk-no-proxy/).
 
 ### As a mitmproxy Script
 
@@ -597,31 +556,6 @@ def get_cache_key_rules():
 Export one of `get_cache_key_rules()`, `CACHE_KEY_RULES`,
 `get_cache_key_resolver()`, or `CACHE_KEY_RESOLVER` from the file. See
 `default_cache_keys.py` for the full built-in implementation.
-
-## No-Redirect User Agents
-
-Some HTTP clients (notably `pip`) do not honor the `NO_PROXY` / `no_proxy`
-environment variable. When `--cache-redirect` is enabled, these clients attempt
-to follow the redirect through the proxy itself, so it's better to serve them through the proxy instead.
-
-The `--no-redirect-user-agents` option (or `PASSSAGE_NO_REDIRECT_USER_AGENTS`
-env var) accepts a comma-separated list of User-Agent **prefixes**. When a
-request's `User-Agent` header starts with any of these prefixes, Passsage
-serves the cached content through the proxy instead of issuing a redirect.
-
-```bash
-passsage --cache-redirect --no-redirect-user-agents "pip/"
-```
-
-Or via environment variable:
-
-```bash
-export PASSSAGE_NO_REDIRECT_USER_AGENTS="pip/,legacy-client/"
-passsage --cache-redirect
-```
-
-Note: `uv` (the fast Python package manager) correctly honors `NO_PROXY` and
-does not need this workaround. If possible, prefer `uv` over `pip`.
 
 ## Important: Do Not Use S3 Object Expiration
 
