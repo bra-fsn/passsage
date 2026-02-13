@@ -15,7 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ${{ fromJson(inputs.python-version != '' && format('["{0}"]', inputs.python-version) || '["3.12", "3.13", "3.14"]') }}
-    name: test (py${{ matrix.python-version }})
+        cache-redirect: [false, true]
+    name: test (py${{ matrix.python-version }}, redirect=${{ matrix.cache-redirect }})
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +37,8 @@ jobs:
         env:
           PASSSAGE_ALLOW_POLICY_HEADER: "1"
           PASSSAGE_DEBUG_PROXY: "1"
+          PASSSAGE_CACHE_REDIRECT: ${{ matrix.cache-redirect && '1' || '' }}
+          PASSSAGE_S3_PROXY_URL: ${{ matrix.cache-redirect && 'http://localhost:4566/proxy-cache' || '' }}
         run: |
           docker compose up -d --build --wait
           docker compose ps
@@ -45,6 +48,8 @@ jobs:
           PROXY_URL: http://localhost:8080
           PASSSAGE_TEST_SERVER_BIND_HOST: 0.0.0.0
           PASSSAGE_TEST_SERVER_HOST: host.docker.internal
+          PASSSAGE_CACHE_REDIRECT: ${{ matrix.cache-redirect && '1' || '' }}
+          PASSSAGE_S3_PROXY_URL: ${{ matrix.cache-redirect && 'http://localhost:4566/proxy-cache' || '' }}
         run: |
           pytest -m "not slow"
 
