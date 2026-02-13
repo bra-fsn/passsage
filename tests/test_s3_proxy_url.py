@@ -73,7 +73,7 @@ class FakeFlow:
 
 class TestCLIValidation:
     def test_s3_proxy_url_without_cache_redirect_errors(self):
-        runner = CliRunner()
+        runner = CliRunner(env={"PASSSAGE_CACHE_REDIRECT": "", "PASSSAGE_S3_PROXY_URL": ""})
         result = runner.invoke(main, [
             "--s3-proxy-url", "http://proxy.local:8080",
         ])
@@ -81,7 +81,7 @@ class TestCLIValidation:
         assert "--s3-proxy-url requires --cache-redirect" in result.output
 
     def test_s3_proxy_url_with_cache_redirect_accepted(self):
-        runner = CliRunner()
+        runner = CliRunner(env={"PASSSAGE_CACHE_REDIRECT": "", "PASSSAGE_S3_PROXY_URL": ""})
         result = runner.invoke(main, [
             "--s3-proxy-url", "http://proxy.local:8080",
             "--cache-redirect",
