@@ -825,7 +825,19 @@ def get_cache_metadata(cache_key: str) -> S3HeadResponse:
                 return S3HeadResponse(200, headers)
         except Exception as exc:
             LOG.debug("Memcached get for cache metadata failed: %s", exc)
-    return s3_head_object(cache_key)
+    head = s3_head_object(cache_key)
+    if mc and head.status_code == 200:
+        try:
+            meta = {
+                k[len("x-amz-meta-"):]: v
+                for k, v in head.headers.items()
+                if k.lower().startswith("x-amz-meta-")
+            }
+            if meta:
+                _memcached_set_metadata(mc, cache_key, meta)
+        except Exception as exc:
+            LOG.debug("Memcached write-back for cache metadata failed: %s", exc)
+    return head
 
 
 def get_vary_index(vary_index_key: str) -> S3HeadResponse:
@@ -839,7 +851,15 @@ def get_vary_index(vary_index_key: str) -> S3HeadResponse:
                 return S3HeadResponse(200, {"x-amz-meta-vary": vary})
         except Exception as exc:
             LOG.debug("Memcached get for vary index failed: %s", exc)
-    return s3_head_object(vary_index_key)
+    head = s3_head_object(vary_index_key)
+    if mc and head.status_code == 200:
+        try:
+            vary = head.headers.get("x-amz-meta-vary", "")
+            if vary:
+                mc.set(_memcached_key(vary_index_key), json.dumps({"vary": vary}), expire=0)
+        except Exception as exc:
+            LOG.debug("Memcached write-back for vary index failed: %s", exc)
+    return head
 
 
 def get_refresh_patterns() -> list[RefreshPattern]:
