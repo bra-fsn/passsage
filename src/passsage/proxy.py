@@ -214,6 +214,7 @@ def get_s3_client(tls=threading.local()):
 class S3HeadResponse:
     status_code: int
     headers: dict
+    source: str = ""
 
 
 def s3_head_object(cache_key: str) -> S3HeadResponse:
@@ -822,10 +823,11 @@ def get_cache_metadata(cache_key: str) -> S3HeadResponse:
             if raw is not None:
                 meta = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
                 headers = {f"x-amz-meta-{k}": str(v) for k, v in meta.items()}
-                return S3HeadResponse(200, headers)
+                return S3HeadResponse(200, headers, source="memcached")
         except Exception as exc:
             LOG.debug("Memcached get for cache metadata failed: %s", exc)
     head = s3_head_object(cache_key)
+    head.source = "s3"
     if mc and head.status_code == 200:
         try:
             meta = {
@@ -848,10 +850,11 @@ def get_vary_index(vary_index_key: str) -> S3HeadResponse:
             if raw is not None:
                 data = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
                 vary = data.get("vary", "")
-                return S3HeadResponse(200, {"x-amz-meta-vary": vary})
+                return S3HeadResponse(200, {"x-amz-meta-vary": vary}, source="memcached")
         except Exception as exc:
             LOG.debug("Memcached get for vary index failed: %s", exc)
     head = s3_head_object(vary_index_key)
+    head.source = "s3"
     if mc and head.status_code == 200:
         try:
             vary = head.headers.get("x-amz-meta-vary", "")
@@ -1066,6 +1069,7 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "cache_head_etag": cache_head.headers.get("x-amz-meta-header-etag") if cache_head else None,
         "cache_head_last_modified": cache_head.headers.get("x-amz-meta-last-modified") if cache_head else None,
         "cache_head_method": cache_head.headers.get("x-amz-meta-method") if cache_head else None,
+        "metadata_source": getattr(flow, "_metadata_source", None),
         "serve_reason": getattr(flow, "_serve_reason", None),
         "cached_method": getattr(flow, "_cached_method", None),
         "vary_index_key": getattr(flow, "_vary_index_key", None),
@@ -1575,6 +1579,12 @@ class Proxy:
             flow._vary_index_key = vary_index_key
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
             vary_index_head = get_vary_index(vary_index_key)
+            LOG.debug(
+                "Vary index status=%s source=%s key=%s",
+                vary_index_head.status_code,
+                vary_index_head.source,
+                vary_index_key,
+            )
             if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.headers.get("x-amz-meta-vary")):
                 flow._cache_vary = vary_hdr
                 if "*" not in vary_hdr:
@@ -1592,9 +1602,11 @@ class Proxy:
                 LOG.debug("Cache lookup default key=%s", flow._cache_key)
             if flow._cache_key:
                 flow._cache_head = get_cache_metadata(flow._cache_key)
+                flow._metadata_source = flow._cache_head.source
                 LOG.debug(
-                    "Cache HEAD status=%s key=%s",
+                    "Cache HEAD status=%s source=%s key=%s",
                     flow._cache_head.status_code,
+                    flow._cache_head.source,
                     flow._cache_key,
                 )
         except Exception as e:
