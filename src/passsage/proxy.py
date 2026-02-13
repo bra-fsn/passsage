@@ -714,6 +714,15 @@ def request_requires_revalidation(request_headers: dict[str, str], freshness: Ca
     return False
 
 
+def _normalize_etag(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    return value
+
+
 def apply_cached_metadata(flow: http.HTTPFlow) -> None:
     if (status_code := flow.response.headers.get("x-amz-meta-status-code")):
         # When S3 returns 206 (honoring a Range header on the cached object),
@@ -1688,6 +1697,9 @@ class Proxy:
         ):
             cache_fresh = False
             allow_stale_while_revalidate = False
+            LOG.debug(
+                "Client forced revalidation (Cache-Control: no-cache or max-age) -> cache_fresh=False"
+            )
         LOG.debug(
             "Cache freshness cached_method=%s cache_fresh=%s policy=%s stale_while_revalidate=%s stale_if_error=%s",
             cached_method,
@@ -1855,8 +1867,8 @@ class Proxy:
             # ETag is the authoritative validator: if both sides have one and they
             # match, the content is identical regardless of Last-Modified differences
             # (e.g. cache stored None but upstream now returns a value).
-            upstream_etag = flow._upstream_head.headers.get("etag")
-            cached_etag = flow._cache_head.headers.get("x-amz-meta-header-etag")
+            upstream_etag = _normalize_etag(flow._upstream_head.headers.get("etag"))
+            cached_etag = _normalize_etag(flow._cache_head.headers.get("x-amz-meta-header-etag"))
             upstream_lastmod = flow._upstream_head.headers.get("last-modified")
             cached_lastmod = flow._cache_head.headers.get("x-amz-meta-last-modified")
             if upstream_etag and cached_etag:
@@ -1871,6 +1883,7 @@ class Proxy:
                     refresh_cache_metadata(flow._cache_key, flow._cache_head.headers)
                 rewrite_upstream_to_cache(flow)
                 return
+            flow._serve_reason = "cache_revalidated_content_changed"
 
 
     @_log_hook_errors("responseheaders")
