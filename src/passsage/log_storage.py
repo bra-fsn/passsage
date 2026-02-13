@@ -94,6 +94,7 @@ class AccessLogWriter:
                 ("cache_head_etag", pa.string()),
                 ("cache_head_last_modified", pa.string()),
                 ("cache_head_method", pa.string()),
+                ("serve_reason", pa.string()),
                 ("error", pa.string()),
                 ("duration_ms", pa.int64()),
                 ("bytes_sent", pa.int64()),

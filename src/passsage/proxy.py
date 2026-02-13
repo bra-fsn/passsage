@@ -1520,11 +1520,16 @@ class Proxy:
         flow._cache_saved = False
         policy = flow._policy = get_policy(flow)
         if _is_s3_cache_request(flow):
-            # If a client proxies the S3 redirect URL back through us, avoid re-caching
-            # the cached object again and create a loop. Force NoCache for S3 host.
             flow._save_response = False
             flow._policy = NoCache
             flow._serve_reason = "no_cache_s3_request"
+            LOG.debug(
+                "Client %s sent cache-object request for %s through proxy "
+                "(no_proxy not honored, user-agent: %s)",
+                flow.client_conn.peername,
+                flow.request.pretty_host,
+                flow.request.headers.get("user-agent", "unknown"),
+            )
             return
         if flow.request.pretty_host == "mitm.it" and flow.request.path in ("/proxy-env", "/proxy-env.sh"):
             public_url = getattr(ctx.options, "public_proxy_url", "").strip()
@@ -2077,8 +2082,13 @@ class Proxy:
             return
         if (flow.request.method not in ("GET", "HEAD")
                 or flow._policy == NoCache or flow._cached):
+            if getattr(flow, "_serve_reason", None) == "no_cache_s3_request" and flow.response:
+                flow.response.headers["x-passsage-warning"] = (
+                    "no_proxy-bypass: this request to "
+                    + flow.request.pretty_host
+                    + " should bypass the proxy (check client no_proxy setting)"
+                )
             self.log_response(flow)
-            # bail out quickly if we have nothing to do with the response
             with ctx._lock:
                 self.cleanup(flow)
             return
