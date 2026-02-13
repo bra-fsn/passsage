@@ -1117,10 +1117,21 @@ def build_vary_request(vary_header: str, request_headers) -> str | None:
 _MOUNT_CHUNK_SIZE = 64 * 1024
 
 
-def _mount_file_chunks(path: Path):
+def _mount_file_chunks(path: Path, offset: int = 0, length: int | None = None):
     with open(path, "rb") as fh:
-        while chunk := fh.read(_MOUNT_CHUNK_SIZE):
+        if offset:
+            fh.seek(offset)
+        remaining = length
+        while True:
+            to_read = _MOUNT_CHUNK_SIZE if remaining is None else min(_MOUNT_CHUNK_SIZE, remaining)
+            chunk = fh.read(to_read)
+            if not chunk:
+                break
             yield chunk
+            if remaining is not None:
+                remaining -= len(chunk)
+                if remaining <= 0:
+                    break
 
 
 def _serve_from_mount(flow) -> bool:
@@ -1150,12 +1161,27 @@ def _serve_from_mount(flow) -> bool:
     cached_headers = meta.get("headers", {})
     ct = cached_headers.get("content-type", "application/octet-stream")
 
-    flow.response = http.Response.make(200, b"", {"Content-Type": ct})
-    flow.response.headers["content-length"] = str(size)
+    range_header = flow.request.headers.get("range", "")
+    byte_range = _parse_single_range(range_header, size) if range_header else None
 
-    if flow.request.method != "HEAD":
-        flow.response.stream = _mount_file_chunks(local_path)
+    if byte_range is not None:
+        start, end = byte_range
+        content_length = end - start + 1
+        flow.response = http.Response.make(206, b"", {"Content-Type": ct})
+        flow.response.headers["content-range"] = f"bytes {start}-{end}/{size}"
+        flow.response.headers["content-length"] = str(content_length)
+        if flow.request.method != "HEAD":
+            flow.response.stream = _mount_file_chunks(local_path, offset=start, length=content_length)
+    elif range_header and _is_unsatisfiable_range(range_header, size):
+        flow.response = http.Response.make(416, b"", {"Content-Type": ct})
+        flow.response.headers["content-range"] = f"bytes */{size}"
+    else:
+        flow.response = http.Response.make(200, b"", {"Content-Type": ct})
+        flow.response.headers["content-length"] = str(size)
+        if flow.request.method != "HEAD":
+            flow.response.stream = _mount_file_chunks(local_path)
 
+    flow.response.headers["accept-ranges"] = "bytes"
     flow._save_response = False
     flow._cached = True
     flow._mount_served = True
