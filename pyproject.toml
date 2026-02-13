@@ -67,6 +67,9 @@ passsage = "passsage.cli:main"
 Homepage = "https://github.com/bra-fsn/passsage"
 Repository = "https://github.com/bra-fsn/passsage"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.version]
 path = "src/passsage/__init__.py"
 
