@@ -383,6 +383,23 @@ pip install "passsage[ui]"
 passsage errors --start-date 2026-02-01 --end-date 2026-02-02
 ```
 
+### Troubleshooting
+
+#### Clients not honoring `no_proxy`
+
+When the proxy serves a cache-hit redirect, the client should fetch the cached object
+directly from the S3/objects backend (configured via `no_proxy`). If a client ignores
+`no_proxy` and routes the object request back through the proxy, the access log records
+this with `serve_reason=no_cache_s3_request` and the response includes an
+`x-passsage-warning` header.
+
+Find these requests in the access logs:
+
+```bash
+passsage logs --start-date 2026-02-01 --end-date 2026-02-14 \
+    -f serve_reason=no_cache_s3_request
+```
+
 ### As a mitmproxy Script
 
 You can also use Passsage directly as a mitmproxy script:
