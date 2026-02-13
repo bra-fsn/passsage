@@ -835,6 +835,9 @@ def cache_get(ctx, url, keys_only, output_format):
     if mc is None:
         raise click.ClickException("Failed to create memcached client.")
 
+    from passsage.cache_utils import memcached_key, get_cache_key
+    import hashlib
+
     metadata_raw = mc.get(keys["memcached_key"])
     vary_raw = mc.get(keys["memcached_vary_key"])
 
@@ -846,11 +849,30 @@ def cache_get(ctx, url, keys_only, output_format):
     if vary_raw is not None:
         vary_data = json_mod.loads(vary_raw)
 
+    vary_metadata = None
+    vary_cache_key = None
+    vary_memcached_key = None
+    if vary_data and metadata is None:
+        vary_header = vary_data.get("vary", "")
+        if vary_header and "*" not in vary_header:
+            names = [n.strip().lower() for n in vary_header.split(",") if n.strip()]
+            vary_request = "|".join(f"{name}=" for name in names)
+            vary_key_hash = hashlib.sha224(vary_request.encode("utf-8")).hexdigest()
+            vary_cache_key = get_cache_key(keys["normalized_url"], vary_key_hash)
+            vary_memcached_key = memcached_key(vary_cache_key)
+            vary_meta_raw = mc.get(vary_memcached_key)
+            if vary_meta_raw is not None:
+                vary_metadata = json_mod.loads(vary_meta_raw)
+
     result = {
         **keys,
         "metadata": metadata,
         "vary_index": vary_data,
     }
+    if vary_cache_key:
+        result["vary_cache_key"] = vary_cache_key
+        result["vary_memcached_key"] = vary_memcached_key
+        result["vary_metadata"] = vary_metadata
 
     if output_format == "json":
         click.echo(json_mod.dumps(result, indent=2))
@@ -867,7 +889,7 @@ def cache_get(ctx, url, keys_only, output_format):
             for k, v in metadata.items():
                 click.echo(f"  {k}: {v}")
         else:
-            click.echo("metadata: (not found)")
+            click.echo("metadata: (not found under base key)")
         click.echo()
         if vary_data is not None:
             click.echo("vary_index:")
@@ -875,6 +897,18 @@ def cache_get(ctx, url, keys_only, output_format):
                 click.echo(f"  {k}: {v}")
         else:
             click.echo("vary_index: (not found)")
+        if vary_cache_key:
+            click.echo()
+            click.echo(f"vary_cache_key:     {vary_cache_key}")
+            click.echo(f"vary_memcached_key: {vary_memcached_key}")
+            if vary_metadata is not None:
+                click.echo("vary_metadata (Accept: empty):")
+                for k, v in vary_metadata.items():
+                    click.echo(f"  {k}: {v}")
+            else:
+                click.echo("vary_metadata: (not found for empty Accept headers)"
+                           " -- actual metadata is under a vary key derived"
+                           " from the client's request headers)")
 
 
 @memcache.command("delete")
