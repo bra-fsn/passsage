@@ -1877,18 +1877,18 @@ class Proxy:
     def responseheaders(self, flow):
         request_id = getattr(flow, "id", None)
         if request_id is not None:
-            flow.response.headers["X-Request-Id"] = str(request_id)
+            flow.response.headers["x-request-id"] = str(request_id)
         if getattr(flow, "_cache_redirect", False):
             flow.response.headers["x-proxy-policy"] = flow._policy.__name__
             existing_via = flow.response.headers.get("via", "")
             flow.response.headers["via"] = (
                 f"{VIA_HEADER_VALUE}, {existing_via}" if existing_via else VIA_HEADER_VALUE
             )
-            flow.response.headers["Cache-Status"] = f"{SERVER_NAME};hit;detail=redirect"
+            flow.response.headers["cache-status"] = f"{SERVER_NAME};hit;detail=redirect"
             if flow._cache_head and (stored_dt := cache_stored_at(flow._cache_head.headers)):
                 stored_dt = stored_dt.astimezone(pytz.utc)
                 age_seconds = int((datetime.now(tz=pytz.utc) - stored_dt).total_seconds())
-                flow.response.headers["Age"] = str(max(0, age_seconds))
+                flow.response.headers["age"] = str(max(0, age_seconds))
             return
         if (
             not flow._cached
@@ -1968,12 +1968,12 @@ class Proxy:
         if flow._cached:
             # this is a cached response, rewrite headers from cache (origin Server preserved)
             LOG.debug("Cache response: serving from cache")
-            flow.response.headers["Cache-Status"] = f"{SERVER_NAME};hit;detail=stored"
+            flow.response.headers["cache-status"] = f"{SERVER_NAME};hit;detail=stored"
             apply_cached_metadata(flow)
             if (stored_dt := cache_stored_at(flow.response.headers)):
                 stored_dt = stored_dt.astimezone(pytz.utc)
                 age_seconds = int((datetime.now(tz=pytz.utc) - stored_dt).total_seconds())
-                flow.response.headers["Age"] = str(max(0, age_seconds))
+                flow.response.headers["age"] = str(max(0, age_seconds))
         else:
             LOG.debug("Cache response: not cached")
             apply_cached_metadata(flow)
