@@ -36,7 +36,7 @@ dependencies = [
     "click>=8.0",
     "pymemcache>=4.0",
     "flask>=2.0",
-    "mitmproxy~=12.2",
+    "mitmproxy @ git+https://github.com/bra-fsn/mitmproxy.git@local_file_streaming",
     "pyarrow",
     "pytz>=2023.0",
     "requests>=2.28",
