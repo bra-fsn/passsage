@@ -1854,6 +1854,9 @@ class Proxy:
                 flow._serve_reason = "cache_hit_revalidated"
                 if flow._cache_key:
                     refresh_cache_metadata(flow._cache_key, flow._cache_head.headers)
+                if getattr(ctx.options, "cache_redirect", False):
+                    serve_cache_hit(flow)
+                    return
                 rewrite_upstream_to_cache(flow)
                 return
             flow._serve_reason = "cache_revalidated_content_changed"
