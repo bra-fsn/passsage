@@ -47,14 +47,19 @@ def assert_cached_response(resp: requests.Response) -> None:
     assert "Cache-Status" in resp.headers
 
 
-def _is_s3_presigned_location(location: str) -> bool:
-    return "AWSAccessKeyId=" in location or "X-Amz-Credential=" in location
+def _is_cache_redirect_location(location: str) -> bool:
+    if "AWSAccessKeyId=" in location or "X-Amz-Credential=" in location:
+        return True
+    s3_proxy_url = os.environ.get("PASSSAGE_S3_PROXY_URL", "").strip()
+    if s3_proxy_url and location.startswith(s3_proxy_url):
+        return True
+    return False
 
 
 def has_cache_redirect(resp: requests.Response) -> bool:
     candidates = [resp] + list(resp.history or [])
     return any(
-        r.status_code in (302, 307) and _is_s3_presigned_location(r.headers.get("Location", ""))
+        r.status_code in (302, 307) and _is_cache_redirect_location(r.headers.get("Location", ""))
         for r in candidates
     )
 
@@ -1235,4 +1240,186 @@ class TestNoRedirectUserAgents:
         assert resp.ok
         assert after_gets == before_gets, (
             "No-redirect response should be served from cache, not upstream"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cache-redirect after revalidation tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestCacheRedirectAfterRevalidation:
+    """Tests that cache_redirect works on the revalidation path.
+
+    When a cached object is stale (max-age expired) but the upstream content
+    is unchanged (304 or matching etag), the proxy must still honour
+    cache_redirect and send a 302/307 redirect for non-skip user-agents.
+    This covers the cache_hit_revalidated code path.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_cache_redirect(self):
+        if not cache_redirect_enabled():
+            pytest.skip("PASSSAGE_CACHE_REDIRECT not enabled")
+
+    def _prime_and_expire(self, proxy_session, url, test_server, path):
+        proxy_get(proxy_session, url, timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+
+    def test_revalidated_hit_redirects_normal_ua(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """After max-age expires and upstream confirms unchanged content,
+        a normal user-agent must receive a 302 redirect (not a 200 stream)."""
+        test_server.reset()
+        case_id = uuid.uuid4().hex
+        url = test_server.url(
+            f"/cache-control/max-age-low?random={cache_bust_random}&case=reval_redir_{case_id}"
+        )
+        self._prime_and_expire(proxy_session, url, test_server, "/cache-control/max-age-low")
+
+        resp = _proxy_get_ua(proxy_session, url, NORMAL_UA, timeout=30)
+        assert resp.status_code in (302, 307), (
+            f"Expected redirect after revalidation for normal UA, got {resp.status_code}"
+        )
+        assert resp.headers.get("Location"), "Redirect must have a Location header"
+
+    def test_revalidated_hit_no_redirect_for_pip(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """After revalidation, pip/ user-agent must still get a 200 (no redirect)."""
+        test_server.reset()
+        case_id = uuid.uuid4().hex
+        url = test_server.url(
+            f"/cache-control/max-age-low?random={cache_bust_random}&case=reval_pip_{case_id}"
+        )
+        self._prime_and_expire(proxy_session, url, test_server, "/cache-control/max-age-low")
+
+        resp = _proxy_get_ua(proxy_session, url, PIP_UA_SHORT, allow_redirects=True, timeout=30)
+        assert resp.status_code == 200, (
+            f"Expected 200 for pip UA after revalidation, got {resp.status_code}"
+        )
+        assert not has_cache_redirect(resp), "pip UA must not receive a redirect"
+
+    def test_revalidated_hit_content_correct(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """Content served via redirect after revalidation must match the original."""
+        test_server.reset()
+        case_id = uuid.uuid4().hex
+        url = test_server.url(
+            f"/cache-control/max-age-low?random={cache_bust_random}&case=reval_content_{case_id}"
+        )
+        r1 = proxy_get(proxy_session, url, timeout=30)
+        assert r1.ok
+        original_body = r1.text
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+
+        resp = _proxy_get_ua(proxy_session, url, NORMAL_UA, allow_redirects=True, timeout=30)
+        assert resp.ok
+        assert resp.text == original_body, (
+            "Content after revalidation redirect must match the original"
+        )
+
+    def test_revalidated_stale_if_error_redirects(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """StaleIfError policy with expired cache and unchanged upstream must redirect."""
+        test_server.reset()
+        case_id = uuid.uuid4().hex
+        url = test_server.url(
+            f"/cache-control/max-age-low?random={cache_bust_random}&case=reval_sie_{case_id}"
+        )
+        proxy_get(
+            proxy_session, url,
+            headers=policy_headers("StaleIfError"), timeout=30,
+        )
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+
+        resp = proxy_get(
+            proxy_session, url,
+            headers={
+                **policy_headers("StaleIfError"),
+                "User-Agent": NORMAL_UA,
+            },
+            allow_redirects=False,
+            timeout=30,
+        )
+        assert resp.status_code in (302, 307), (
+            f"Expected redirect for StaleIfError revalidation, got {resp.status_code}"
+        )
+
+    def test_revalidated_no_upstream_get_on_redirect(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """Revalidation must issue only a HEAD, not a GET, before redirecting."""
+        test_server.reset()
+        case_id = uuid.uuid4().hex
+        url = test_server.url(
+            f"/cache-control/max-age-low?random={cache_bust_random}&case=reval_head_{case_id}"
+        )
+        proxy_get(proxy_session, url, timeout=30)
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+
+        stats_before = test_server.stats()
+        gets_before = get_method_count(stats_before, "/cache-control/max-age-low", "GET")
+        heads_before = get_method_count(stats_before, "/cache-control/max-age-low", "HEAD")
+
+        resp = _proxy_get_ua(proxy_session, url, NORMAL_UA, timeout=30)
+        assert resp.status_code in (302, 307)
+
+        stats_after = test_server.stats()
+        gets_after = get_method_count(stats_after, "/cache-control/max-age-low", "GET")
+        heads_after = get_method_count(stats_after, "/cache-control/max-age-low", "HEAD")
+        assert gets_after == gets_before, (
+            f"Expected no new GETs during revalidation redirect, "
+            f"got {gets_after - gets_before} new GET(s)"
+        )
+        assert heads_after == heads_before + 1, (
+            f"Expected exactly 1 new HEAD for revalidation, "
+            f"got {heads_after - heads_before}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# no_proxy bypass detection tests (x-passsage-warning header)
+# ---------------------------------------------------------------------------
+
+S3_PROXY_URL_ENV = os.environ.get("PASSSAGE_S3_PROXY_URL", "").strip()
+
+
+@pytest.mark.integration
+class TestNoProxyBypassDetection:
+    """Tests that the proxy detects and signals when a client sends a request
+    to the S3 cache-object backend through the proxy (no_proxy not honored).
+
+    Requires PASSSAGE_S3_PROXY_URL to be set so the test knows which host
+    the proxy considers as its S3 backend.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_s3_proxy_url(self):
+        if not S3_PROXY_URL_ENV:
+            pytest.skip("PASSSAGE_S3_PROXY_URL not set")
+
+    def test_s3_proxy_request_gets_warning_header(self, proxy_session):
+        """Sending a request to the S3 proxy host through the HTTP proxy
+        must return the x-passsage-warning header."""
+        url = f"{S3_PROXY_URL_ENV}/nonexistent-key"
+        resp = proxy_get(proxy_session, url, timeout=30)
+        warning = resp.headers.get("x-passsage-warning", "")
+        assert "no_proxy-bypass" in warning, (
+            f"Expected x-passsage-warning with no_proxy-bypass, "
+            f"got: {warning!r}"
+        )
+
+    def test_s3_proxy_request_not_cached(self, proxy_session):
+        """Requests to the S3 proxy host must not be cached."""
+        url = f"{S3_PROXY_URL_ENV}/nonexistent-key"
+        resp = proxy_get(proxy_session, url, timeout=30)
+        assert "Cache-Status" not in resp.headers, (
+            "S3 proxy host requests must not be cached"
+        )
+        assert not has_cache_redirect(resp), (
+            "S3 proxy host requests must not trigger cache redirects"
         )
