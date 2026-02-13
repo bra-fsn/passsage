@@ -760,6 +760,93 @@ def refresh_cache_metadata(cache_key: str, cache_headers: dict[str, str]) -> Non
         s3.copy_object(**copy_args)
     except Exception as exc:
         LOG.warning("Cache metadata refresh failed for %s: %s", cache_key, exc)
+    mc = _get_memcached_client()
+    if mc:
+        try:
+            meta = {k: v for k, v in cache_headers.items() if k.lower().startswith("x-amz-meta-")}
+            meta = {k[len("x-amz-meta-"):]: v for k, v in meta.items()}
+            meta["stored-at"] = str(time.time())
+            _memcached_set_metadata(mc, cache_key, meta)
+        except Exception as exc:
+            LOG.debug("Memcached set on metadata refresh failed: %s", exc)
+
+
+MEMCACHED_MAX_KEY_LEN = 250
+
+
+def _memcached_key(key: str) -> str:
+    if len(key) <= MEMCACHED_MAX_KEY_LEN:
+        return key
+    return "passsage:s224:" + hashlib.sha224(key.encode()).hexdigest()
+
+
+def _parse_memcached_servers(servers_str: str) -> list[tuple[str, int]]:
+    out: list[tuple[str, int]] = []
+    for part in servers_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            host, _, port_str = part.rpartition(":")
+            port = int(port_str) if port_str.isdigit() else 11211
+        else:
+            host, port = part, 11211
+        if host:
+            out.append((host, port))
+    return out
+
+
+def _update_memcached_client() -> None:
+    servers_str = getattr(ctx.options, "memcached_servers", "") or ""
+    ctx._passsage_memcached = None
+    if not servers_str.strip():
+        return
+    servers = _parse_memcached_servers(servers_str)
+    if not servers:
+        return
+    try:
+        from pymemcache.client.hash import HashClient
+        ctx._passsage_memcached = HashClient(servers, connect_timeout=2, timeout=2)
+    except Exception as exc:
+        LOG.warning("Memcached client init failed: %s", exc)
+
+
+def _get_memcached_client():
+    if not hasattr(ctx, "_passsage_memcached"):
+        _update_memcached_client()
+    return getattr(ctx, "_passsage_memcached", None)
+
+
+def _memcached_set_metadata(mc, cache_key: str, meta: dict) -> None:
+    mc.set(_memcached_key(cache_key), json.dumps(meta), expire=0)
+
+
+def get_cache_metadata(cache_key: str) -> S3HeadResponse:
+    mc = _get_memcached_client()
+    if mc:
+        try:
+            raw = mc.get(_memcached_key(cache_key))
+            if raw is not None:
+                meta = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
+                headers = {f"x-amz-meta-{k}": str(v) for k, v in meta.items()}
+                return S3HeadResponse(200, headers)
+        except Exception as exc:
+            LOG.debug("Memcached get for cache metadata failed: %s", exc)
+    return s3_head_object(cache_key)
+
+
+def get_vary_index(vary_index_key: str) -> S3HeadResponse:
+    mc = _get_memcached_client()
+    if mc:
+        try:
+            raw = mc.get(_memcached_key(vary_index_key))
+            if raw is not None:
+                data = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
+                vary = data.get("vary", "")
+                return S3HeadResponse(200, {"x-amz-meta-vary": vary})
+        except Exception as exc:
+            LOG.debug("Memcached get for vary index failed: %s", exc)
+    return s3_head_object(vary_index_key)
 
 
 def get_refresh_patterns() -> list[RefreshPattern]:
@@ -1393,6 +1480,12 @@ class Proxy:
             default=ERROR_LOG_FLUSH_BYTES,
             help="Flush size threshold for error logs (bytes or 1G/500M/10K)",
         )
+        loader.add_option(
+            name="memcached_servers",
+            typespec=str,
+            default="",
+            help="Comma-separated memcached servers (host:port) for metadata/vary cache; e.g. cache-0.cache:11211,cache-1.cache:11211",
+        )
 
     @_log_hook_errors("configure")
     def configure(self, updated):
@@ -1415,6 +1508,8 @@ class Proxy:
             "error_log_flush_bytes",
         }.intersection(updated):
             _init_error_logs()
+        if "memcached_servers" in updated:
+            _update_memcached_client()
 
     @staticmethod
     def cache_expired(cache):
@@ -1497,7 +1592,7 @@ class Proxy:
             vary_index_key = get_vary_index_key(normalized_url)
             flow._vary_index_key = vary_index_key
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
-            vary_index_head = s3_head_object(vary_index_key)
+            vary_index_head = get_vary_index(vary_index_key)
             if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.headers.get("x-amz-meta-vary")):
                 flow._cache_vary = vary_hdr
                 if "*" not in vary_hdr:
@@ -1514,7 +1609,7 @@ class Proxy:
                 flow._cache_key = get_cache_key(normalized_url)
                 LOG.debug("Cache lookup default key=%s", flow._cache_key)
             if flow._cache_key:
-                flow._cache_head = s3_head_object(flow._cache_key)
+                flow._cache_head = get_cache_metadata(flow._cache_key)
                 LOG.debug(
                     "Cache HEAD status=%s key=%s",
                     flow._cache_head.status_code,
@@ -1958,6 +2053,12 @@ class Proxy:
                 if header in headers:
                     extras[aws_key] = headers[header]
             s3.upload_fileobj(f, S3_BUCKET, cache_key, ExtraArgs=extras)
+            mc = _get_memcached_client()
+            if mc:
+                try:
+                    _memcached_set_metadata(mc, cache_key, extras["Metadata"])
+                except Exception as mc_exc:
+                    LOG.debug("Memcached set after cache save failed: %s", mc_exc)
             if vary_header:
                 vary_index_key = get_vary_index_key(normalized_url)
                 vary_meta = {"vary": vary_header}
@@ -1966,6 +2067,11 @@ class Proxy:
                     Key=vary_index_key,
                     Metadata=vary_meta,
                 )
+                if mc:
+                    try:
+                        mc.set(_memcached_key(vary_index_key), json.dumps(vary_meta), expire=0)
+                    except Exception as mc_exc:
+                        LOG.debug("Memcached set for vary index failed: %s", mc_exc)
         except Exception as e:
             LOG.error("Cache save error %s, %s", url, e)
             _log_exception(

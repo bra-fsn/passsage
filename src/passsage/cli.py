@@ -280,6 +280,14 @@ import click
     "Written to ~/.mitmproxy/mitmproxy-ca.pem before startup. "
     "(env: PASSSAGE_MITM_CA)"
 )
+@click.option(
+    "--memcached-servers",
+    envvar="PASSSAGE_MEMCACHED_SERVERS",
+    default="",
+    show_default=False,
+    help="Comma-separated memcached servers (host:port) for metadata/vary cache; "
+    "e.g. cache-0.cache:11211,cache-1.cache:11211 (env: PASSSAGE_MEMCACHED_SERVERS)"
+)
 @click.version_option()
 @click.pass_context
 def main(
@@ -319,6 +327,7 @@ def main(
     connection_strategy,
     mitm_ca_cert,
     mitm_ca,
+    memcached_servers,
 ):
     """
     Passsage (Pas³age) - S3-backed caching proxy.
@@ -382,6 +391,7 @@ def main(
             connection_strategy,
             mitm_ca_cert,
             mitm_ca,
+            memcached_servers,
         )
 
 
@@ -444,6 +454,7 @@ def run_proxy(
     connection_strategy="lazy",
     mitm_ca_cert=None,
     mitm_ca=None,
+    memcached_servers="",
 ):
     if mitm_ca_cert or mitm_ca:
         _install_mitm_certs(mitm_ca_cert, mitm_ca)
@@ -539,6 +550,8 @@ def run_proxy(
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
     args.extend(["--set", f"connection_strategy={connection_strategy}"])
+    if memcached_servers:
+        args.extend(["--set", f"memcached_servers={memcached_servers}"])
 
     if verbose:
         args.extend(["-v"])
