@@ -707,7 +707,7 @@ def errors(start_date, end_date, s3_bucket, error_log_prefix, grep, filters, whe
         )
 
 
-@main.group("cache", invoke_without_command=True)
+@main.group("memcache", invoke_without_command=True)
 @click.option(
     "--memcached-servers",
     envvar="PASSSAGE_MEMCACHED_SERVERS",
@@ -717,7 +717,7 @@ def errors(start_date, end_date, s3_bucket, error_log_prefix, grep, filters, whe
     "e.g. cache-0.cache:11211,cache-1.cache:11211 (env: PASSSAGE_MEMCACHED_SERVERS)",
 )
 @click.pass_context
-def cache(ctx, memcached_servers):
+def memcache(ctx, memcached_servers):
     """Inspect and manipulate the memcached metadata cache.
 
     \b
@@ -728,13 +728,13 @@ def cache(ctx, memcached_servers):
     \b
     Examples:
         # Show cached metadata for a URL
-        passsage cache get https://pypi.org/simple/requests/
+        passsage memcache get https://pypi.org/simple/requests/
 
         # Delete cached metadata for a URL
-        passsage cache delete https://pypi.org/simple/requests/
+        passsage memcache delete https://pypi.org/simple/requests/
 
         # Show only the derived keys (no memcached connection needed)
-        passsage cache get --keys-only https://pypi.org/simple/requests/
+        passsage memcache get --keys-only https://pypi.org/simple/requests/
     """
     ctx.ensure_object(dict)
     ctx.obj["memcached_servers"] = memcached_servers
@@ -781,7 +781,7 @@ def _resolve_cache_keys(url):
     }
 
 
-@cache.command("get")
+@memcache.command("get")
 @click.argument("url")
 @click.option(
     "--keys-only",
@@ -806,9 +806,9 @@ def cache_get(ctx, url, keys_only, output_format):
 
     \b
     Examples:
-        passsage cache get https://pypi.org/simple/requests/
-        passsage cache get --keys-only https://example.com/path
-        passsage cache get -o json https://pypi.org/simple/requests/
+        passsage memcache get https://pypi.org/simple/requests/
+        passsage memcache get --keys-only https://example.com/path
+        passsage memcache get -o json https://pypi.org/simple/requests/
     """
     import json as json_mod
 
@@ -877,7 +877,7 @@ def cache_get(ctx, url, keys_only, output_format):
             click.echo("vary_index: (not found)")
 
 
-@cache.command("delete")
+@memcache.command("delete")
 @click.argument("url")
 @click.option(
     "--yes", "-y",
@@ -907,9 +907,9 @@ def cache_delete(ctx, url, yes, vary_only, metadata_only):
 
     \b
     Examples:
-        passsage cache delete https://pypi.org/simple/requests/
-        passsage cache delete -y https://example.com/path
-        passsage cache delete --metadata-only https://example.com/path
+        passsage memcache delete https://pypi.org/simple/requests/
+        passsage memcache delete -y https://example.com/path
+        passsage memcache delete --metadata-only https://example.com/path
     """
     keys = _resolve_cache_keys(url)
 
