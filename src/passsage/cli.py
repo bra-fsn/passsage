@@ -744,9 +744,9 @@ def memcache(ctx, memcached_servers):
 
 def _make_memcached_client(servers_str):
     """Create a standalone HashClient from a comma-separated server string."""
-    from passsage.proxy import _parse_memcached_servers
+    from passsage.cache_utils import parse_memcached_servers
 
-    servers = _parse_memcached_servers(servers_str)
+    servers = parse_memcached_servers(servers_str)
     if not servers:
         return None
     from pymemcache.client.hash import HashClient
@@ -756,8 +756,8 @@ def _make_memcached_client(servers_str):
 
 def _resolve_cache_keys(url):
     """Normalize a URL and return (normalized_url, cache_key, vary_index_key, memcached keys)."""
-    from passsage.proxy import (
-        _memcached_key,
+    from passsage.cache_utils import (
+        memcached_key,
         get_cache_key,
         get_vary_index_key,
     )
@@ -776,8 +776,8 @@ def _resolve_cache_keys(url):
         "normalized_url": normalized_url,
         "cache_key": cache_key,
         "vary_index_key": vary_index_key,
-        "memcached_key": _memcached_key(cache_key),
-        "memcached_vary_key": _memcached_key(vary_index_key),
+        "memcached_key": memcached_key(cache_key),
+        "memcached_vary_key": memcached_key(vary_index_key),
     }
 
 

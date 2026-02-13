@@ -52,6 +52,15 @@ from passsage.policy import (
     policy_from_name,
     set_default_resolver,
 )
+from passsage.cache_utils import (
+    memcached_key as _memcached_key,
+    parse_memcached_servers as _parse_memcached_servers,
+    url_ext as _url_ext,
+    hashed_s3_key as _hashed_s3_key,
+    get_cache_key,
+    get_vary_index_key,
+    MEMCACHED_MAX_KEY_LEN,
+)
 from passsage.log_storage import AccessLogWriter, ErrorLogWriter, build_access_log_config, build_error_log_config
 
 try:
@@ -780,31 +789,6 @@ def refresh_cache_metadata(cache_key: str, cache_headers: dict[str, str]) -> Non
             LOG.debug("Memcached set on metadata refresh failed: %s", exc)
 
 
-MEMCACHED_MAX_KEY_LEN = 250
-
-
-def _memcached_key(key: str) -> str:
-    if len(key) <= MEMCACHED_MAX_KEY_LEN:
-        return key
-    return "passsage:s224:" + hashlib.sha224(key.encode()).hexdigest()
-
-
-def _parse_memcached_servers(servers_str: str) -> list[tuple[str, int]]:
-    out: list[tuple[str, int]] = []
-    for part in servers_str.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if ":" in part:
-            host, _, port_str = part.rpartition(":")
-            port = int(port_str) if port_str.isdigit() else 11211
-        else:
-            host, port = part, 11211
-        if host:
-            out.append((host, port))
-    return out
-
-
 def _update_memcached_client() -> None:
     servers_str = getattr(ctx.options, "memcached_servers", "") or ""
     ctx._passsage_memcached = None
@@ -1152,42 +1136,6 @@ def _normalize_url(flow) -> str:
     resolver = get_default_cache_key_resolver()
     return resolver.resolve(request_ctx)
 
-
-def _url_ext(url: str, max_len: int = 20) -> str:
-    path = urlparse(url).path.rstrip("/")
-    if not path:
-        return ""
-    last = path.rsplit("/", 1)[-1]
-    dot = last.rfind(".")
-    if dot < 1:
-        return ""
-    ext = last[dot:]
-    if len(ext) > max_len or not all(c.isalnum() or c in ".-_" for c in ext[1:]):
-        return ""
-    return ext
-
-
-def _hashed_s3_key(normalized_url: str, vary_key: str | None = None) -> str:
-    parsed = urlparse(normalized_url)
-    scheme = (parsed.scheme or "https").lower()
-    host = (parsed.hostname or "unknown").lower()
-    digest = hashlib.sha224(normalized_url.encode("utf-8")).hexdigest()
-    ext = _url_ext(normalized_url)
-    if vary_key:
-        return f"{scheme}/{host}/{digest}+{vary_key}{ext}"
-    return f"{scheme}/{host}/{digest}{ext}"
-
-
-def get_cache_key(normalized_url: str, vary_key: str | None = None) -> str:
-    return _hashed_s3_key(normalized_url, vary_key)
-
-
-def get_vary_index_key(normalized_url: str) -> str:
-    parsed = urlparse(normalized_url)
-    scheme = (parsed.scheme or "https").lower()
-    host = (parsed.hostname or "unknown").lower()
-    digest = hashlib.sha224(normalized_url.encode("utf-8")).hexdigest()
-    return f"{scheme}/{host}/_vary/{digest}"
 
 
 def compute_vary_key(vary_header: str, request_headers) -> str | None:
