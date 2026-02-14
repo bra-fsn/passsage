@@ -1783,6 +1783,7 @@ class Proxy:
                     # Preserve original 200 so the cache stores the full object as 200
                     flow._orig_data["status_code"] = 200
                     flow._orig_data["reason"] = flow.response.reason
+                    flow._orig_data["content-length"] = str(total)
                     flow.response.status_code = 206
                     flow.response.headers["content-range"] = f"bytes {start}-{end}/{total}"
                     flow.response.headers["content-length"] = str(length)
@@ -1790,6 +1791,7 @@ class Proxy:
                 elif _is_unsatisfiable_range(orig_range, total):
                     flow._orig_data["status_code"] = 200
                     flow._orig_data["reason"] = flow.response.reason
+                    flow._orig_data["content-length"] = str(total)
                     flow.response.status_code = 416
                     flow.response.headers["content-range"] = f"bytes */{total}"
                     flow.response.headers["content-length"] = "0"
@@ -2019,6 +2021,13 @@ class Proxy:
             cache_key = flow._cache_key or get_cache_key(normalized_url)
             flow._cache_saved = True
             LOG.debug("Cache save enqueue key=%s", cache_key)
+            save_headers = flow.response.headers
+            if getattr(flow, "_orig_range", None):
+                save_headers = flow.response.headers.copy()
+                if "content-length" in flow._orig_data:
+                    save_headers["content-length"] = flow._orig_data["content-length"]
+                if "content-range" in save_headers:
+                    del save_headers["content-range"]
             ctx._executor.submit(
                 self._save_to_cache,
                 # save the original values in the cache for eg. in a
@@ -2028,7 +2037,7 @@ class Proxy:
                 flow.request.method,
                 self.files[flow._counter],
                 self.hashes[flow._counter].hexdigest(),
-                flow.response.headers,
+                save_headers,
                 flow.request.url,
                 cache_key,
                 getattr(flow, "_cache_vary", None),
