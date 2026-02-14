@@ -745,7 +745,14 @@ def _update_memcached_client() -> None:
         return
     try:
         from pymemcache.client.hash import HashClient
-        ctx._passsage_memcached = HashClient(servers, connect_timeout=2, timeout=2)
+        ctx._passsage_memcached = HashClient(
+            servers,
+            connect_timeout=2,
+            timeout=2,
+            dead_timeout=30,
+            retry_attempts=2,
+            retry_timeout=1,
+        )
     except Exception as exc:
         LOG.warning("Memcached client init failed: %s", exc)
 
