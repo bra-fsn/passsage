@@ -10,7 +10,6 @@ test:
 	pytest -v
 
 test-local:
-	docker compose build passsage-base
 	PASSSAGE_ALLOW_POLICY_HEADER=1 PASSSAGE_DEBUG_PROXY=1 \
 		docker compose up -d --build --wait
 	docker compose ps

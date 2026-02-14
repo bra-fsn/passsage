@@ -15,26 +15,17 @@ services:
       timeout: 5s
       retries: 10
 
-  passsage-base:
-    image: passsage:base
-    build:
-      context: .
-      dockerfile: Dockerfile
-    profiles: ["build"]
-
   passsage:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile
     ports:
       - "${PROXY_PORT:-8080}:8080"
       - "${HEALTH_PORT:-8082}:8082"
-    privileged: true
     environment:
       - PASSSAGE_ALLOW_POLICY_HEADER=${PASSSAGE_ALLOW_POLICY_HEADER:-}
       - PASSSAGE_DEBUG_PROXY=${PASSSAGE_DEBUG_PROXY:-}
-      - PASSSAGE_MOUNT_S3_PATH=/s3mount
-      - PASSSAGE_S3FS_MOUNT=1
+      - PASSSAGE_OBJECT_STORE_URL=http://localstack:4566/proxy-cache
       - PASSSAGE_HEALTH_PORT=8082
       - PASSSAGE_HEALTH_HOST=0.0.0.0
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
