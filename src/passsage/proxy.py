@@ -732,7 +732,7 @@ def refresh_cache_metadata(cache_key: str, meta: dict) -> None:
         try:
             _memcached_set_metadata(mc, cache_key, meta)
         except Exception as exc:
-            LOG.debug("Memcached set on metadata refresh failed: %s", exc)
+            LOG.warning("Memcached set on metadata refresh failed: %s", exc)
 
 
 def _update_memcached_client() -> None:
@@ -778,7 +778,7 @@ def get_cache_metadata(cache_key: str) -> CacheMeta:
                 meta = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
                 return CacheMeta(200, meta, source="memcached")
         except Exception as exc:
-            LOG.debug("Memcached get for cache metadata failed: %s", exc)
+            LOG.warning("Memcached get for cache metadata failed: %s", exc)
     data = _s3_get_json(f"{cache_key}.meta")
     if data is None:
         return CacheMeta(404, {}, source="s3")
@@ -786,7 +786,7 @@ def get_cache_metadata(cache_key: str) -> CacheMeta:
         try:
             _memcached_set_metadata(mc, cache_key, data)
         except Exception as exc:
-            LOG.debug("Memcached write-back for cache metadata failed: %s", exc)
+            LOG.warning("Memcached write-back for cache metadata failed: %s", exc)
     return CacheMeta(200, data, source="s3")
 
 
@@ -799,7 +799,7 @@ def get_vary_index(vary_index_key: str) -> CacheMeta:
                 data = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
                 return CacheMeta(200, data, source="memcached")
         except Exception as exc:
-            LOG.debug("Memcached get for vary index failed: %s", exc)
+            LOG.warning("Memcached get for vary index failed: %s", exc)
     data = _s3_get_json(vary_index_key)
     if data is None:
         return CacheMeta(404, {}, source="s3")
@@ -807,7 +807,7 @@ def get_vary_index(vary_index_key: str) -> CacheMeta:
         try:
             mc.set(_memcached_key(vary_index_key), json.dumps(data), expire=0)
         except Exception as exc:
-            LOG.debug("Memcached write-back for vary index failed: %s", exc)
+            LOG.warning("Memcached write-back for vary index failed: %s", exc)
     return CacheMeta(200, data, source="s3")
 
 
@@ -1925,7 +1925,7 @@ class Proxy:
                 try:
                     _memcached_set_metadata(mc, cache_key, meta)
                 except Exception as mc_exc:
-                    LOG.debug("Memcached set after cache save failed: %s", mc_exc)
+                    LOG.warning("Memcached set after cache save failed: %s", mc_exc)
 
             # 3. Write the vary index (if applicable)
             if vary_header:
@@ -1936,7 +1936,7 @@ class Proxy:
                     try:
                         mc.set(_memcached_key(vary_index_key), json.dumps(vary_data), expire=0)
                     except Exception as mc_exc:
-                        LOG.debug("Memcached set for vary index failed: %s", mc_exc)
+                        LOG.warning("Memcached set for vary index failed: %s", mc_exc)
         except Exception as e:
             LOG.error("Cache save error %s, %s", url, e)
             _log_exception(
