@@ -36,7 +36,7 @@ dependencies = [
     "click>=8.0",
     "pymemcache>=4.0",
     "flask>=2.0",
-    "mitmproxy @ https://github.com/bra-fsn/mitmproxy/archive/local_file_streaming.tar.gz",
+    "mitmproxy>=12,<13",
     "pyarrow",
     "pytz>=2023.0",
     "requests>=2.28",
@@ -66,9 +66,6 @@ passsage = "passsage.cli:main"
 [project.urls]
 Homepage = "https://github.com/bra-fsn/passsage"
 Repository = "https://github.com/bra-fsn/passsage"
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.version]
 path = "src/passsage/__init__.py"
