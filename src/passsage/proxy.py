@@ -752,6 +752,8 @@ def _update_memcached_client() -> None:
             dead_timeout=30,
             retry_attempts=2,
             retry_timeout=1,
+            use_pooling=True,
+            max_pool_size=16,
         )
     except Exception as exc:
         LOG.warning("Memcached client init failed: %s", exc)
