@@ -30,17 +30,25 @@ See https://docs.mitmproxy.org/stable/concepts/how-mitmproxy-works/ for the deta
 Passsage resolves each request to a cache policy, then uses S3 object metadata to decide
 whether to serve from cache or go upstream. In brief:
 
-- Cache hits are streamed from a local mount of the S3 bucket (`--mount-s3-path`,
-  required). The mount is typically provided by `mountpoint-s3` or `s3fs`.
-  `Cache-Status` is set to `hit` and `Age` is derived from the stored timestamp.
+- **With xs3lerator** (`--xs3lerator-url`): GET requests are routed through
+  [xs3lerator](../xs3lerator/), which handles parallel downloads from both S3
+  (cache hits) and upstream HTTP servers (cache misses), and simultaneously
+  uploads data to S3 on miss. Passsage manages metadata only (`.meta` JSON,
+  vary indexes, memcached). HEAD requests are served synthetically from
+  memcached metadata when fresh, or via direct upstream HEAD otherwise.
+- **Without xs3lerator** (legacy mode): cache hits are fetched from an HTTP
+  object store (`--object-store-url`, required). Passsage uploads data to S3
+  on cache miss.
 - Object metadata is stored in separate `.meta` JSON objects in S3 and cached in
   memcached for fast lookups. The data objects themselves are immutable.
-- S3 cache keys use the format `<scheme>/<host>/<sha224>[.<ext>]`
-  (e.g. `https/ftp.bme.hu/a1b2c3d4...56.iso`). Metadata lives at
+- S3 cache keys use hash-prefixed format
+  `<scheme>/<host>/<h>/<a>/<s>/<h>/<sha224>[.<ext>]`
+  (e.g. `https/ftp.bme.hu/f/f/3/0/ff30f95e...56.iso`). The hash prefix depth
+  is configurable (`--s3-hash-prefix-depth`, default 4) and distributes objects
+  across 65,536 S3 prefixes to avoid per-prefix throttling. Metadata lives at
   `<key>.meta`. Vary-aware keys append `+<sha224-of-vary-values>`.
-  Vary index objects live under `<scheme>/<host>/_vary/`.
-  Keys are POSIX filesystem-safe and bounded at ~340 bytes, so they work both on S3
-  and on a local `mountpoint-s3` mount.
+  Vary index objects live under `<scheme>/<host>/_vary/<h>/<a>/<s>/<h>/`.
+  Memcached keys remain unprefixed.
 - `NoRefresh` serves from cache immediately on a hit (no revalidation).
 - `Standard` revalidates with an upstream `HEAD` when stale; if the cached `ETag`/`Last-Modified`
   matches, the cached object is served.
@@ -52,16 +60,56 @@ whether to serve from cache or go upstream. In brief:
 `Standard` follows RFC 9111 HTTP caching semantics; `stale-if-error` and
 `stale-while-revalidate` are supported when present.
 
-On cache misses, Passsage fetches from upstream and streams the response to the client.
+On cache misses, the response is fetched from upstream and streamed to the client.
+With xs3lerator enabled, data fetching and S3 upload is handled by xs3lerator;
+Passsage only saves metadata (`.meta` and vary index). Without xs3lerator,
+Passsage uploads the data to S3 itself.
 Responses are saved to S3 unless caching is disabled by policy or response headers
 (`Cache-Control: no-store` or `private`, or `Vary: *`). When `Vary` is present, cache
 keys include the `Vary` request headers so separate variants are stored and served.
 
 ## Example production setup
 
-A typical deployment uses Passsage as the TLS-terminating cache with the S3 bucket
-mounted locally via `mountpoint-s3` or `s3fs`. Cache hits are streamed directly from
-the FUSE mount. Clients point `HTTP_PROXY`/`HTTPS_PROXY` at Passsage.
+A typical deployment uses Passsage as the TLS-terminating policy engine with
+xs3lerator handling all data transfer. On a cache hit, Passsage rewrites the
+GET request to xs3lerator, which serves the data from S3 using parallel
+range-GETs. On a cache miss, xs3lerator fetches from the real upstream with
+adaptive parallel downloads and simultaneously uploads to S3. Clients point
+`HTTP_PROXY`/`HTTPS_PROXY` at Passsage.
+
+```
+                                             ┌────────────┐
+                                        ┌───▶│  Upstream  │
+                                        │ ◀──│  Servers   │
+                                        │    │ (PyPI etc) │
+┌──────────────┐     ┌──────────────┐   │    └────────────┘
+│   Client     │────▶│   Passsage   │   │
+│ (pip, curl,  │◀────│ (policy +    │   │
+│  docker...)  │     │  metadata)   │   │
+└──────────────┘     └──────┬───────┘   │
+                            │           │
+                  GET       │           │
+                  requests  │           │
+                            ▼           │
+                     ┌──────────────┐   │    ┌──────────┐
+                     │  xs3lerator  │───┘    │  AWS S3  │
+                     │ (data plane) │◀──────▶│ (cache)  │
+                     └──────────────┘        └──────────┘
+                            │
+                   metadata │  .meta JSON
+                   only     │  vary index
+                            │  memcached
+                            ▼
+                     ┌──────────────┐
+                     │  Passsage    │
+                     │ (writes meta │
+                     │  to S3 +    │
+                     │  memcached)  │
+                     └──────────────┘
+```
+
+For deployments without xs3lerator (legacy mode), Passsage can still use an
+HTTP object store directly:
 
 ```
 ┌──────────────┐     ┌──────────────────────┐     ┌────────────┐
@@ -70,9 +118,9 @@ the FUSE mount. Clients point `HTTP_PROXY`/`HTTPS_PROXY` at Passsage.
 │  docker...)  │     │   :3128              │     │ (PyPI etc) │
 └──────────────┘     └──────┬──────┬────────┘     └────────────┘
                             │      │
-                    reads   │      │  writes cached objects +
-                    cached  │      │  .meta JSON + vary index
-                    data    │      │
+                   fetches  │      │  writes cached objects +
+                   cached   │      │  .meta JSON + vary index
+                   objects  │      │
                             │      ▼
                             │  ┌──────────┐
                             │  │  AWS S3  │
@@ -81,8 +129,9 @@ the FUSE mount. Clients point `HTTP_PROXY`/`HTTPS_PROXY` at Passsage.
                             │
                             ▼
                      ┌──────────────────────┐
-                     │   FUSE mount         │
-                     │ (mountpoint-s3/s3fs) │
+                     │   Object Store HTTP  │
+                     │  (S3 public bucket,  │
+                     │   nginx, or similar) │
                      └──────────────────────┘
 ```
 
@@ -191,7 +240,8 @@ awslocal s3api put-bucket-policy --bucket proxy-cache --policy '{
 Run Passsage:
 
 ```bash
-passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache --mount-s3-path /mnt/s3
+passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache \
+    --object-store-url http://localhost:4566/proxy-cache
 ```
 
 ### Environment Variables
@@ -203,7 +253,7 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache --mount-s3-
 | `S3_BUCKET` | S3 bucket name for cache storage | `364189071156-ds-proxy-us-west-2` (AWS) or `proxy-cache` (custom endpoint) |
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
 | `PASSSAGE_PUBLIC_PROXY_URL` | Externally reachable proxy URL for the onboarding script (e.g. `http://proxy.example.com:3128`). Required behind a load balancer or in Kubernetes. | None |
-| `PASSSAGE_MOUNT_S3_PATH` | Local mount path for the S3 bucket (required). Cache hits are streamed from this path. | (required) |
+| `PASSSAGE_OBJECT_STORE_URL` | HTTP URL of the object store exposing the S3 cache namespace (required). Cache hits are fetched from this URL. | (required) |
 | `PASSSAGE_MEMCACHED_SERVERS` | Comma-separated memcached servers (host:port) for metadata caching. | None |
 | `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `0` |
 | `PASSSAGE_ACCESS_LOG_PREFIX` | S3 prefix for access logs | `__passsage_logs__` |
@@ -219,6 +269,8 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache --mount-s3-
 | `PASSSAGE_CONNECTION_STRATEGY` | Mitmproxy connection strategy: `lazy` (default) or `eager` | `lazy` |
 | `PASSSAGE_MITM_CA_CERT` | mitmproxy CA certificate (PEM file path or inline PEM). Written to `~/.mitmproxy/mitmproxy-ca-cert.pem` before startup. | None |
 | `PASSSAGE_MITM_CA` | mitmproxy CA key+cert bundle (PEM file path or inline PEM). Written to `~/.mitmproxy/mitmproxy-ca.pem` before startup. | None |
+| `PASSSAGE_XS3LERATOR_URL` | xs3lerator base URL (e.g. `http://localhost:8080`). When set, GET requests are routed through xs3lerator for parallel download and S3 caching. | None (disabled) |
+| `PASSSAGE_S3_HASH_PREFIX_DEPTH` | Number of hash characters to use as S3 path prefix segments (e.g. 4 produces `f/f/3/0/hash...`). Distributes objects across prefixes to avoid S3 throttling. | `4` |
 
 ### CLI Options
 
@@ -236,8 +288,8 @@ Options:
   -v, --verbose                   Enable verbose logging
   --public-proxy-url TEXT         Externally reachable proxy URL for client onboarding
                                   (env: PASSSAGE_PUBLIC_PROXY_URL)
-  --mount-s3-path TEXT            Local mount path for S3 bucket (required)
-                                  (env: PASSSAGE_MOUNT_S3_PATH)
+  --object-store-url TEXT         HTTP URL of the object store (required)
+                                  (env: PASSSAGE_OBJECT_STORE_URL)
   --memcached-servers TEXT        Comma-separated memcached servers (host:port)
                                   (env: PASSSAGE_MEMCACHED_SERVERS)
   --access-logs                   Enable S3 access logs in Parquet format
@@ -255,6 +307,10 @@ Options:
   --health-host TEXT              Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)
   --connection-strategy [lazy|eager]
                                   Upstream TLS connection strategy (default: lazy)
+  --xs3lerator-url TEXT          xs3lerator base URL for parallel GET downloads and S3 caching
+                                  (env: PASSSAGE_XS3LERATOR_URL)
+  --s3-hash-prefix-depth INT    Hash prefix depth for S3 key partitioning (default: 4)
+                                  (env: PASSSAGE_S3_HASH_PREFIX_DEPTH)
   --web                           Enable mitmproxy web interface
   --version                       Show the version and exit.
   --help                          Show this message and exit.
@@ -303,61 +359,6 @@ Error UI:
 pip install "passsage[ui]"
 passsage errors --start-date 2026-02-01 --end-date 2026-02-02
 ```
-
-### Troubleshooting
-
-#### Clients not honoring `no_proxy`
-
-When the proxy serves a cache-hit redirect, the client should fetch the cached object
-directly from the S3/objects backend (configured via `no_proxy`). If a client ignores
-`no_proxy` and routes the object request back through the proxy, the access log records
-this with `serve_reason=no_cache_s3_request` and the response includes an
-`x-passsage-warning` header.
-
-Find these requests in the access logs:
-
-```bash
-passsage logs --start-date 2026-02-01 --end-date 2026-02-14 \
-    -f serve_reason=no_cache_s3_request
-```
-
-For clients that are known to not honor `no_proxy` reliably (e.g. `pip`), the proxy
-can stream the response directly instead of issuing a redirect. This is controlled by
-the `--no-redirect-user-agents` option (defaults to `pip/`).
-
-#### `no_proxy` client compatibility
-
-There is no standard for how clients handle the `no_proxy` environment variable.
-Behavior varies across tools and languages:
-
-| Client | `no_proxy` | `NO_PROXY` | `*` matches all | Leading dot stripped | CIDR |
-|---|---|---|---|---|---|
-| curl | Yes | Yes | Yes | Yes | No |
-| wget | Yes | No | No | No | No |
-| Python requests | Yes | Yes | Yes | Yes | No |
-| Go net/http | Yes | Yes | Yes | No | Yes |
-| Ruby Net::HTTP | Yes | Yes | No | Yes | Yes |
-| Node.js (native) | No | No | N/A | N/A | N/A |
-
-Known issues:
-
-- **pip**: Ignores `no_proxy` when proxy is set via `pip.ini` config rather than
-  environment variables. Build isolation (`pyproject.toml`) loses proxy config
-  entirely. This is why passsage defaults `--no-redirect-user-agents` to `pip/`.
-- **npm 10.x**: Had a regression ignoring proxy environment variables entirely.
-- **yarn**: Ignores `no_proxy` when proxy is set in config files.
-- **Node.js**: Does not use proxy environment variables without third-party packages.
-- **Java**: Uses system properties (`http.nonProxyHosts`), ignores `no_proxy` env var.
-
-Safest `no_proxy` format (works across all clients):
-
-```bash
-export no_proxy="localhost,127.0.0.1,::1,objects.example.com"
-```
-
-Use lowercase `no_proxy`, comma-separated exact hostnames, no leading dots,
-no wildcards, no CIDR blocks. For a detailed analysis of cross-client differences, see
-[We need to talk: Can we standardize NO_PROXY?](https://about.gitlab.com/blog/we-need-to-talk-no-proxy/).
 
 ### As a mitmproxy Script
 

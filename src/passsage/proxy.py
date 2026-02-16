@@ -2,6 +2,7 @@
 # handle upstream authentication
 # collect and expose metrics/stats (with limited number of entries), like top list for misses, hits, etc.
 
+import base64
 import copy
 import json
 import hashlib
@@ -127,6 +128,14 @@ ERROR_LOG_DIR = os.environ.get("PASSSAGE_ERROR_LOG_DIR", "/tmp/passsage-errors")
 ERROR_LOG_FLUSH_SECONDS = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_SECONDS", "30").strip()
 ERROR_LOG_FLUSH_BYTES = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_BYTES", "256M").strip()
 OBJECT_STORE_URL = os.environ.get("PASSSAGE_OBJECT_STORE_URL", "").strip()
+
+
+def _s3_hash_prefix_depth() -> int:
+    """Get the S3 hash prefix depth from mitmproxy options, with fallback."""
+    try:
+        return getattr(ctx.options, "s3_hash_prefix_depth", 4)
+    except Exception:
+        return int(os.environ.get("PASSSAGE_S3_HASH_PREFIX_DEPTH", "4"))
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -1129,6 +1138,10 @@ def _rewrite_to_object_store(flow):
     URL.  The response will be handled by mitmproxy's normal proxy flow;
     metadata headers are applied later in responseheaders.
     """
+    xs3lerator_url = getattr(ctx.options, "xs3lerator_url", "")
+    if xs3lerator_url and flow.request.method == "GET":
+        _rewrite_to_xs3lerator(flow, cache_skip=False)
+        return
     store_url = ctx.options.object_store_url
     parsed = urlparse(store_url)
     flow.request.scheme = parsed.scheme or "http"
@@ -1139,6 +1152,46 @@ def _rewrite_to_object_store(flow):
     flow._object_store_rewrite = True
     flow._cached = True
     flow._save_response = False
+
+
+def _rewrite_to_xs3lerator(flow, cache_skip: bool):
+    """Rewrite GET request to route through xs3lerator.
+
+    xs3lerator handles parallel downloads, S3 caching, and range requests.
+    """
+    xs3lerator_url = ctx.options.xs3lerator_url
+    parsed = urlparse(xs3lerator_url)
+    flow._original_url = flow.request.url
+
+    flow.request.scheme = parsed.scheme or "http"
+    flow.request.host = parsed.hostname
+    flow.request.port = parsed.port or 8080
+
+    s3_key = flow._cache_key
+    flow.request.path = f"/{S3_BUCKET}/{s3_key}"
+
+    flow.request.headers["X-Xs3lerator-Upstream-Url"] = base64.b64encode(
+        flow._original_url.encode()
+    ).decode()
+    if cache_skip:
+        flow.request.headers["X-Xs3lerator-Cache-Skip"] = "true"
+    elif flow._cache_head and flow._cache_head.meta.get("headers", {}).get("content-length"):
+        flow.request.headers["X-Xs3lerator-Object-Size"] = (
+            flow._cache_head.meta["headers"]["content-length"]
+        )
+
+    flow._xs3lerator_rewrite = True
+    flow._object_store_rewrite = True
+    flow._cached = not cache_skip
+    flow._save_response = cache_skip
+
+
+def _rewrite_to_xs3lerator_miss(flow):
+    """Rewrite a cache miss GET to route through xs3lerator."""
+    xs3lerator_url = getattr(ctx.options, "xs3lerator_url", "")
+    if not xs3lerator_url:
+        return
+    _rewrite_to_xs3lerator(flow, cache_skip=True)
 
 
 def _fallback_fetch_from_object_store(flow) -> bool:
@@ -1348,6 +1401,22 @@ class Proxy:
             help="HTTP URL of the object store exposing the S3 cache namespace (required). "
                  "Cache hits are fetched from this URL. (env: PASSSAGE_OBJECT_STORE_URL)",
         )
+        loader.add_option(
+            name="xs3lerator_url",
+            typespec=str,
+            default=os.environ.get("PASSSAGE_XS3LERATOR_URL", ""),
+            help="HTTP URL of the xs3lerator service for GET request proxying. "
+                 "When set, GET requests are routed through xs3lerator for parallel "
+                 "downloads and S3 caching. (env: PASSSAGE_XS3LERATOR_URL)",
+        )
+        loader.add_option(
+            name="s3_hash_prefix_depth",
+            typespec=int,
+            default=int(os.environ.get("PASSSAGE_S3_HASH_PREFIX_DEPTH", "4")),
+            help="Number of hash characters to use as S3 path prefix directories. "
+                 "Depth 4 gives 65,536 prefixes to avoid S3 throttling. "
+                 "(env: PASSSAGE_S3_HASH_PREFIX_DEPTH)",
+        )
 
     @_log_hook_errors("configure")
     def configure(self, updated):
@@ -1403,6 +1472,9 @@ class Proxy:
         flow._vary_index_key = None
         flow._cache_saved = False
         flow._object_store_rewrite = False
+        flow._xs3lerator_rewrite = False
+        flow._xs3lerator_full_size = None
+        flow._original_url = None
         policy = flow._policy = get_policy(flow)
         if _is_s3_cache_request(flow):
             flow._save_response = False
@@ -1456,7 +1528,8 @@ class Proxy:
         flow._cache_vary = None
         try:
             normalized_url = _normalize_url(flow)
-            vary_index_key = get_vary_index_key(normalized_url)
+            depth = _s3_hash_prefix_depth()
+            vary_index_key = get_vary_index_key(normalized_url, hash_prefix_depth=depth)
             flow._vary_index_key = vary_index_key
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
             vary_index_head = get_vary_index(vary_index_key)
@@ -1471,7 +1544,7 @@ class Proxy:
                 if "*" not in vary_hdr:
                     vary_key = compute_vary_key(vary_hdr, flow.request.headers)
                     if vary_key is not None:
-                        flow._cache_key = get_cache_key(normalized_url, vary_key)
+                        flow._cache_key = get_cache_key(normalized_url, vary_key, hash_prefix_depth=depth)
                         LOG.debug(
                             "Cache lookup vary header=%s vary_key=%s cache_key=%s",
                             vary_hdr,
@@ -1479,7 +1552,7 @@ class Proxy:
                             flow._cache_key,
                         )
             if flow._cache_key is None and flow._cache_vary != "*":
-                flow._cache_key = get_cache_key(normalized_url)
+                flow._cache_key = get_cache_key(normalized_url, hash_prefix_depth=depth)
                 LOG.debug("Cache lookup default key=%s", flow._cache_key)
             if flow._cache_key:
                 flow._cache_head = get_cache_metadata(flow._cache_key)
@@ -1576,6 +1649,25 @@ class Proxy:
             allow_stale_if_error,
         )
 
+        # When xs3lerator is configured, serve fresh-cache HEAD requests
+        # synthetically from memcached metadata (no xs3lerator involvement).
+        xs3lerator_enabled = bool(getattr(ctx.options, "xs3lerator_url", ""))
+        if flow.request.method == "HEAD" and xs3lerator_enabled:
+            if cache_hit and cache_fresh:
+                meta = flow._cache_head.meta
+                headers_dict = meta.get("headers", {})
+                flow.response = http.Response.make(
+                    meta.get("status_code", 200), b"", headers_dict,
+                )
+                flow._save_response = False
+                flow._cached = True
+                flow._short_circuit = True
+                flow._serve_reason = "head_synthetic_from_cache"
+                return
+            # Stale/miss HEAD: fall through to existing upstream HEAD logic.
+            # xs3lerator is never involved for HEAD requests.
+            return
+
         if cache_hit:
             if policy == NoRefresh:
                 flow._serve_reason = "cache_hit_norefresh"
@@ -1595,15 +1687,13 @@ class Proxy:
         else:
             if (flow.request.method == "GET"
                     and flow.request.headers.get("if-modified-since")):
-                # Remove the if-mod-since client side header if we don't have
-                # the file, so we'll forcefully retrieve it from the
-                # upstream and store it in the cache.
-                # We do this to always have a copy regardless if the client has
-                # in its cache or if the request matches AlwaysUpstream, so when
-                # the upstream doesn't work, we have the chance of serving it.
-                # save the original, we'll need that for returning 304
                 flow._orig_data["if-modified-since"] = flow.request.headers.pop("if-modified-since", None)
-            if flow.request.method == "GET" and "Range" in flow.request.headers:
+            if xs3lerator_enabled and flow.request.method == "GET":
+                # With xs3lerator, pass Range through -- xs3lerator handles
+                # full-file download for S3 caching and serves the requested
+                # range to the client.
+                pass
+            elif flow.request.method == "GET" and "Range" in flow.request.headers:
                 # Strip Range on cache miss so upstream returns the full 200.
                 # We cache the full object and serve the requested range slice
                 # to the client in responseheaders.
@@ -1742,6 +1832,12 @@ class Proxy:
                 return
             flow._serve_reason = "cache_revalidated_content_changed"
 
+        # When xs3lerator is configured and we've reached here (cache miss or
+        # stale+content-changed), redirect the GET to xs3lerator for upstream
+        # download + S3 caching.
+        if xs3lerator_enabled and flow.request.method == "GET" and not getattr(flow, "_xs3lerator_rewrite", False):
+            _rewrite_to_xs3lerator_miss(flow)
+
 
     @_log_hook_errors("responseheaders")
     def responseheaders(self, flow):
@@ -1771,7 +1867,24 @@ class Proxy:
         # Identify proxy via Via (RFC 7230); do not rewrite Server header
         existing_via = flow.response.headers.get("via", "")
         flow.response.headers["via"] = f"{VIA_HEADER_VALUE}, {existing_via}" if existing_via else VIA_HEADER_VALUE
-        if getattr(flow, "_object_store_rewrite", False):
+        if getattr(flow, "_xs3lerator_rewrite", False):
+            # Process xs3lerator response headers
+            xs3_cache_hit = flow.response.headers.get("x-xs3lerator-cache-hit")
+            xs3_full_size = flow.response.headers.get("x-xs3lerator-full-size")
+            if xs3_full_size:
+                flow._xs3lerator_full_size = int(xs3_full_size)
+            if xs3_cache_hit == "false":
+                flow._save_response = True
+            # Strip all X-Xs3lerator-* response headers before forwarding to client
+            to_remove = [k for k in flow.response.headers if k.lower().startswith("x-xs3lerator-")]
+            for k in to_remove:
+                del flow.response.headers[k]
+            if flow.response.status_code in (200, 206):
+                flow.response.stream = True
+            elif flow.response.status_code == 404:
+                LOG.warning("xs3lerator returned 404 for key=%s",
+                            getattr(flow, "_cache_key", "?"))
+        elif getattr(flow, "_object_store_rewrite", False):
             if flow.response.status_code in (200, 206):
                 flow.response.stream = True
             elif flow.response.status_code == 404:
@@ -1865,22 +1978,26 @@ class Proxy:
         vary_header,
         vary_request,
         normalized_url,
+        xs3lerator_handled=False,
+        xs3lerator_full_size=None,
     ):
         try:
             s3 = get_s3_client()
-            f.flush()
-            f.seek(0)
+            if f is not None:
+                f.flush()
+                f.seek(0)
 
-            # 1. Upload the data object (immutable, no metadata)
-            extra_args = {}
-            s3_header_map = {
-                "content-type": "ContentType",
-                "content-encoding": "ContentEncoding",
-            }
-            for header, aws_key in s3_header_map.items():
-                if header in headers:
-                    extra_args[aws_key] = headers[header]
-            s3.upload_fileobj(f, S3_BUCKET, cache_key, ExtraArgs=extra_args or None)
+            if not xs3lerator_handled:
+                # 1. Upload the data object (immutable, no metadata)
+                extra_args = {}
+                s3_header_map = {
+                    "content-type": "ContentType",
+                    "content-encoding": "ContentEncoding",
+                }
+                for header, aws_key in s3_header_map.items():
+                    if header in headers:
+                        extra_args[aws_key] = headers[header]
+                s3.upload_fileobj(f, S3_BUCKET, cache_key, ExtraArgs=extra_args or None)
 
             # 2. Build and write the .meta JSON
             cached_headers = {}
@@ -1929,7 +2046,7 @@ class Proxy:
 
             # 3. Write the vary index (if applicable)
             if vary_header:
-                vary_index_key = get_vary_index_key(normalized_url)
+                vary_index_key = get_vary_index_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
                 vary_data = {"vary": vary_header}
                 _s3_put_json(vary_index_key, vary_data)
                 if mc:
@@ -1949,10 +2066,11 @@ class Proxy:
             )
             raise
         finally:
-            try:
-                f.close()
-            except Exception:
-                pass
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
     @_log_hook_errors("response")
     def response(self, flow):
@@ -1994,7 +2112,7 @@ class Proxy:
                 vary_key = compute_vary_key(vary_header, flow.request.headers)
                 if vary_key:
                     normalized_url = _normalize_url(flow)
-                    flow._cache_key = get_cache_key(normalized_url, vary_key)
+                    flow._cache_key = get_cache_key(normalized_url, vary_key, hash_prefix_depth=_s3_hash_prefix_depth())
                     flow._cache_vary = vary_header
                     flow._cache_vary_request = build_vary_request(
                         vary_header, flow.request.headers
@@ -2018,41 +2136,70 @@ class Proxy:
                     and flow._cache_head.meta.get("method") == "GET"):
                 flow._save_response = False
         if flow._save_response:
-            # save in the background
-            if flow._counter not in self.files or flow._counter not in self.hashes:
-                LOG.debug("Cache save skipped (no body recorded) counter=%s", flow._counter)
-                flow._save_response = False
-                self.log_response(flow)
-                with ctx._lock:
-                    self.cleanup(flow)
-                return
-            normalized_url = _normalize_url(flow)
-            cache_key = flow._cache_key or get_cache_key(normalized_url)
-            flow._cache_saved = True
-            LOG.debug("Cache save enqueue key=%s", cache_key)
-            save_headers = flow.response.headers
-            if getattr(flow, "_orig_range", None):
+            is_xs3lerator = getattr(flow, "_xs3lerator_rewrite", False)
+            xs3_full_size = getattr(flow, "_xs3lerator_full_size", None)
+
+            if is_xs3lerator:
+                # xs3lerator handles data upload to S3 -- we only save metadata
+                normalized_url = _normalize_url(flow)
+                cache_key = flow._cache_key or get_cache_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
+                flow._cache_saved = True
+                LOG.debug("Cache save enqueue (metadata only, xs3lerator) key=%s", cache_key)
                 save_headers = flow.response.headers.copy()
-                if "content-length" in flow._orig_data:
-                    save_headers["content-length"] = flow._orig_data["content-length"]
+                if xs3_full_size:
+                    save_headers["content-length"] = str(xs3_full_size)
                 if "content-range" in save_headers:
                     del save_headers["content-range"]
-            ctx._executor.submit(
-                self._save_to_cache,
-                # save the original values in the cache for eg. in a
-                # 304 not-modified situation
-                flow._orig_data.get("status_code") or flow.response.status_code,
-                flow._orig_data.get("reason") or flow.response.reason,
-                flow.request.method,
-                self.files[flow._counter],
-                self.hashes[flow._counter].hexdigest(),
-                save_headers,
-                flow.request.url,
-                cache_key,
-                getattr(flow, "_cache_vary", None),
-                getattr(flow, "_cache_vary_request", None),
-                normalized_url,
-            )
+                ctx._executor.submit(
+                    self._save_to_cache,
+                    flow._orig_data.get("status_code") or flow.response.status_code,
+                    flow._orig_data.get("reason") or flow.response.reason,
+                    flow.request.method,
+                    None,
+                    None,
+                    save_headers,
+                    getattr(flow, "_original_url", flow.request.url),
+                    cache_key,
+                    getattr(flow, "_cache_vary", None),
+                    getattr(flow, "_cache_vary_request", None),
+                    normalized_url,
+                    xs3lerator_handled=True,
+                    xs3lerator_full_size=xs3_full_size,
+                )
+            else:
+                # save in the background
+                if flow._counter not in self.files or flow._counter not in self.hashes:
+                    LOG.debug("Cache save skipped (no body recorded) counter=%s", flow._counter)
+                    flow._save_response = False
+                    self.log_response(flow)
+                    with ctx._lock:
+                        self.cleanup(flow)
+                    return
+                normalized_url = _normalize_url(flow)
+                cache_key = flow._cache_key or get_cache_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
+                flow._cache_saved = True
+                LOG.debug("Cache save enqueue key=%s", cache_key)
+                save_headers = flow.response.headers
+                if getattr(flow, "_orig_range", None):
+                    save_headers = flow.response.headers.copy()
+                    if "content-length" in flow._orig_data:
+                        save_headers["content-length"] = flow._orig_data["content-length"]
+                    if "content-range" in save_headers:
+                        del save_headers["content-range"]
+                ctx._executor.submit(
+                    self._save_to_cache,
+                    flow._orig_data.get("status_code") or flow.response.status_code,
+                    flow._orig_data.get("reason") or flow.response.reason,
+                    flow.request.method,
+                    self.files[flow._counter],
+                    self.hashes[flow._counter].hexdigest(),
+                    save_headers,
+                    flow.request.url,
+                    cache_key,
+                    getattr(flow, "_cache_vary", None),
+                    getattr(flow, "_cache_vary_request", None),
+                    normalized_url,
+                )
 
         if flow.response.status_code == 304:
             # empty content on 304 not-modified, even if we have a fully cached
