@@ -246,6 +246,25 @@ import click
     help="HTTP URL of the object store exposing the S3 cache namespace (required). "
     "Cache hits are fetched from this URL. (env: PASSSAGE_OBJECT_STORE_URL)"
 )
+@click.option(
+    "--xs3lerator-url",
+    envvar="PASSSAGE_XS3LERATOR_URL",
+    default="",
+    show_default=True,
+    help="HTTP URL of the xs3lerator service for GET request proxying. "
+    "When set, GET requests are routed through xs3lerator for parallel "
+    "downloads and S3 caching. (env: PASSSAGE_XS3LERATOR_URL)"
+)
+@click.option(
+    "--s3-hash-prefix-depth",
+    envvar="PASSSAGE_S3_HASH_PREFIX_DEPTH",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Number of hash characters to use as S3 path prefix directories. "
+    "Depth 4 gives 65,536 prefixes to avoid S3 throttling. "
+    "(env: PASSSAGE_S3_HASH_PREFIX_DEPTH)"
+)
 @click.version_option()
 @click.pass_context
 def main(
@@ -281,6 +300,8 @@ def main(
     mitm_ca,
     memcached_servers,
     object_store_url,
+    xs3lerator_url,
+    s3_hash_prefix_depth,
 ):
     """
     Passsage (Pas³age) - S3-backed caching proxy.
@@ -336,6 +357,8 @@ def main(
             mitm_ca,
             memcached_servers,
             object_store_url,
+            xs3lerator_url,
+            s3_hash_prefix_depth,
         )
 
 
@@ -394,6 +417,8 @@ def run_proxy(
     mitm_ca=None,
     memcached_servers="",
     object_store_url="",
+    xs3lerator_url="",
+    s3_hash_prefix_depth=4,
 ):
     if mitm_ca_cert or mitm_ca:
         _install_mitm_certs(mitm_ca_cert, mitm_ca)
@@ -474,6 +499,10 @@ def run_proxy(
         args.extend(["--set", f"memcached_servers={memcached_servers}"])
     os.environ["PASSSAGE_OBJECT_STORE_URL"] = object_store_url
     args.extend(["--set", f"object_store_url={object_store_url}"])
+    if xs3lerator_url:
+        os.environ["PASSSAGE_XS3LERATOR_URL"] = xs3lerator_url
+        args.extend(["--set", f"xs3lerator_url={xs3lerator_url}"])
+    args.extend(["--set", f"s3_hash_prefix_depth={s3_hash_prefix_depth}"])
 
     if verbose:
         args.extend(["-v"])
