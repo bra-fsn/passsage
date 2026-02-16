@@ -1,30 +1,19 @@
 """Default cache key normalization rules.
 
-This module defines built-in cache key normalization for URLs that use
-signed query parameters (e.g. S3/R2, Cloudflare Registry blobs). The goal
-is to avoid cache fragmentation when signed URLs differ only by ephemeral
-credentials.
+This module strips ephemeral signing/credential query parameters from
+*any* URL so that differently-signed requests to the same resource share
+a single cache entry.  The upstream request still uses the original URL;
+only the cache key is normalized.
 
-How it works
-------------
-- Match known object storage hosts.
-- Strip query params based on a configurable rule table:
-  - remove any params with a given prefix (e.g. X-Amz-*)
-  - remove any params in a given allowlist (e.g. expires, signature, version)
-- The upstream request still uses the original URL; only the cache key is normalized.
+Covered signing schemes
+-----------------------
+- AWS Signature V4        – ``X-Amz-*`` prefix
+- AWS CloudFront signed   – Expires, Policy, Signature, Key-Pair-Id
+- Azure SAS               – se, sig, sp, sv, …
 
-Example
--------
-Original request URL:
-    https://example.r2.cloudflarestorage.com/path/blob
-    ?X-Amz-Algorithm=AWS4-HMAC-SHA256
-    &X-Amz-Credential=...
-    &X-Amz-Date=20260204T210046Z
-    &X-Amz-Expires=1200
-    &X-Amz-Signature=...
-
-Normalized cache key:
-    https://example.r2.cloudflarestorage.com/path/blob
+Because these parameter names are unambiguous credentials/signatures,
+they are stripped regardless of host.  Any remaining query parameters are
+kept (sorted for determinism).
 
 Extending in a policy file
 --------------------------
@@ -73,9 +62,25 @@ class CallableRule:
         return self.func(ctx)
 
 
-_SIGNED_QUERY_PREFIX = "x-amz-"
-_CLOUDFLARE_SIGNED_PARAMS = {"expires", "signature", "version"}
-_AZURE_SIGNED_PARAMS = {
+# AWS Signature V4 – all params start with this prefix.
+# Example: S3 presigned
+#   https://my-bucket.s3.amazonaws.com/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...&X-Amz-Signature=...
+# Example: R2 presigned
+#   https://account.r2.cloudflarestorage.com/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...
+# Example: HuggingFace (xethub) redirect – combines AWS SigV4 + CloudFront signing
+#   https://cas-bridge.xethub.hf.co/xet-bridge-us/abc/def?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=...&Expires=...&Policy=...&Signature=...&Key-Pair-Id=...
+_SIGNED_QUERY_PREFIXES = ("x-amz-",)
+
+_SIGNED_QUERY_PARAMS = frozenset({
+    # AWS CloudFront signed URLs
+    # Example: https://d111111abcdef8.cloudfront.net/path?Expires=...&Policy=...&Signature=...&Key-Pair-Id=...
+    "expires",
+    "key-pair-id",
+    "policy",
+    "signature",
+    # Azure SAS tokens
+    # Example: https://pkg-containers.githubusercontent.com/ghcr1/blobs/sha256:abc?se=2026-02-04T22:30:00Z&sig=...&sv=2025-01-05
+    # Example: https://myaccount.blob.core.windows.net/container/blob?sp=r&st=...&se=...&sv=...&sr=b&sig=...
     "se",
     "sig",
     "ske",
@@ -89,86 +94,29 @@ _AZURE_SIGNED_PARAMS = {
     "sr",
     "sv",
     "hmac",
-}
-_SIGNED_QUERY_RULES = (
-    {
-        "host_suffixes": ("r2.cloudflarestorage.com", "amazonaws.com"),
-        "remove_prefixes": (_SIGNED_QUERY_PREFIX,),
-        "remove_params": (),
-    },
-    {
-        "host_suffixes": ("production.cloudflare.docker.com",),
-        "remove_prefixes": (),
-        "remove_params": tuple(sorted(_CLOUDFLARE_SIGNED_PARAMS)),
-    },
-    {
-        "host_suffixes": ("pkg-containers.githubusercontent.com",),
-        "remove_prefixes": (),
-        "remove_params": tuple(sorted(_AZURE_SIGNED_PARAMS)),
-    },
-)
+})
 
 
-class _SuffixTrieNode:
-    __slots__ = ("children", "rules")
-
-    def __init__(self) -> None:
-        self.children: dict[str, _SuffixTrieNode] = {}
-        self.rules: list[dict[str, tuple[str, ...]]] = []
+def _is_signed_param(name: str) -> bool:
+    lower = name.lower()
+    return lower.startswith(_SIGNED_QUERY_PREFIXES) or lower in _SIGNED_QUERY_PARAMS
 
 
-def _build_suffix_trie(rules: tuple[dict[str, tuple[str, ...]], ...]) -> _SuffixTrieNode:
-    root = _SuffixTrieNode()
-    for rule in rules:
-        for suffix in rule["host_suffixes"]:
-            node = root
-            for ch in reversed(suffix):
-                node = node.children.setdefault(ch, _SuffixTrieNode())
-            node.rules.append(rule)
-    return root
-
-
-_SIGNED_QUERY_TRIE = _build_suffix_trie(_SIGNED_QUERY_RULES)
-
-
-def _strip_signed_query(ctx: Context, remove_prefixes: tuple[str, ...], remove_params: tuple[str, ...]) -> str | None:
+def _strip_signed_params(ctx: Context) -> str | None:
     parts = urlsplit(ctx.url)
     if not parts.query:
         return None
     pairs = parse_qsl(parts.query, keep_blank_values=True)
-    if not any(
-        name.lower().startswith(remove_prefixes) or name.lower() in remove_params
-        for name, _ in pairs
-    ):
+    if not any(_is_signed_param(name) for name, _ in pairs):
         return None
-    filtered = [
-        (name, value)
-        for (name, value) in pairs
-        if not name.lower().startswith(remove_prefixes) and name.lower() not in remove_params
-    ]
+    filtered = [(n, v) for n, v in pairs if not _is_signed_param(n)]
     if filtered:
-        # Normalize order to avoid cache misses from param reordering.
         filtered.sort(key=lambda item: (item[0].lower(), item[0], item[1]))
     query = urlencode(filtered, doseq=True)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
-def _signed_storage_rule(ctx: Context) -> str | None:
-    if not ctx.host:
-        return None
-    host = ctx.host
-    node = _SIGNED_QUERY_TRIE
-    for ch in reversed(host):
-        if ch not in node.children:
-            break
-        node = node.children[ch]
-        if node.rules:
-            for rule in node.rules:
-                return _strip_signed_query(ctx, rule["remove_prefixes"], rule["remove_params"])
-    return None
-
-
 def default_rules():
     return [
-        CallableRule(_signed_storage_rule),
+        CallableRule(_strip_signed_params),
     ]
