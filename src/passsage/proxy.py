@@ -240,6 +240,25 @@ def _s3_put_json(key: str, data: dict) -> None:
     )
 
 
+def _s3_copy_object(src_key: str, dst_key: str, max_retries: int = 5) -> None:
+    """Server-side S3 copy with retry for eventual consistency."""
+    s3 = get_s3_client()
+    for attempt in range(max_retries):
+        try:
+            s3.copy_object(
+                Bucket=S3_BUCKET,
+                CopySource={"Bucket": S3_BUCKET, "Key": src_key},
+                Key=dst_key,
+            )
+            LOG.debug("S3 copy %s -> %s", src_key, dst_key)
+            return
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey" and attempt < max_retries - 1:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise
+
+
 def _no_proxy_s3_hosts() -> str:
     return S3_HOST
 
@@ -1983,6 +2002,11 @@ class Proxy:
                     if header in headers:
                         extra_args[aws_key] = headers[header]
                 s3.upload_fileobj(f, S3_BUCKET, cache_key, ExtraArgs=extra_args or None)
+
+            if xs3lerator_handled and vary_header:
+                base_key = get_cache_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
+                if base_key != cache_key:
+                    _s3_copy_object(base_key, cache_key)
 
             # 2. Build and write the .meta JSON
             cached_headers = {}
