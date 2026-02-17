@@ -485,7 +485,9 @@ class TestProxyLive:
 
         for policy_name in ("Standard", "AlwaysUpstream", "NoCache"):
             resp = proxy_get(proxy_session, url, headers=policy_headers(policy_name), timeout=30)
-            assert resp.status_code == 500
+            assert resp.status_code == 500, (
+                f"Expected 500 for {policy_name}, got {resp.status_code}"
+            )
             assert "Cache-Status" not in resp.headers
 
     def test_cache_control_no_store(self, proxy_session, test_server, cache_bust_random):
