@@ -240,20 +240,13 @@ import click
     "e.g. cache-0.cache:11211,cache-1.cache:11211 (env: PASSSAGE_MEMCACHED_SERVERS)"
 )
 @click.option(
-    "--object-store-url",
-    envvar="PASSSAGE_OBJECT_STORE_URL",
-    required=True,
-    help="HTTP URL of the object store exposing the S3 cache namespace (required). "
-    "Cache hits are fetched from this URL. (env: PASSSAGE_OBJECT_STORE_URL)"
-)
-@click.option(
     "--xs3lerator-url",
     envvar="PASSSAGE_XS3LERATOR_URL",
-    default="",
-    show_default=True,
-    help="HTTP URL of the xs3lerator service for GET request proxying. "
-    "When set, GET requests are routed through xs3lerator for parallel "
-    "downloads and S3 caching. (env: PASSSAGE_XS3LERATOR_URL)"
+    required=True,
+    help="HTTP URL of the xs3lerator service (required). "
+    "All GET requests (cache hits and misses) are routed through xs3lerator "
+    "for parallel downloads and S3 caching. Non-GET verbs go directly to "
+    "upstream. (env: PASSSAGE_XS3LERATOR_URL)"
 )
 @click.option(
     "--s3-hash-prefix-depth",
@@ -299,7 +292,6 @@ def main(
     mitm_ca_cert,
     mitm_ca,
     memcached_servers,
-    object_store_url,
     xs3lerator_url,
     s3_hash_prefix_depth,
 ):
@@ -356,7 +348,6 @@ def main(
             mitm_ca_cert,
             mitm_ca,
             memcached_servers,
-            object_store_url,
             xs3lerator_url,
             s3_hash_prefix_depth,
         )
@@ -416,7 +407,6 @@ def run_proxy(
     mitm_ca_cert=None,
     mitm_ca=None,
     memcached_servers="",
-    object_store_url="",
     xs3lerator_url="",
     s3_hash_prefix_depth=4,
 ):
@@ -497,11 +487,8 @@ def run_proxy(
     args.extend(["--set", f"connection_strategy={connection_strategy}"])
     if memcached_servers:
         args.extend(["--set", f"memcached_servers={memcached_servers}"])
-    os.environ["PASSSAGE_OBJECT_STORE_URL"] = object_store_url
-    args.extend(["--set", f"object_store_url={object_store_url}"])
-    if xs3lerator_url:
-        os.environ["PASSSAGE_XS3LERATOR_URL"] = xs3lerator_url
-        args.extend(["--set", f"xs3lerator_url={xs3lerator_url}"])
+    os.environ["PASSSAGE_XS3LERATOR_URL"] = xs3lerator_url
+    args.extend(["--set", f"xs3lerator_url={xs3lerator_url}"])
     args.extend(["--set", f"s3_hash_prefix_depth={s3_hash_prefix_depth}"])
 
     if verbose:

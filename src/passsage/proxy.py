@@ -127,7 +127,7 @@ ERROR_LOG_PREFIX = os.environ.get("PASSSAGE_ERROR_LOG_PREFIX", "__passsage_error
 ERROR_LOG_DIR = os.environ.get("PASSSAGE_ERROR_LOG_DIR", "/tmp/passsage-errors").strip()
 ERROR_LOG_FLUSH_SECONDS = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_SECONDS", "30").strip()
 ERROR_LOG_FLUSH_BYTES = os.environ.get("PASSSAGE_ERROR_LOG_FLUSH_BYTES", "256M").strip()
-OBJECT_STORE_URL = os.environ.get("PASSSAGE_OBJECT_STORE_URL", "").strip()
+
 
 
 def _s3_hash_prefix_depth() -> int:
@@ -1132,26 +1132,13 @@ def build_vary_request(vary_header: str, request_headers) -> str | None:
 
 
 def _rewrite_to_object_store(flow):
-    """Rewrite the request to fetch the cached object from the object store.
+    """Rewrite a cache-hit GET to fetch via xs3lerator.
 
-    Modifies flow.request in-place to point at the configured object store
-    URL.  The response will be handled by mitmproxy's normal proxy flow;
-    metadata headers are applied later in responseheaders.
+    xs3lerator handles S3 cache retrieval (with parallel downloads and
+    automatic upstream fallback).  Non-GET methods never reach here — HEAD
+    requests are handled separately and other verbs go straight to upstream.
     """
-    xs3lerator_url = getattr(ctx.options, "xs3lerator_url", "")
-    if xs3lerator_url and flow.request.method == "GET":
-        _rewrite_to_xs3lerator(flow, cache_skip=False)
-        return
-    store_url = ctx.options.object_store_url
-    parsed = urlparse(store_url)
-    flow.request.scheme = parsed.scheme or "http"
-    flow.request.host = parsed.hostname
-    flow.request.port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    base = parsed.path.rstrip("/")
-    flow.request.path = f"{base}/{flow._cache_key}"
-    flow._object_store_rewrite = True
-    flow._cached = True
-    flow._save_response = False
+    _rewrite_to_xs3lerator(flow, cache_skip=False)
 
 
 def _rewrite_to_xs3lerator(flow, cache_skip: bool):
@@ -1195,22 +1182,27 @@ def _rewrite_to_xs3lerator_miss(flow):
 
 
 def _fallback_fetch_from_object_store(flow) -> bool:
-    """Fetch from the object store when we cannot rewrite (responseheaders fallback).
+    """Fetch cached object via xs3lerator as stale-if-error fallback.
 
-    Used for stale-if-error when the upstream already returned an error response
-    and we need to replace it with the cached object.  Returns True on success.
+    Used when the upstream already returned an error response and we need to
+    replace it with the cached object.  Returns True on success.
     """
     cache_key = flow._cache_key
     if not cache_key:
         return False
-    store_url = ctx.options.object_store_url
-    parsed = urlparse(store_url)
-    base = parsed.path.rstrip("/")
-    url = f"{parsed.scheme}://{parsed.netloc}{base}/{cache_key}"
+    xs3lerator_url = ctx.options.xs3lerator_url
+    if not xs3lerator_url:
+        return False
+    parsed = urlparse(xs3lerator_url)
+    url = f"{parsed.scheme}://{parsed.netloc}/{S3_BUCKET}/{cache_key}"
     try:
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(url, timeout=30, headers={
+            "X-Xs3lerator-Upstream-Url": base64.b64encode(
+                flow._original_url.encode() if hasattr(flow, "_original_url") else flow.request.url.encode()
+            ).decode(),
+        })
         if resp.status_code != 200:
-            LOG.warning("Object store fallback returned %s for key=%s", resp.status_code, cache_key)
+            LOG.warning("xs3lerator fallback returned %s for key=%s", resp.status_code, cache_key)
             return False
         flow.response = http.Response.make(200, resp.content, {
             "Content-Type": resp.headers.get("content-type", "application/octet-stream"),
@@ -1220,7 +1212,7 @@ def _fallback_fetch_from_object_store(flow) -> bool:
         flow._cached = True
         return True
     except Exception as exc:
-        LOG.warning("Object store fallback failed for key=%s: %s", cache_key, exc)
+        LOG.warning("xs3lerator fallback failed for key=%s: %s", cache_key, exc)
         return False
 
 
@@ -1393,13 +1385,6 @@ class Proxy:
             typespec=str,
             default="",
             help="Comma-separated memcached servers (host:port) for metadata/vary cache; e.g. cache-0.cache:11211,cache-1.cache:11211",
-        )
-        loader.add_option(
-            name="object_store_url",
-            typespec=str,
-            default=OBJECT_STORE_URL,
-            help="HTTP URL of the object store exposing the S3 cache namespace (required). "
-                 "Cache hits are fetched from this URL. (env: PASSSAGE_OBJECT_STORE_URL)",
         )
         loader.add_option(
             name="xs3lerator_url",
