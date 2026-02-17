@@ -8,6 +8,10 @@ on:
         type: string
         default: ""
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   integration:
     runs-on: ubuntu-latest
@@ -19,6 +23,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -39,10 +50,17 @@ jobs:
         run: |
           docker compose up -d --build --wait
           docker compose ps
+          docker compose logs xs3lerator
 
       - name: Run tests
         env:
           PROXY_URL: http://localhost:8080
+          XS3LERATOR_URL: http://localhost:8888
+          S3_ENDPOINT_URL: http://localhost:4566
+          S3_BUCKET: proxy-cache
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-west-2
           PASSSAGE_TEST_SERVER_BIND_HOST: 0.0.0.0
           PASSSAGE_TEST_SERVER_HOST: host.docker.internal
         run: |
