@@ -1674,6 +1674,22 @@ class Proxy:
             return
 
         if cache_hit:
+            cached_status = flow._cache_head.meta.get("status_code", 200) if flow._cache_head else 200
+            if xs3lerator_enabled and 300 <= int(cached_status) < 400 and cache_fresh:
+                meta = flow._cache_head.meta
+                headers_dict = meta.get("headers", {})
+                flow.response = http.Response.make(
+                    int(cached_status), b"", headers_dict,
+                )
+                if (reason := meta.get("reason")):
+                    flow.response.reason = reason
+                flow._save_response = False
+                flow._cached = True
+                flow._short_circuit = True
+                flow._serve_reason = "redirect_synthetic_from_cache"
+                LOG.debug("Cache hit: redirect %d -> synthetic response", int(cached_status))
+                return
+
             if policy == NoRefresh:
                 flow._serve_reason = "cache_hit_norefresh"
                 LOG.debug("Cache hit: NoRefresh -> rewrite to object store")
@@ -1995,7 +2011,7 @@ class Proxy:
                 f.flush()
                 f.seek(0)
 
-            if not xs3lerator_handled:
+            if not xs3lerator_handled and f is not None:
                 # 1. Upload the data object (immutable, no metadata)
                 extra_args = {}
                 s3_header_map = {
