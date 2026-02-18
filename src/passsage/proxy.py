@@ -1884,7 +1884,10 @@ class Proxy:
             for k in to_remove:
                 del flow.response.headers[k]
             if flow.response.status_code in (200, 206):
-                flow.response.stream = True
+                if xs3_full_size:
+                    flow.response.stream = True
+                else:
+                    flow.response.stream = lambda data: save_response(self, flow, data)
             elif flow.response.status_code == 404:
                 LOG.warning("xs3lerator returned 404 for key=%s",
                             getattr(flow, "_cache_key", "?"))
@@ -2149,32 +2152,62 @@ class Proxy:
             xs3_full_size = getattr(flow, "_xs3lerator_full_size", None)
 
             if is_xs3lerator:
-                # xs3lerator handles data upload to S3 -- we only save metadata
                 normalized_url = _normalize_url(flow)
                 cache_key = flow._cache_key or get_cache_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
                 flow._cache_saved = True
-                LOG.debug("Cache save enqueue (metadata only, xs3lerator) key=%s", cache_key)
                 save_headers = flow.response.headers.copy()
-                if xs3_full_size:
-                    save_headers["content-length"] = str(xs3_full_size)
                 if "content-range" in save_headers:
                     del save_headers["content-range"]
-                ctx._executor.submit(
-                    self._save_to_cache,
-                    flow._orig_data.get("status_code") or flow.response.status_code,
-                    flow._orig_data.get("reason") or flow.response.reason,
-                    flow.request.method,
-                    None,
-                    None,
-                    save_headers,
-                    getattr(flow, "_original_url", flow.request.url),
-                    cache_key,
-                    getattr(flow, "_cache_vary", None),
-                    getattr(flow, "_cache_vary_request", None),
-                    normalized_url,
-                    xs3lerator_handled=True,
-                    xs3lerator_full_size=xs3_full_size,
-                )
+
+                if xs3_full_size:
+                    save_headers["content-length"] = str(xs3_full_size)
+                    LOG.debug("Cache save enqueue (metadata only, xs3lerator) key=%s", cache_key)
+                    ctx._executor.submit(
+                        self._save_to_cache,
+                        flow._orig_data.get("status_code") or flow.response.status_code,
+                        flow._orig_data.get("reason") or flow.response.reason,
+                        flow.request.method,
+                        None,
+                        None,
+                        save_headers,
+                        getattr(flow, "_original_url", flow.request.url),
+                        cache_key,
+                        getattr(flow, "_cache_vary", None),
+                        getattr(flow, "_cache_vary_request", None),
+                        normalized_url,
+                        xs3lerator_handled=True,
+                        xs3lerator_full_size=xs3_full_size,
+                    )
+                elif flow._counter in self.files and flow._counter in self.hashes:
+                    body_file = self.files[flow._counter]
+                    body_file.flush()
+                    body_size = body_file.tell()
+                    save_headers["content-length"] = str(body_size)
+                    digest = self.hashes[flow._counter].hexdigest()
+                    LOG.debug(
+                        "Cache save enqueue (xs3lerator chunked, passsage uploads blob) key=%s size=%d",
+                        cache_key, body_size,
+                    )
+                    ctx._executor.submit(
+                        self._save_to_cache,
+                        flow._orig_data.get("status_code") or flow.response.status_code,
+                        flow._orig_data.get("reason") or flow.response.reason,
+                        flow.request.method,
+                        body_file,
+                        digest,
+                        save_headers,
+                        getattr(flow, "_original_url", flow.request.url),
+                        cache_key,
+                        getattr(flow, "_cache_vary", None),
+                        getattr(flow, "_cache_vary_request", None),
+                        normalized_url,
+                    )
+                else:
+                    LOG.warning(
+                        "xs3lerator chunked response without captured body, skipping cache save url=%s",
+                        flow.request.url[:200],
+                    )
+                    flow._cache_saved = False
             else:
                 # save in the background
                 if flow._counter not in self.files or flow._counter not in self.hashes:
