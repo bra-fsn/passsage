@@ -1125,8 +1125,9 @@ def _build_error_log_record(
 
 
 def _normalize_url(flow) -> str:
+    url = getattr(flow, "_original_url", None) or flow.request.url
     request_ctx = CacheKeyContext(
-        url=flow.request.url,
+        url=url,
         method=flow.request.method,
         headers=list(flow.request.headers.items()) if flow.request.headers else None,
     )
@@ -2195,6 +2196,25 @@ class Proxy:
                         flow.request.method,
                         body_file,
                         digest,
+                        save_headers,
+                        getattr(flow, "_original_url", flow.request.url),
+                        cache_key,
+                        getattr(flow, "_cache_vary", None),
+                        getattr(flow, "_cache_vary_request", None),
+                        normalized_url,
+                    )
+                elif 300 <= flow.response.status_code < 400:
+                    LOG.debug(
+                        "Cache save enqueue (redirect metadata only, xs3lerator) key=%s status=%d",
+                        cache_key, flow.response.status_code,
+                    )
+                    ctx._executor.submit(
+                        self._save_to_cache,
+                        flow._orig_data.get("status_code") or flow.response.status_code,
+                        flow._orig_data.get("reason") or flow.response.reason,
+                        flow.request.method,
+                        None,
+                        None,
                         save_headers,
                         getattr(flow, "_original_url", flow.request.url),
                         cache_key,
