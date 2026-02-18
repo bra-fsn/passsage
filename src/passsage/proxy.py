@@ -240,23 +240,20 @@ def _s3_put_json(key: str, data: dict) -> None:
     )
 
 
-def _s3_copy_object(src_key: str, dst_key: str, max_retries: int = 5) -> None:
-    """Server-side S3 copy with retry for eventual consistency."""
-    s3 = get_s3_client()
-    for attempt in range(max_retries):
-        try:
-            s3.copy_object(
-                Bucket=S3_BUCKET,
-                CopySource={"Bucket": S3_BUCKET, "Key": src_key},
-                Key=dst_key,
-            )
-            LOG.debug("S3 copy %s -> %s", src_key, dst_key)
-            return
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey" and attempt < max_retries - 1:
-                time.sleep(0.5 * (2 ** attempt))
-                continue
-            raise
+def _xs3lerator_link_manifest(base_key: str, vary_key: str) -> None:
+    """Ask xs3lerator to create a manifest alias for Vary-aware cache keys."""
+    xs3_url = getattr(ctx.options, "xs3lerator_url", "")
+    if not xs3_url:
+        LOG.warning("xs3lerator_url not configured, cannot link manifest")
+        return
+    url = f"{xs3_url}/{S3_BUCKET}/{vary_key}"
+    headers = {"X-Xs3lerator-Link-Manifest": base_key}
+    try:
+        resp = requests.post(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        LOG.debug("Manifest alias linked: %s -> %s", base_key, vary_key)
+    except Exception as exc:
+        LOG.warning("Manifest alias failed (%s -> %s): %s", base_key, vary_key, exc)
 
 
 def _no_proxy_s3_hosts() -> str:
@@ -752,7 +749,7 @@ def refresh_cache_metadata(cache_key: str, meta: dict) -> None:
     meta = dict(meta)
     meta["stored_at"] = time.time()
     try:
-        _s3_put_json(f"{cache_key}.meta", meta)
+        _s3_put_json(cache_key, meta)
     except Exception as exc:
         LOG.warning("Cache metadata refresh failed for %s: %s", cache_key, exc)
     mc = _get_memcached_client()
@@ -807,7 +804,7 @@ def get_cache_metadata(cache_key: str) -> CacheMeta:
                 return CacheMeta(200, meta, source="memcached")
         except Exception as exc:
             LOG.warning("Memcached get for cache metadata failed: %s", exc)
-    data = _s3_get_json(f"{cache_key}.meta")
+    data = _s3_get_json(cache_key)
     if data is None:
         return CacheMeta(404, {}, source="s3")
     if mc:
@@ -2011,24 +2008,12 @@ class Proxy:
                 f.flush()
                 f.seek(0)
 
-            if not xs3lerator_handled and f is not None:
-                # 1. Upload the data object (immutable, no metadata)
-                extra_args = {}
-                s3_header_map = {
-                    "content-type": "ContentType",
-                    "content-encoding": "ContentEncoding",
-                }
-                for header, aws_key in s3_header_map.items():
-                    if header in headers:
-                        extra_args[aws_key] = headers[header]
-                s3.upload_fileobj(f, S3_BUCKET, cache_key, ExtraArgs=extra_args or None)
-
             if xs3lerator_handled and vary_header:
                 base_key = get_cache_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
                 if base_key != cache_key:
-                    _s3_copy_object(base_key, cache_key)
+                    _xs3lerator_link_manifest(base_key, cache_key)
 
-            # 2. Build and write the .meta JSON
+            # Build and write the metadata JSON (under meta/ prefix)
             cached_headers = {}
             for k in (
                 "etag",
@@ -2064,7 +2049,7 @@ class Proxy:
             if vary_request:
                 meta["vary_request"] = vary_request
 
-            _s3_put_json(f"{cache_key}.meta", meta)
+            _s3_put_json(cache_key, meta)
 
             mc = _get_memcached_client()
             if mc:

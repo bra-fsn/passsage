@@ -73,8 +73,8 @@ def hashed_s3_key(
     ext = url_ext(normalized_url)
     prefixed_digest = _add_hash_prefix(digest, hash_prefix_depth)
     if vary_key:
-        return f"{scheme}/{host}/{prefixed_digest}+{vary_key}{ext}"
-    return f"{scheme}/{host}/{prefixed_digest}{ext}"
+        return f"meta/{scheme}/{host}/{prefixed_digest}+{vary_key}{ext}"
+    return f"meta/{scheme}/{host}/{prefixed_digest}{ext}"
 
 
 def get_cache_key(
@@ -93,4 +93,4 @@ def get_vary_index_key(normalized_url: str, hash_prefix_depth: int = 4) -> str:
     host = (parsed.hostname or "unknown").lower()
     digest = hashlib.sha224(normalized_url.encode("utf-8")).hexdigest()
     prefixed_digest = _add_hash_prefix(digest, hash_prefix_depth)
-    return f"{scheme}/{host}/_vary/{prefixed_digest}"
+    return f"meta/{scheme}/{host}/_vary/{prefixed_digest}"

@@ -1103,7 +1103,7 @@ class TestXs3leratorIntegration:
         self, proxy_session, test_server, cache_bust_random
     ):
         """A cache miss GET through passsage should trigger xs3lerator to store the
-        object in S3 via multipart upload."""
+        object in S3 via content-addressed chunks."""
         test_server.reset()
         url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=miss")
         resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
@@ -1111,6 +1111,23 @@ class TestXs3leratorIntegration:
         time.sleep(SYNC_SETTLE_SECONDS + 1)
         keys = _s3_list_objects()
         assert len(keys) > 0, "xs3lerator should have stored at least one object in S3"
+
+    def test_s3_namespace_separation(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """After a cache miss, S3 should contain objects under meta/, data/, and _map/ prefixes."""
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=ns")
+        resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert resp.ok
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+
+        meta_keys = _s3_list_objects("meta/")
+        data_keys = _s3_list_objects("data/")
+        map_keys = _s3_list_objects("_map/")
+        assert len(meta_keys) > 0, "Expected metadata objects under meta/"
+        assert len(data_keys) > 0, "Expected data chunks under data/"
+        assert len(map_keys) > 0, "Expected manifest objects under _map/"
 
     def test_cache_hit_served_from_s3(
         self, proxy_session, test_server, cache_bust_random
@@ -1162,10 +1179,46 @@ class TestXs3leratorIntegration:
         assert resp.ok
         assert "policy Standard" in resp.text
 
-    def test_xs3lerator_returns_405_for_post(self):
-        """xs3lerator only supports GET; other methods should return 405."""
+    def test_xs3lerator_post_without_link_header_returns_500(self):
+        """POST without X-Xs3lerator-Link-Manifest header returns 500."""
         resp = requests.post(f"{XS3LERATOR_URL}/proxy-cache/some-key", timeout=5)
+        assert resp.status_code == 500
+
+    def test_xs3lerator_returns_405_for_put(self):
+        """xs3lerator only supports GET and POST; other methods should return 405."""
+        resp = requests.put(f"{XS3LERATOR_URL}/proxy-cache/some-key", timeout=5)
         assert resp.status_code == 405
+
+    def test_manifest_alias_post(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """POST with X-Xs3lerator-Link-Manifest should create a manifest alias."""
+        test_server.reset()
+        size = 4096
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&xs3=alias")
+        upstream_b64 = base64.b64encode(url.encode()).decode()
+        source_key = f"test-alias-source-{cache_bust_random}"
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{S3_BUCKET}/{source_key}",
+            headers={
+                "X-Xs3lerator-Upstream-Url": upstream_b64,
+                "X-Xs3lerator-Cache-Skip": "true",
+            },
+            timeout=30,
+        )
+        assert resp.ok
+        time.sleep(SYNC_SETTLE_SECONDS + 1)
+
+        alias_key = f"test-alias-dest-{cache_bust_random}"
+        post_resp = requests.post(
+            f"{XS3LERATOR_URL}/{S3_BUCKET}/{alias_key}",
+            headers={"X-Xs3lerator-Link-Manifest": source_key},
+            timeout=30,
+        )
+        assert post_resp.status_code == 200
+
+        alias_maps = _s3_list_objects(f"_map/{alias_key}")
+        assert len(alias_maps) > 0, "Manifest alias should exist in _map/"
 
     def test_large_file_through_xs3lerator(
         self, proxy_session, test_server, cache_bust_random
