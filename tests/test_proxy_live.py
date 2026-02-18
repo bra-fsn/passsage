@@ -1217,7 +1217,7 @@ class TestXs3leratorIntegration:
         )
         assert post_resp.status_code == 204
 
-        alias_maps = _s3_list_objects(f"_map/{alias_key}")
+        alias_maps = _s3_list_objects(f"_map/{S3_BUCKET}/{alias_key}")
         assert len(alias_maps) > 0, "Manifest alias should exist in _map/"
 
     def test_large_file_through_xs3lerator(
