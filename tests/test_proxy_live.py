@@ -1213,8 +1213,18 @@ class TestXs3leratorIntegration:
         )
         assert post_resp.status_code == 204
 
-        alias_maps = _s3_list_objects(f"_map/{S3_BUCKET}/{alias_key}")
-        assert len(alias_maps) > 0, "Manifest alias should exist in _map/"
+        alias_doc_id = f"{S3_BUCKET}/{alias_key}".replace("/", "%2F")
+        es_url = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
+        es_resp = requests.get(
+            f"{es_url}/xs3_manifests/_doc/{alias_doc_id}",
+            timeout=10,
+        )
+        assert es_resp.status_code == 200, (
+            f"Manifest alias should exist in Elasticsearch, got {es_resp.status_code}"
+        )
+        doc = es_resp.json()
+        assert doc.get("found") is True
+        assert "manifest_b64" in doc.get("_source", {})
 
     def test_large_file_through_xs3lerator(
         self, proxy_session, test_server, cache_bust_random
