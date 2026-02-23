@@ -6,7 +6,7 @@ plus a LastAccessBatcher that batches last_access updates via periodic bulk writ
 
 import logging
 import threading
-import time
+from datetime import datetime, timezone
 
 LOG = logging.getLogger("passsage.proxy")
 
@@ -98,7 +98,7 @@ class LastAccessBatcher:
 
     def __init__(self, es_index: str, flush_interval: float = 30.0):
         self._lock = threading.Lock()
-        self._pending: dict[str, int] = {}
+        self._pending: dict[str, str] = {}
         self._index = es_index
         self._flush_interval = flush_interval
         self._stop = threading.Event()
@@ -107,9 +107,9 @@ class LastAccessBatcher:
 
     def touch(self, doc_id: str) -> None:
         """Record a cache access. O(1), minimal lock contention."""
-        now_ms = int(time.time() * 1000)
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            self._pending[doc_id] = now_ms
+            self._pending[doc_id] = now
 
     def _run(self) -> None:
         while not self._stop.wait(self._flush_interval):
