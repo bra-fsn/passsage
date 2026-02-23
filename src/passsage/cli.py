@@ -232,12 +232,41 @@ import click
     "(env: PASSSAGE_MITM_CA)"
 )
 @click.option(
-    "--memcached-servers",
-    envvar="PASSSAGE_MEMCACHED_SERVERS",
-    default="",
-    show_default=False,
-    help="Comma-separated memcached servers (host:port) for metadata/vary cache; "
-    "e.g. cache-0.cache:11211,cache-1.cache:11211 (env: PASSSAGE_MEMCACHED_SERVERS)"
+    "--elasticsearch-url",
+    envvar="PASSSAGE_ELASTICSEARCH_URL",
+    required=True,
+    help="Elasticsearch URL for metadata storage (env: PASSSAGE_ELASTICSEARCH_URL)"
+)
+@click.option(
+    "--elasticsearch-meta-index",
+    envvar="PASSSAGE_ELASTICSEARCH_META_INDEX",
+    default="passsage_meta",
+    show_default=True,
+    help="Elasticsearch index name for metadata (env: PASSSAGE_ELASTICSEARCH_META_INDEX)"
+)
+@click.option(
+    "--elasticsearch-replicas",
+    envvar="PASSSAGE_ELASTICSEARCH_REPLICAS",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of ES index replicas (env: PASSSAGE_ELASTICSEARCH_REPLICAS)"
+)
+@click.option(
+    "--elasticsearch-shards",
+    envvar="PASSSAGE_ELASTICSEARCH_SHARDS",
+    type=int,
+    default=9,
+    show_default=True,
+    help="Number of ES index shards (env: PASSSAGE_ELASTICSEARCH_SHARDS)"
+)
+@click.option(
+    "--elasticsearch-flush-interval",
+    envvar="PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Last-access batcher flush interval in seconds (env: PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL)"
 )
 @click.option(
     "--xs3lerator-url",
@@ -291,7 +320,11 @@ def main(
     connection_strategy,
     mitm_ca_cert,
     mitm_ca,
-    memcached_servers,
+    elasticsearch_url,
+    elasticsearch_meta_index,
+    elasticsearch_replicas,
+    elasticsearch_shards,
+    elasticsearch_flush_interval,
     xs3lerator_url,
     s3_hash_prefix_depth,
 ):
@@ -347,7 +380,11 @@ def main(
             connection_strategy,
             mitm_ca_cert,
             mitm_ca,
-            memcached_servers,
+            elasticsearch_url,
+            elasticsearch_meta_index,
+            elasticsearch_replicas,
+            elasticsearch_shards,
+            elasticsearch_flush_interval,
             xs3lerator_url,
             s3_hash_prefix_depth,
         )
@@ -406,7 +443,11 @@ def run_proxy(
     connection_strategy="lazy",
     mitm_ca_cert=None,
     mitm_ca=None,
-    memcached_servers="",
+    elasticsearch_url="",
+    elasticsearch_meta_index="passsage_meta",
+    elasticsearch_replicas=1,
+    elasticsearch_shards=9,
+    elasticsearch_flush_interval=30.0,
     xs3lerator_url="",
     s3_hash_prefix_depth=4,
 ):
@@ -485,8 +526,11 @@ def run_proxy(
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
     args.extend(["--set", f"connection_strategy={connection_strategy}"])
-    if memcached_servers:
-        args.extend(["--set", f"memcached_servers={memcached_servers}"])
+    os.environ["PASSSAGE_ELASTICSEARCH_URL"] = elasticsearch_url
+    os.environ["PASSSAGE_ELASTICSEARCH_META_INDEX"] = elasticsearch_meta_index
+    os.environ["PASSSAGE_ELASTICSEARCH_REPLICAS"] = str(elasticsearch_replicas)
+    os.environ["PASSSAGE_ELASTICSEARCH_SHARDS"] = str(elasticsearch_shards)
+    os.environ["PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL"] = str(elasticsearch_flush_interval)
     os.environ["PASSSAGE_XS3LERATOR_URL"] = xs3lerator_url
     args.extend(["--set", f"xs3lerator_url={xs3lerator_url}"])
     args.extend(["--set", f"s3_hash_prefix_depth={s3_hash_prefix_depth}"])
@@ -643,281 +687,6 @@ def errors(start_date, end_date, s3_bucket, error_log_prefix, grep, filters, whe
             bucket, error_log_prefix, start_date, end_date,
             grep=grep, filters=list(filters) or None, where=where,
         )
-
-
-@main.group("memcache", invoke_without_command=True)
-@click.option(
-    "--memcached-servers",
-    envvar="PASSSAGE_MEMCACHED_SERVERS",
-    default="",
-    show_default=False,
-    help="Comma-separated memcached servers (host:port); "
-    "e.g. cache-0.cache:11211,cache-1.cache:11211 (env: PASSSAGE_MEMCACHED_SERVERS)",
-)
-@click.pass_context
-def memcache(ctx, memcached_servers):
-    """Inspect and manipulate the memcached metadata cache.
-
-    \b
-    Passsage stores response metadata in memcached to speed up cache-hit
-    lookups.  This command group lets you inspect or remove those entries
-    for a given URL.
-
-    \b
-    Examples:
-        # Show cached metadata for a URL
-        passsage memcache get https://pypi.org/simple/requests/
-
-        # Delete cached metadata for a URL
-        passsage memcache delete https://pypi.org/simple/requests/
-
-        # Show only the derived keys (no memcached connection needed)
-        passsage memcache get --keys-only https://pypi.org/simple/requests/
-    """
-    ctx.ensure_object(dict)
-    ctx.obj["memcached_servers"] = memcached_servers
-    if ctx.invoked_subcommand is None:
-        click.echo(ctx.get_help())
-
-
-def _make_memcached_client(servers_str):
-    """Create a standalone HashClient from a comma-separated server string."""
-    from passsage.cache_utils import parse_memcached_servers
-
-    servers = parse_memcached_servers(servers_str)
-    if not servers:
-        return None
-    from pymemcache.client.hash import HashClient
-
-    return HashClient(servers, connect_timeout=2, timeout=2)
-
-
-def _resolve_cache_keys(url):
-    """Normalize a URL and return (normalized_url, cache_key, vary_index_key, memcached keys)."""
-    from passsage.cache_utils import (
-        memcached_key,
-        get_cache_key,
-        get_vary_index_key,
-    )
-    from passsage.cache_key import (
-        Context as CacheKeyContext,
-        get_default_cache_key_resolver,
-    )
-
-    request_ctx = CacheKeyContext(url=url, method="GET")
-    resolver = get_default_cache_key_resolver()
-    normalized_url = resolver.resolve(request_ctx)
-    cache_key = get_cache_key(normalized_url)
-    vary_index_key = get_vary_index_key(normalized_url)
-    return {
-        "url": url,
-        "normalized_url": normalized_url,
-        "cache_key": cache_key,
-        "vary_index_key": vary_index_key,
-        "memcached_key": memcached_key(cache_key),
-        "memcached_vary_key": memcached_key(vary_index_key),
-    }
-
-
-@memcache.command("get")
-@click.argument("url")
-@click.option(
-    "--keys-only",
-    is_flag=True,
-    default=False,
-    help="Only show derived keys without connecting to memcached.",
-)
-@click.option(
-    "-o", "--output",
-    "output_format",
-    type=click.Choice(["text", "json"]),
-    default="text",
-    show_default=True,
-    help="Output format.",
-)
-@click.pass_context
-def cache_get(ctx, url, keys_only, output_format):
-    """Show memcached metadata for a URL.
-
-    Derives the cache key and vary-index key from URL, then fetches the
-    stored metadata from memcached.
-
-    \b
-    Examples:
-        passsage memcache get https://pypi.org/simple/requests/
-        passsage memcache get --keys-only https://example.com/path
-        passsage memcache get -o json https://pypi.org/simple/requests/
-    """
-    import json as json_mod
-
-    keys = _resolve_cache_keys(url)
-
-    if keys_only:
-        if output_format == "json":
-            click.echo(json_mod.dumps(keys, indent=2))
-        else:
-            click.echo(f"url:                {keys['url']}")
-            click.echo(f"normalized_url:     {keys['normalized_url']}")
-            click.echo(f"cache_key:          {keys['cache_key']}")
-            click.echo(f"vary_index_key:     {keys['vary_index_key']}")
-            click.echo(f"memcached_key:      {keys['memcached_key']}")
-            click.echo(f"memcached_vary_key: {keys['memcached_vary_key']}")
-        return
-
-    servers = ctx.obj["memcached_servers"]
-    if not servers:
-        raise click.ClickException(
-            "Memcached servers required (set PASSSAGE_MEMCACHED_SERVERS or --memcached-servers)."
-        )
-    mc = _make_memcached_client(servers)
-    if mc is None:
-        raise click.ClickException("Failed to create memcached client.")
-
-    from passsage.cache_utils import memcached_key, get_cache_key
-    import hashlib
-
-    metadata_raw = mc.get(keys["memcached_key"])
-    vary_raw = mc.get(keys["memcached_vary_key"])
-
-    metadata = None
-    if metadata_raw is not None:
-        metadata = json_mod.loads(metadata_raw)
-
-    vary_data = None
-    if vary_raw is not None:
-        vary_data = json_mod.loads(vary_raw)
-
-    vary_metadata = None
-    vary_cache_key = None
-    vary_memcached_key = None
-    if vary_data and metadata is None:
-        vary_header = vary_data.get("vary", "")
-        if vary_header and "*" not in vary_header:
-            names = [n.strip().lower() for n in vary_header.split(",") if n.strip()]
-            vary_request = "|".join(f"{name}=" for name in names)
-            vary_key_hash = hashlib.sha224(vary_request.encode("utf-8")).hexdigest()
-            vary_cache_key = get_cache_key(keys["normalized_url"], vary_key_hash)
-            vary_memcached_key = memcached_key(vary_cache_key)
-            vary_meta_raw = mc.get(vary_memcached_key)
-            if vary_meta_raw is not None:
-                vary_metadata = json_mod.loads(vary_meta_raw)
-
-    result = {
-        **keys,
-        "metadata": metadata,
-        "vary_index": vary_data,
-    }
-    if vary_cache_key:
-        result["vary_cache_key"] = vary_cache_key
-        result["vary_memcached_key"] = vary_memcached_key
-        result["vary_metadata"] = vary_metadata
-
-    if output_format == "json":
-        click.echo(json_mod.dumps(result, indent=2))
-    else:
-        click.echo(f"url:                {keys['url']}")
-        click.echo(f"normalized_url:     {keys['normalized_url']}")
-        click.echo(f"cache_key:          {keys['cache_key']}")
-        click.echo(f"vary_index_key:     {keys['vary_index_key']}")
-        click.echo(f"memcached_key:      {keys['memcached_key']}")
-        click.echo(f"memcached_vary_key: {keys['memcached_vary_key']}")
-        click.echo()
-        if metadata is not None:
-            click.echo("metadata:")
-            for k, v in metadata.items():
-                click.echo(f"  {k}: {v}")
-        else:
-            click.echo("metadata: (not found under base key)")
-        click.echo()
-        if vary_data is not None:
-            click.echo("vary_index:")
-            for k, v in vary_data.items():
-                click.echo(f"  {k}: {v}")
-        else:
-            click.echo("vary_index: (not found)")
-        if vary_cache_key:
-            click.echo()
-            click.echo(f"vary_cache_key:     {vary_cache_key}")
-            click.echo(f"vary_memcached_key: {vary_memcached_key}")
-            if vary_metadata is not None:
-                click.echo("vary_metadata (Accept: empty):")
-                for k, v in vary_metadata.items():
-                    click.echo(f"  {k}: {v}")
-            else:
-                click.echo("vary_metadata: (not found for empty Accept headers)"
-                           " -- actual metadata is under a vary key derived"
-                           " from the client's request headers)")
-
-
-@memcache.command("delete")
-@click.argument("url")
-@click.option(
-    "--yes", "-y",
-    is_flag=True,
-    default=False,
-    help="Skip confirmation prompt.",
-)
-@click.option(
-    "--vary-only",
-    is_flag=True,
-    default=False,
-    help="Only delete the vary-index entry.",
-)
-@click.option(
-    "--metadata-only",
-    is_flag=True,
-    default=False,
-    help="Only delete the metadata entry.",
-)
-@click.pass_context
-def cache_delete(ctx, url, yes, vary_only, metadata_only):
-    """Delete memcached metadata for a URL.
-
-    Derives the cache key and vary-index key from URL, then deletes
-    the corresponding entries from memcached.  By default both the
-    metadata entry and the vary-index entry are removed.
-
-    \b
-    Examples:
-        passsage memcache delete https://pypi.org/simple/requests/
-        passsage memcache delete -y https://example.com/path
-        passsage memcache delete --metadata-only https://example.com/path
-    """
-    keys = _resolve_cache_keys(url)
-
-    servers = ctx.obj["memcached_servers"]
-    if not servers:
-        raise click.ClickException(
-            "Memcached servers required (set PASSSAGE_MEMCACHED_SERVERS or --memcached-servers)."
-        )
-    mc = _make_memcached_client(servers)
-    if mc is None:
-        raise click.ClickException("Failed to create memcached client.")
-
-    targets = []
-    if not vary_only:
-        targets.append(("metadata", keys["memcached_key"]))
-    if not metadata_only:
-        targets.append(("vary_index", keys["memcached_vary_key"]))
-
-    if not targets:
-        raise click.ClickException("Nothing to delete (--vary-only and --metadata-only cancel out).")
-
-    if not yes:
-        click.echo(f"url:            {keys['url']}")
-        click.echo(f"normalized_url: {keys['normalized_url']}")
-        click.echo(f"Will delete:")
-        for label, mc_key in targets:
-            click.echo(f"  {label}: {mc_key}")
-        if not click.confirm("Proceed?"):
-            raise SystemExit(0)
-
-    for label, mc_key in targets:
-        deleted = mc.delete(mc_key, noreply=False)
-        if deleted:
-            click.echo(f"Deleted {label}: {mc_key}")
-        else:
-            click.echo(f"Not found {label}: {mc_key}")
 
 
 @main.command("cache-keys", help="""\
