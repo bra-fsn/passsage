@@ -18,7 +18,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, Union
@@ -582,7 +582,9 @@ def cache_stored_at(meta: dict) -> datetime | None:
     stored = meta.get("stored_at")
     if stored is not None:
         try:
-            return datetime.fromtimestamp(float(stored), tz=pytz.utc)
+            if isinstance(stored, str):
+                return datetime.fromisoformat(stored)
+            return datetime.fromtimestamp(float(stored), tz=timezone.utc)
         except (ValueError, TypeError, OSError):
             return None
     return None
@@ -726,7 +728,7 @@ def apply_cached_metadata(flow: http.HTTPFlow) -> None:
 def refresh_cache_metadata(cache_key: str, meta: dict) -> None:
     """Update stored_at timestamp in the ES doc."""
     meta = dict(meta)
-    meta["stored_at"] = time.time()
+    meta["stored_at"] = datetime.now(timezone.utc).isoformat()
     try:
         es_meta_index = os.environ.get("PASSSAGE_ELASTICSEARCH_META_INDEX", "passsage_meta")
         doc_id = cache_key
@@ -908,8 +910,8 @@ _ES_MAPPING = {
             "url": {"type": "keyword"},
             "extension": {"type": "keyword"},
             "content_size": {"type": "long", "index": False},
-            "stored_at": {"type": "double", "index": False},
-            "last_access": {"type": "date", "format": "epoch_millis"},
+            "stored_at": {"type": "date"},
+            "last_access": {"type": "date"},
             "headers": {"type": "object", "enabled": False},
             "vary": {"type": "keyword", "index": False},
             "vary_request": {"type": "keyword", "index": False},
@@ -2005,10 +2007,11 @@ class Proxy:
                 except (ValueError, TypeError):
                     pass
 
+            now_iso = datetime.now(timezone.utc).isoformat()
             meta = {
                 "status_code": int(status_code),
-                "stored_at": time.time(),
-                "last_access": int(time.time() * 1000),
+                "stored_at": now_iso,
+                "last_access": now_iso,
                 "url": url[:512],
                 "extension": _url_ext(url),
                 "headers": cached_headers,
