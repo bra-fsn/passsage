@@ -15,6 +15,20 @@ services:
       timeout: 5s
       retries: 10
 
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+    ports:
+      - "9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
   xs3lerator:
     image: ghcr.io/bra-fsn/xs3lerator:latest
     ports:
@@ -23,6 +37,8 @@ services:
       - XS3_S3_ENDPOINT_URL=http://localstack:4566
       - XS3_S3_FORCE_PATH_STYLE=true
       - XS3_UPSTREAM_TLS_SKIP_VERIFY=true
+      - XS3_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - XS3_ELASTICSEARCH_MANIFEST_INDEX=xs3_manifests
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
@@ -30,6 +46,8 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       localstack:
+        condition: service_healthy
+      elasticsearch:
         condition: service_healthy
 
   passsage:
@@ -46,6 +64,8 @@ services:
       - PASSSAGE_S3_HASH_PREFIX_DEPTH=4
       - PASSSAGE_HEALTH_PORT=8082
       - PASSSAGE_HEALTH_HOST=0.0.0.0
+      - PASSSAGE_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - PASSSAGE_ELASTICSEARCH_META_INDEX=passsage_meta
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
@@ -55,6 +75,8 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       localstack:
+        condition: service_healthy
+      elasticsearch:
         condition: service_healthy
       xs3lerator:
         condition: service_started

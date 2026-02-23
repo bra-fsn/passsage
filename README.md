@@ -33,22 +33,20 @@ whether to serve from cache or go upstream. In brief:
 - **With xs3lerator** (`--xs3lerator-url`): GET requests are routed through
   [xs3lerator](../xs3lerator/), which handles parallel downloads from both S3
   (cache hits) and upstream HTTP servers (cache misses), and simultaneously
-  uploads data to S3 on miss. Passsage manages metadata only (`.meta` JSON,
-  vary indexes, memcached). HEAD requests are served synthetically from
-  memcached metadata when fresh, or via direct upstream HEAD otherwise.
+  uploads data to S3 on miss. Passsage manages metadata only (Elasticsearch
+  indexes, vary indexes). HEAD requests are served synthetically from
+  Elasticsearch metadata when fresh, or via direct upstream HEAD otherwise.
 - **Without xs3lerator** (legacy mode): cache hits are fetched from an HTTP
   object store (`--object-store-url`, required). Passsage uploads data to S3
   on cache miss.
-- Object metadata is stored in separate `.meta` JSON objects in S3 and cached in
-  memcached for fast lookups. The data objects themselves are immutable.
-- S3 cache keys use hash-prefixed format
-  `<scheme>/<host>/<h>/<a>/<s>/<h>/<sha224>[.<ext>]`
-  (e.g. `https/ftp.bme.hu/f/f/3/0/ff30f95e...56.iso`). The hash prefix depth
-  is configurable (`--s3-hash-prefix-depth`, default 4) and distributes objects
-  across 65,536 S3 prefixes to avoid per-prefix throttling. Metadata lives at
-  `<key>.meta`. Vary-aware keys append `+<sha224-of-vary-values>`.
-  Vary index objects live under `<scheme>/<host>/_vary/<h>/<a>/<s>/<h>/`.
-  Memcached keys remain unprefixed.
+- Object metadata is stored in Elasticsearch (`passsage_meta` index) for fast
+  real-time lookups by document `_id`. The data objects themselves are immutable
+  content-addressed chunks in S3.
+- Elasticsearch document `_id` format is `<scheme>/<host>/<sha224>` (or
+  `<scheme>/<host>/<sha224>+<vary_sha224>` for vary-aware keys).
+  Vary index documents use `<scheme>/<host>/_vary/<sha224>`.
+- S3 data keys use hash-prefixed format
+  `data/<h>/<a>/<s>/<h>/<sha256>` for content-addressed chunks.
 - `NoRefresh` serves from cache immediately on a hit (no revalidation).
 - `Standard` revalidates with an upstream `HEAD` when stale; if the cached `ETag`/`Last-Modified`
   matches, the cached object is served.
@@ -96,15 +94,13 @@ adaptive parallel downloads and simultaneously uploads to S3. Clients point
                      │ (data plane) │◀──────▶│ (cache)  │
                      └──────────────┘        └──────────┘
                             │
-                   metadata │  .meta JSON
-                   only     │  vary index
-                            │  memcached
+                   metadata │  Elasticsearch
+                   only     │  (passsage_meta index)
                             ▼
                      ┌──────────────┐
                      │  Passsage    │
                      │ (writes meta │
-                     │  to S3 +    │
-                     │  memcached)  │
+                     │  to ES)     │
                      └──────────────┘
 ```
 
@@ -254,7 +250,11 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache \
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
 | `PASSSAGE_PUBLIC_PROXY_URL` | Externally reachable proxy URL for the onboarding script (e.g. `http://proxy.example.com:3128`). Required behind a load balancer or in Kubernetes. | None |
 | `PASSSAGE_OBJECT_STORE_URL` | HTTP URL of the object store exposing the S3 cache namespace (required). Cache hits are fetched from this URL. | (required) |
-| `PASSSAGE_MEMCACHED_SERVERS` | Comma-separated memcached servers (host:port) for metadata caching. | None |
+| `PASSSAGE_ELASTICSEARCH_URL` | Elasticsearch URL for metadata storage. | None |
+| `PASSSAGE_ELASTICSEARCH_META_INDEX` | Elasticsearch index for metadata. | `passsage_meta` |
+| `PASSSAGE_ELASTICSEARCH_REPLICAS` | Number of ES index replicas. | `1` |
+| `PASSSAGE_ELASTICSEARCH_SHARDS` | Number of ES index shards. | `9` |
+| `PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL` | Interval for batched last_access updates (seconds). | `30` |
 | `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `0` |
 | `PASSSAGE_ACCESS_LOG_PREFIX` | S3 prefix for access logs | `__passsage_logs__` |
 | `PASSSAGE_ACCESS_LOG_DIR` | Local spool dir for access logs | `/tmp/passsage-logs` |
@@ -290,8 +290,16 @@ Options:
                                   (env: PASSSAGE_PUBLIC_PROXY_URL)
   --object-store-url TEXT         HTTP URL of the object store (required)
                                   (env: PASSSAGE_OBJECT_STORE_URL)
-  --memcached-servers TEXT        Comma-separated memcached servers (host:port)
-                                  (env: PASSSAGE_MEMCACHED_SERVERS)
+  --elasticsearch-url TEXT       Elasticsearch URL for metadata
+                                  (env: PASSSAGE_ELASTICSEARCH_URL)
+  --elasticsearch-meta-index TEXT  ES index name (default: passsage_meta)
+                                  (env: PASSSAGE_ELASTICSEARCH_META_INDEX)
+  --elasticsearch-replicas INT   Number of ES replicas (default: 1)
+                                  (env: PASSSAGE_ELASTICSEARCH_REPLICAS)
+  --elasticsearch-shards INT     Number of ES shards (default: 9)
+                                  (env: PASSSAGE_ELASTICSEARCH_SHARDS)
+  --elasticsearch-flush-interval FLOAT  Batch flush interval seconds (default: 30)
+                                  (env: PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL)
   --access-logs                   Enable S3 access logs in Parquet format
   --access-log-prefix TEXT        S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)
   --access-log-dir TEXT           Local spool directory for access logs

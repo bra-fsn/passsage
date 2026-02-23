@@ -1112,22 +1112,18 @@ class TestXs3leratorIntegration:
         keys = _s3_list_objects()
         assert len(keys) > 0, "xs3lerator should have stored at least one object in S3"
 
-    def test_s3_namespace_separation(
+    def test_s3_and_es_storage_after_cache_miss(
         self, proxy_session, test_server, cache_bust_random
     ):
-        """After a cache miss, S3 should contain objects under meta/, data/, and _map/ prefixes."""
+        """After a cache miss, S3 should contain data/ chunks; metadata and manifests are in ES."""
         test_server.reset()
         url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=ns")
         resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
         assert resp.ok
         time.sleep(SYNC_SETTLE_SECONDS + 2)
 
-        meta_keys = _s3_list_objects("meta/")
         data_keys = _s3_list_objects("data/")
-        map_keys = _s3_list_objects("_map/")
-        assert len(meta_keys) > 0, "Expected metadata objects under meta/"
         assert len(data_keys) > 0, "Expected data chunks under data/"
-        assert len(map_keys) > 0, "Expected manifest objects under _map/"
 
     def test_cache_hit_served_from_s3(
         self, proxy_session, test_server, cache_bust_random

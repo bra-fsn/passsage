@@ -54,13 +54,19 @@ from passsage.policy import (
     set_default_resolver,
 )
 from passsage.cache_utils import (
-    memcached_key as _memcached_key,
-    parse_memcached_servers as _parse_memcached_servers,
     url_ext as _url_ext,
     hashed_s3_key as _hashed_s3_key,
     get_cache_key,
     get_vary_index_key,
-    MEMCACHED_MAX_KEY_LEN,
+    es_doc_id,
+    es_vary_index_id,
+)
+from passsage.es_client import (
+    configure as _es_configure,
+    es_get_doc,
+    es_index_doc,
+    es_create_index,
+    LastAccessBatcher,
 )
 from passsage.log_storage import AccessLogWriter, ErrorLogWriter, build_access_log_config, build_error_log_config
 
@@ -210,34 +216,11 @@ class CacheMeta:
 
     *status_code* is 200 when metadata was found, 404 otherwise.
     *meta* is the parsed JSON metadata dict (empty on miss).
-    *source* tracks where the metadata came from ("memcached" or "s3").
+    *source* tracks where the metadata came from ("elasticsearch").
     """
     status_code: int
     meta: dict
     source: str = ""
-
-
-def _s3_get_json(key: str) -> dict | None:
-    """Read a JSON object from S3.  Returns the parsed dict or None on 404."""
-    s3 = get_s3_client()
-    try:
-        resp = s3.get_object(Bucket=S3_BUCKET, Key=key)
-        return json.loads(resp["Body"].read())
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code in ("404", "NoSuchKey", "NotFound"):
-            return None
-        raise
-
-
-def _s3_put_json(key: str, data: dict) -> None:
-    """Write a JSON object to S3."""
-    get_s3_client().put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=json.dumps(data).encode("utf-8"),
-        ContentType="application/json",
-    )
 
 
 def _xs3lerator_link_manifest(base_key: str, vary_key: str) -> None:
@@ -558,7 +541,7 @@ class RefreshPattern:
     options: set[str]
 
     def ttl_seconds(self, now: datetime, meta: dict) -> int:
-        lastmod = meta.get("last_modified")
+        lastmod = (meta.get("headers") or {}).get("last-modified")
         if lastmod:
             lastmod_dt = parse_date(lastmod)
             age = max(0, int((now - lastmod_dt).total_seconds())) if lastmod_dt else 0
@@ -646,7 +629,7 @@ def cache_ttl_seconds(
         exp_dt = parse_date(exp)
         if exp_dt:
             return max(0, int((exp_dt - stored_at).total_seconds()))
-    if (lastmod := meta.get("last_modified")):
+    if (lastmod := (meta.get("headers") or {}).get("last-modified")):
         lastmod_dt = parse_date(lastmod)
         if lastmod_dt:
             lifetime = max(0, int((now - lastmod_dt).total_seconds() * 0.1))
@@ -736,104 +719,41 @@ def apply_cached_metadata(flow: http.HTTPFlow) -> None:
     if (status_code := m.get("status_code")):
         if flow.response.status_code != 206:
             flow.response.status_code = int(status_code)
-    if (reason := m.get("reason")):
-        flow.response.reason = reason
     for k, v in m.get("headers", {}).items():
         flow.response.headers[k] = v
-    if (lastmod := m.get("last_modified")):
-        flow.response.headers["last-modified"] = lastmod
 
 
 def refresh_cache_metadata(cache_key: str, meta: dict) -> None:
-    """Update stored_at timestamp in the .meta JSON and sync to memcached."""
+    """Update stored_at timestamp in the ES doc."""
     meta = dict(meta)
     meta["stored_at"] = time.time()
     try:
-        _s3_put_json(cache_key, meta)
+        es_meta_index = os.environ.get("PASSSAGE_ELASTICSEARCH_META_INDEX", "passsage_meta")
+        doc_id = cache_key
+        es_index_doc(es_meta_index, doc_id, meta)
     except Exception as exc:
         LOG.warning("Cache metadata refresh failed for %s: %s", cache_key, exc)
-    mc = _get_memcached_client()
-    if mc:
-        try:
-            _memcached_set_metadata(mc, cache_key, meta)
-        except Exception as exc:
-            LOG.warning("Memcached set on metadata refresh failed: %s", exc)
 
 
-def _update_memcached_client() -> None:
-    servers_str = getattr(ctx.options, "memcached_servers", "") or ""
-    ctx._passsage_memcached = None
-    if not servers_str.strip():
-        return
-    servers = _parse_memcached_servers(servers_str)
-    if not servers:
-        return
-    try:
-        from pymemcache.client.hash import HashClient
-        ctx._passsage_memcached = HashClient(
-            servers,
-            connect_timeout=2,
-            timeout=2,
-            dead_timeout=30,
-            retry_attempts=2,
-            retry_timeout=1,
-            use_pooling=True,
-            max_pool_size=16,
-        )
-    except Exception as exc:
-        LOG.warning("Memcached client init failed: %s", exc)
-
-
-def _get_memcached_client():
-    if not hasattr(ctx, "_passsage_memcached"):
-        _update_memcached_client()
-    return getattr(ctx, "_passsage_memcached", None)
-
-
-def _memcached_set_metadata(mc, cache_key: str, meta: dict) -> None:
-    mc.set(_memcached_key(cache_key), json.dumps(meta), expire=0)
+def _es_meta_index() -> str:
+    return os.environ.get("PASSSAGE_ELASTICSEARCH_META_INDEX", "passsage_meta")
 
 
 def get_cache_metadata(cache_key: str) -> CacheMeta:
-    mc = _get_memcached_client()
-    if mc:
-        try:
-            raw = mc.get(_memcached_key(cache_key))
-            if raw is not None:
-                meta = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
-                return CacheMeta(200, meta, source="memcached")
-        except Exception as exc:
-            LOG.warning("Memcached get for cache metadata failed: %s", exc)
-    data = _s3_get_json(cache_key)
+    data = es_get_doc(_es_meta_index(), cache_key)
     if data is None:
-        return CacheMeta(404, {}, source="s3")
-    if mc:
-        try:
-            _memcached_set_metadata(mc, cache_key, data)
-        except Exception as exc:
-            LOG.warning("Memcached write-back for cache metadata failed: %s", exc)
-    return CacheMeta(200, data, source="s3")
+        return CacheMeta(404, {}, source="elasticsearch")
+    batcher = getattr(ctx, "_last_access_batcher", None)
+    if batcher:
+        batcher.touch(cache_key)
+    return CacheMeta(200, data, source="elasticsearch")
 
 
 def get_vary_index(vary_index_key: str) -> CacheMeta:
-    mc = _get_memcached_client()
-    if mc:
-        try:
-            raw = mc.get(_memcached_key(vary_index_key))
-            if raw is not None:
-                data = json.loads(raw) if isinstance(raw, bytes) else json.loads(str(raw))
-                return CacheMeta(200, data, source="memcached")
-        except Exception as exc:
-            LOG.warning("Memcached get for vary index failed: %s", exc)
-    data = _s3_get_json(vary_index_key)
+    data = es_get_doc(_es_meta_index(), vary_index_key)
     if data is None:
-        return CacheMeta(404, {}, source="s3")
-    if mc:
-        try:
-            mc.set(_memcached_key(vary_index_key), json.dumps(data), expire=0)
-        except Exception as exc:
-            LOG.warning("Memcached write-back for vary index failed: %s", exc)
-    return CacheMeta(200, data, source="s3")
+        return CacheMeta(404, {}, source="elasticsearch")
+    return CacheMeta(200, data, source="elasticsearch")
 
 
 def get_refresh_patterns() -> list[RefreshPattern]:
@@ -973,6 +893,57 @@ def _init_error_logs() -> None:
         getattr(ctx.options, "access_log_headers", ACCESS_LOG_HEADERS)
     )
     ctx._error_log_writer.start()
+
+
+_ES_MAPPING = {
+    "settings": {
+        "number_of_shards": 9,
+        "number_of_replicas": 1,
+        "refresh_interval": "60s",
+    },
+    "mappings": {
+        "dynamic": False,
+        "properties": {
+            "status_code": {"type": "integer", "index": False},
+            "url": {"type": "keyword"},
+            "extension": {"type": "keyword"},
+            "content_size": {"type": "long", "index": False},
+            "stored_at": {"type": "double", "index": False},
+            "last_access": {"type": "date", "format": "epoch_millis"},
+            "headers": {"type": "object", "enabled": False},
+            "vary": {"type": "keyword", "index": False},
+            "vary_request": {"type": "keyword", "index": False},
+            "doc_type": {"type": "keyword"},
+        },
+    },
+}
+
+
+def _init_elasticsearch() -> None:
+    if getattr(ctx, "_es_initialized", False):
+        return
+    es_url = os.environ.get("PASSSAGE_ELASTICSEARCH_URL", "")
+    if not es_url:
+        return
+    meta_index = os.environ.get("PASSSAGE_ELASTICSEARCH_META_INDEX", "passsage_meta")
+    flush_interval = float(os.environ.get("PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL", "30"))
+
+    shards = int(os.environ.get("PASSSAGE_ELASTICSEARCH_SHARDS", "9"))
+    replicas = int(os.environ.get("PASSSAGE_ELASTICSEARCH_REPLICAS", "1"))
+
+    _es_configure(es_url)
+
+    mapping = dict(_ES_MAPPING)
+    mapping["settings"] = {
+        "number_of_shards": shards,
+        "number_of_replicas": replicas,
+        "refresh_interval": "60s",
+    }
+    es_create_index(meta_index, mapping)
+
+    ctx._last_access_batcher = LastAccessBatcher(meta_index, flush_interval)
+    ctx._es_initialized = True
+    LOG.info("Elasticsearch initialized: url=%s index=%s flush_interval=%ss", es_url, meta_index, flush_interval)
 
 
 def _build_access_log_record(flow, error: str | None = None) -> dict:
@@ -1398,12 +1369,6 @@ class Proxy:
             help="Flush size threshold for error logs (bytes or 1G/500M/10K)",
         )
         loader.add_option(
-            name="memcached_servers",
-            typespec=str,
-            default="",
-            help="Comma-separated memcached servers (host:port) for metadata/vary cache; e.g. cache-0.cache:11211,cache-1.cache:11211",
-        )
-        loader.add_option(
             name="xs3lerator_url",
             typespec=str,
             default=os.environ.get("PASSSAGE_XS3LERATOR_URL", ""),
@@ -1441,8 +1406,7 @@ class Proxy:
             "error_log_flush_bytes",
         }.intersection(updated):
             _init_error_logs()
-        if "memcached_servers" in updated:
-            _update_memcached_client()
+        _init_elasticsearch()
 
     @staticmethod
     def cache_expired(cache):
@@ -1531,7 +1495,7 @@ class Proxy:
         try:
             normalized_url = _normalize_url(flow)
             depth = _s3_hash_prefix_depth()
-            vary_index_key = get_vary_index_key(normalized_url, hash_prefix_depth=depth)
+            vary_index_key = es_vary_index_id(normalized_url)
             flow._vary_index_key = vary_index_key
             LOG.debug("Cache lookup vary index key=%s", vary_index_key)
             vary_index_head = get_vary_index(vary_index_key)
@@ -1546,7 +1510,7 @@ class Proxy:
                 if "*" not in vary_hdr:
                     vary_key = compute_vary_key(vary_hdr, flow.request.headers)
                     if vary_key is not None:
-                        flow._cache_key = get_cache_key(normalized_url, vary_key, hash_prefix_depth=depth)
+                        flow._cache_key = es_doc_id(normalized_url, vary_key)
                         LOG.debug(
                             "Cache lookup vary header=%s vary_key=%s cache_key=%s",
                             vary_hdr,
@@ -1554,7 +1518,7 @@ class Proxy:
                             flow._cache_key,
                         )
             if flow._cache_key is None and flow._cache_vary != "*":
-                flow._cache_key = get_cache_key(normalized_url, hash_prefix_depth=depth)
+                flow._cache_key = es_doc_id(normalized_url)
                 LOG.debug("Cache lookup default key=%s", flow._cache_key)
             if flow._cache_key:
                 flow._cache_head = get_cache_metadata(flow._cache_key)
@@ -1609,7 +1573,7 @@ class Proxy:
                 flow._cache_head.status_code,
                 m.get("method"),
                 m.get("headers", {}).get("etag"),
-                m.get("last_modified"),
+                (m.get("headers") or {}).get("last-modified"),
             )
             LOG.debug("Cache method match cached_method=%s", cached_method)
 
@@ -2003,7 +1967,6 @@ class Proxy:
         xs3lerator_full_size=None,
     ):
         try:
-            s3 = get_s3_client()
             if f is not None:
                 f.flush()
                 f.seek(0)
@@ -2013,10 +1976,11 @@ class Proxy:
                 if base_key != cache_key:
                     _xs3lerator_link_manifest(base_key, cache_key)
 
-            # Build and write the metadata JSON (under meta/ prefix)
+            # Build and write the metadata JSON
             cached_headers = {}
             for k in (
                 "etag",
+                "last-modified",
                 "vary",
                 "cache-control",
                 "content-type",
@@ -2034,40 +1998,37 @@ class Proxy:
                 if k in headers:
                     cached_headers[k] = headers[k]
 
+            content_size = xs3lerator_full_size
+            if content_size is None and "content-length" in headers:
+                try:
+                    content_size = int(headers["content-length"])
+                except (ValueError, TypeError):
+                    pass
+
             meta = {
                 "status_code": int(status_code),
-                "reason": reason,
-                "method": method,
-                "sha224": digest,
                 "stored_at": time.time(),
+                "last_access": int(time.time() * 1000),
                 "url": url[:512],
-                "last_modified": headers.get("last-modified"),
+                "extension": _url_ext(url),
                 "headers": cached_headers,
+                "doc_type": "metadata",
             }
+            if content_size is not None:
+                meta["content_size"] = content_size
             if vary_header:
                 meta["vary"] = vary_header
             if vary_request:
                 meta["vary_request"] = vary_request
 
-            _s3_put_json(cache_key, meta)
-
-            mc = _get_memcached_client()
-            if mc:
-                try:
-                    _memcached_set_metadata(mc, cache_key, meta)
-                except Exception as mc_exc:
-                    LOG.warning("Memcached set after cache save failed: %s", mc_exc)
+            es_index = _es_meta_index()
+            es_index_doc(es_index, cache_key, meta)
 
             # 3. Write the vary index (if applicable)
             if vary_header:
-                vary_index_key = get_vary_index_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
-                vary_data = {"vary": vary_header}
-                _s3_put_json(vary_index_key, vary_data)
-                if mc:
-                    try:
-                        mc.set(_memcached_key(vary_index_key), json.dumps(vary_data), expire=0)
-                    except Exception as mc_exc:
-                        LOG.warning("Memcached set for vary index failed: %s", mc_exc)
+                vary_index_key = es_vary_index_id(normalized_url)
+                vary_data = {"vary": vary_header, "doc_type": "vary_index"}
+                es_index_doc(es_index, vary_index_key, vary_data)
         except Exception as e:
             LOG.error("Cache save error %s, %s", url, e)
             _log_exception(
@@ -2126,7 +2087,7 @@ class Proxy:
                 vary_key = compute_vary_key(vary_header, flow.request.headers)
                 if vary_key:
                     normalized_url = _normalize_url(flow)
-                    flow._cache_key = get_cache_key(normalized_url, vary_key, hash_prefix_depth=_s3_hash_prefix_depth())
+                    flow._cache_key = es_doc_id(normalized_url, vary_key)
                     flow._cache_vary = vary_header
                     flow._cache_vary_request = build_vary_request(
                         vary_header, flow.request.headers
@@ -2155,7 +2116,7 @@ class Proxy:
 
             if is_xs3lerator:
                 normalized_url = _normalize_url(flow)
-                cache_key = flow._cache_key or get_cache_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
+                cache_key = flow._cache_key or es_doc_id(normalized_url)
                 flow._cache_saved = True
                 save_headers = flow.response.headers.copy()
                 if "content-range" in save_headers:
@@ -2239,7 +2200,7 @@ class Proxy:
                         self.cleanup(flow)
                     return
                 normalized_url = _normalize_url(flow)
-                cache_key = flow._cache_key or get_cache_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
+                cache_key = flow._cache_key or es_doc_id(normalized_url)
                 flow._cache_saved = True
                 LOG.debug("Cache save enqueue key=%s", cache_key)
                 save_headers = flow.response.headers

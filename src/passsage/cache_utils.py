@@ -1,4 +1,4 @@
-"""Pure utility functions for cache key derivation and memcached key management.
+"""Pure utility functions for cache key derivation.
 
 Shared by proxy.py (runtime) and cli.py (offline inspection).
 """
@@ -6,31 +6,29 @@ Shared by proxy.py (runtime) and cli.py (offline inspection).
 import hashlib
 from urllib.parse import urlparse
 
-MEMCACHED_MAX_KEY_LEN = 250
+
+def es_doc_id(normalized_url: str, vary_key: str | None = None) -> str:
+    """Compute the Elasticsearch document _id for a normalized URL.
+
+    Format: {scheme}/{host}/{sha224hex} or {scheme}/{host}/{sha224hex}+{vary_sha224}
+    No S3-style hash prefix dirs, no meta/ prefix, no extension.
+    """
+    parsed = urlparse(normalized_url)
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "unknown").lower()
+    digest = hashlib.sha224(normalized_url.encode("utf-8")).hexdigest()
+    if vary_key:
+        return f"{scheme}/{host}/{digest}+{vary_key}"
+    return f"{scheme}/{host}/{digest}"
 
 
-def memcached_key(key: str) -> str:
-    """Derive the memcached key from an S3 cache key or vary-index key."""
-    if len(key) <= MEMCACHED_MAX_KEY_LEN:
-        return key
-    return "passsage:s224:" + hashlib.sha224(key.encode()).hexdigest()
-
-
-def parse_memcached_servers(servers_str: str) -> list[tuple[str, int]]:
-    """Parse a comma-separated 'host:port,host:port' string into a server list."""
-    out: list[tuple[str, int]] = []
-    for part in servers_str.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if ":" in part:
-            host, _, port_str = part.rpartition(":")
-            port = int(port_str) if port_str.isdigit() else 11211
-        else:
-            host, port = part, 11211
-        if host:
-            out.append((host, port))
-    return out
+def es_vary_index_id(normalized_url: str) -> str:
+    """Compute the Elasticsearch document _id for a vary-index entry."""
+    parsed = urlparse(normalized_url)
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "unknown").lower()
+    digest = hashlib.sha224(normalized_url.encode("utf-8")).hexdigest()
+    return f"{scheme}/{host}/_vary/{digest}"
 
 
 def url_ext(url: str, max_len: int = 20) -> str:
