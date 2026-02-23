@@ -1972,7 +1972,7 @@ class Proxy:
                 f.seek(0)
 
             if xs3lerator_handled and vary_header:
-                base_key = get_cache_key(normalized_url, hash_prefix_depth=_s3_hash_prefix_depth())
+                base_key = es_doc_id(normalized_url)
                 if base_key != cache_key:
                     _xs3lerator_link_manifest(base_key, cache_key)
 
