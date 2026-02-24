@@ -918,6 +918,7 @@ _ES_MAPPING = {
             "vary": {"type": "keyword", "index": False},
             "vary_request": {"type": "keyword", "index": False},
             "doc_type": {"type": "keyword"},
+            "manifest_b64": {"type": "keyword", "index": False, "doc_values": False},
         },
     },
 }
@@ -1186,6 +1187,11 @@ def _rewrite_to_xs3lerator(flow, cache_skip: bool):
         flow.request.headers["X-Xs3lerator-Object-Size"] = (
             flow._cache_head.meta["headers"]["content-length"]
         )
+
+    if not cache_skip and flow._cache_head:
+        manifest_b64 = flow._cache_head.meta.get("manifest_b64")
+        if manifest_b64 and len(manifest_b64) <= 65536:
+            flow.request.headers["X-Xs3lerator-Manifest"] = manifest_b64
 
     flow._xs3lerator_rewrite = True
     flow._object_store_rewrite = True
