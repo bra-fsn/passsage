@@ -229,7 +229,7 @@ def _xs3lerator_link_manifest(base_key: str, vary_key: str) -> None:
     if not xs3_url:
         LOG.warning("xs3lerator_url not configured, cannot link manifest")
         return
-    url = f"{xs3_url}/{S3_BUCKET}/{vary_key}"
+    url = f"{xs3_url}/{vary_key}"
     headers = {"X-Xs3lerator-Link-Manifest": base_key}
     try:
         resp = requests.post(url, headers=headers, timeout=30)
@@ -1145,7 +1145,7 @@ def _rewrite_to_xs3lerator(flow, cache_skip: bool):
     flow.request.port = parsed.port or 8080
 
     s3_key = flow._cache_key
-    flow.request.path = f"/{S3_BUCKET}/{s3_key}"
+    flow.request.path = f"/{s3_key}"
 
     flow.request.headers["X-Xs3lerator-Upstream-Url"] = base64.b64encode(
         flow._original_url.encode()
