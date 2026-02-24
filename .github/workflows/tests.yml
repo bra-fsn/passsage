@@ -37,7 +37,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          dockerfile: Dockerfile
+          file: Dockerfile
           load: true
           tags: passsage_passsage:latest
           cache-from: type=gha,scope=compose
