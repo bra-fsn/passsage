@@ -1121,6 +1121,33 @@ def build_vary_request(vary_header: str, request_headers) -> str | None:
     return "|".join(parts)
 
 
+# Request headers that are known to affect response bytes.  Used to
+# proactively differentiate cache/dedup keys before the upstream Vary
+# header is discovered — prevents xs3lerator from coalescing concurrent
+# requests for the same URL but different encodings.
+_CONTENT_AFFECTING_HEADERS = ("accept-encoding",)
+
+
+def compute_proactive_vary_key(request_headers) -> str | None:
+    """Hash content-affecting request headers into a vary key *before*
+    seeing the upstream Vary response header.
+
+    Returns None when no content-affecting headers are present (no need
+    to differentiate the key).
+
+    The output intentionally matches ``compute_vary_key()`` for the
+    same set of headers so that the ES metadata key is identical
+    whether computed proactively or reactively.
+    """
+    names_with_values = [
+        name for name in _CONTENT_AFFECTING_HEADERS
+        if request_headers.get(name)
+    ]
+    if not names_with_values:
+        return None
+    return compute_vary_key(",".join(names_with_values), request_headers)
+
+
 def _rewrite_to_object_store(flow):
     """Rewrite a cache-hit GET to fetch via xs3lerator.
 
@@ -1145,6 +1172,7 @@ def _rewrite_to_xs3lerator(flow, cache_skip: bool):
     flow.request.port = parsed.port or 8080
 
     s3_key = flow._cache_key
+    flow._xs3lerator_stored_key = s3_key
     flow.request.path = f"/{s3_key}"
 
     flow.request.headers["X-Xs3lerator-Upstream-Url"] = base64.b64encode(
@@ -1443,6 +1471,7 @@ class Proxy:
         flow._xs3lerator_rewrite = False
         flow._xs3lerator_full_size = None
         flow._original_url = None
+        flow._proactive_vary_key = None
         policy = flow._policy = get_policy(flow)
         if _is_s3_cache_request(flow):
             flow._save_response = False
@@ -1520,8 +1549,17 @@ class Proxy:
                             flow._cache_key,
                         )
             if flow._cache_key is None and flow._cache_vary != "*":
-                flow._cache_key = es_doc_id(normalized_url)
-                LOG.debug("Cache lookup default key=%s", flow._cache_key)
+                proactive_vk = compute_proactive_vary_key(flow.request.headers)
+                flow._cache_key = es_doc_id(normalized_url, proactive_vk)
+                flow._proactive_vary_key = proactive_vk
+                if proactive_vk:
+                    LOG.debug(
+                        "Cache lookup proactive vary key=%s cache_key=%s",
+                        proactive_vk,
+                        flow._cache_key,
+                    )
+                else:
+                    LOG.debug("Cache lookup default key=%s", flow._cache_key)
             if flow._cache_key:
                 flow._cache_head = get_cache_metadata(flow._cache_key)
                 flow._metadata_source = flow._cache_head.source
@@ -1967,6 +2005,7 @@ class Proxy:
         normalized_url,
         xs3lerator_handled=False,
         xs3lerator_full_size=None,
+        xs3lerator_stored_key=None,
     ):
         try:
             if f is not None:
@@ -1974,9 +2013,9 @@ class Proxy:
                 f.seek(0)
 
             if xs3lerator_handled and vary_header:
-                base_key = es_doc_id(normalized_url)
-                if base_key != cache_key:
-                    _xs3lerator_link_manifest(base_key, cache_key)
+                source_key = xs3lerator_stored_key or es_doc_id(normalized_url)
+                if source_key != cache_key:
+                    _xs3lerator_link_manifest(source_key, cache_key)
 
             # Build and write the metadata JSON
             cached_headers = {}
@@ -2143,6 +2182,7 @@ class Proxy:
                         normalized_url,
                         xs3lerator_handled=True,
                         xs3lerator_full_size=xs3_full_size,
+                        xs3lerator_stored_key=getattr(flow, "_xs3lerator_stored_key", None),
                     )
                 elif flow._counter in self.files and flow._counter in self.hashes:
                     body_file = self.files[flow._counter]
