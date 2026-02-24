@@ -48,6 +48,7 @@ jobs:
         env:
           PASSSAGE_ALLOW_POLICY_HEADER: "1"
           PASSSAGE_DEBUG_PROXY: "1"
+          RUST_LOG: "debug"
         run: |
           mkdir -p .data
           docker compose up -d --build --wait
