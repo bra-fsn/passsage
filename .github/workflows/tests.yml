@@ -65,6 +65,7 @@ jobs:
           AWS_DEFAULT_REGION: us-west-2
           PASSSAGE_TEST_SERVER_BIND_HOST: 0.0.0.0
           PASSSAGE_TEST_SERVER_HOST: host.docker.internal
+          PASSSAGE_SYNC_SETTLE_SECONDS: "2"
         run: |
           pytest -m "not slow"
 
