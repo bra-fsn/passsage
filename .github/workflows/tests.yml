@@ -49,6 +49,7 @@ jobs:
           PASSSAGE_ALLOW_POLICY_HEADER: "1"
           PASSSAGE_DEBUG_PROXY: "1"
         run: |
+          mkdir -p .data
           docker compose up -d --build --wait
           docker compose ps
           docker compose logs xs3lerator
