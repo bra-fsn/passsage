@@ -1,6 +1,5 @@
 """Integration tests for the HTTP proxy against a live connection and live S3 backend."""
 
-import base64
 import hashlib
 import os
 import tempfile
@@ -1164,11 +1163,10 @@ class TestXs3leratorIntegration:
         """Direct request to xs3lerator with Cache-Skip=true should fetch from upstream
         and return the correct body."""
         url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=direct")
-        upstream_url = base64.b64encode(url.encode()).decode()
         resp = requests.get(
-            f"{XS3LERATOR_URL}/test-direct-key",
+            f"{XS3LERATOR_URL}/{url}",
             headers={
-                "X-Xs3lerator-Upstream-Url": upstream_url,
+                "X-Xs3lerator-Cache-Key": "test-direct-key",
                 "X-Xs3lerator-Cache-Skip": "true",
             },
             timeout=30,
@@ -1177,7 +1175,7 @@ class TestXs3leratorIntegration:
         assert "policy Standard" in resp.text
 
     def test_xs3lerator_post_without_link_header_returns_500(self):
-        """POST without X-Xs3lerator-Link-Manifest header returns 500."""
+        """POST without X-Xs3lerator-Link-Manifest-Source header returns 500."""
         resp = requests.post(f"{XS3LERATOR_URL}/some-key", timeout=5)
         assert resp.status_code == 500
 
@@ -1189,16 +1187,15 @@ class TestXs3leratorIntegration:
     def test_manifest_alias_post(
         self, proxy_session, test_server, cache_bust_random
     ):
-        """POST with X-Xs3lerator-Link-Manifest should create a manifest alias."""
+        """POST with X-Xs3lerator-Link-Manifest-Source/Target should create a manifest alias."""
         test_server.reset()
         size = 4096
         url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&xs3=alias")
-        upstream_b64 = base64.b64encode(url.encode()).decode()
         source_key = f"test-alias-source-{cache_bust_random}"
         resp = requests.get(
-            f"{XS3LERATOR_URL}/{source_key}",
+            f"{XS3LERATOR_URL}/{url}",
             headers={
-                "X-Xs3lerator-Upstream-Url": upstream_b64,
+                "X-Xs3lerator-Cache-Key": source_key,
                 "X-Xs3lerator-Cache-Skip": "true",
             },
             timeout=30,
@@ -1208,8 +1205,11 @@ class TestXs3leratorIntegration:
 
         alias_key = f"test-alias-dest-{cache_bust_random}"
         post_resp = requests.post(
-            f"{XS3LERATOR_URL}/{alias_key}",
-            headers={"X-Xs3lerator-Link-Manifest": source_key},
+            f"{XS3LERATOR_URL}/manifest-alias",
+            headers={
+                "X-Xs3lerator-Link-Manifest-Source": source_key,
+                "X-Xs3lerator-Link-Manifest-Target": alias_key,
+            },
             timeout=30,
         )
         assert post_resp.status_code == 204

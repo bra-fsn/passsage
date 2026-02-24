@@ -2,7 +2,6 @@
 # handle upstream authentication
 # collect and expose metrics/stats (with limited number of entries), like top list for misses, hits, etc.
 
-import base64
 import copy
 import json
 import hashlib
@@ -229,8 +228,11 @@ def _xs3lerator_link_manifest(base_key: str, vary_key: str) -> None:
     if not xs3_url:
         LOG.warning("xs3lerator_url not configured, cannot link manifest")
         return
-    url = f"{xs3_url}/{vary_key}"
-    headers = {"X-Xs3lerator-Link-Manifest": base_key}
+    url = f"{xs3_url}/manifest-alias"
+    headers = {
+        "X-Xs3lerator-Link-Manifest-Source": base_key,
+        "X-Xs3lerator-Link-Manifest-Target": vary_key,
+    }
     try:
         resp = requests.post(url, headers=headers, timeout=30)
         resp.raise_for_status()
@@ -1162,6 +1164,8 @@ def _rewrite_to_xs3lerator(flow, cache_skip: bool):
     """Rewrite GET request to route through xs3lerator.
 
     xs3lerator handles parallel downloads, S3 caching, and range requests.
+    The upstream URL is placed in the request path; the cache key is sent
+    in the X-Xs3lerator-Cache-Key header.
     """
     xs3lerator_url = ctx.options.xs3lerator_url
     parsed = urlparse(xs3lerator_url)
@@ -1173,11 +1177,9 @@ def _rewrite_to_xs3lerator(flow, cache_skip: bool):
 
     s3_key = flow._cache_key
     flow._xs3lerator_stored_key = s3_key
-    flow.request.path = f"/{s3_key}"
+    flow.request.path = f"/{flow._original_url}"
 
-    flow.request.headers["X-Xs3lerator-Upstream-Url"] = base64.b64encode(
-        flow._original_url.encode()
-    ).decode()
+    flow.request.headers["X-Xs3lerator-Cache-Key"] = s3_key
     if cache_skip:
         flow.request.headers["X-Xs3lerator-Cache-Skip"] = "true"
     elif flow._cache_head and flow._cache_head.meta.get("headers", {}).get("content-length"):
@@ -1211,13 +1213,12 @@ def _fallback_fetch_from_object_store(flow) -> bool:
     xs3lerator_url = ctx.options.xs3lerator_url
     if not xs3lerator_url:
         return False
+    original_url = flow._original_url if hasattr(flow, "_original_url") else flow.request.url
     parsed = urlparse(xs3lerator_url)
-    url = f"{parsed.scheme}://{parsed.netloc}/{cache_key}"
+    url = f"{parsed.scheme}://{parsed.netloc}/{original_url}"
     try:
         resp = requests.get(url, timeout=30, headers={
-            "X-Xs3lerator-Upstream-Url": base64.b64encode(
-                flow._original_url.encode() if hasattr(flow, "_original_url") else flow.request.url.encode()
-            ).decode(),
+            "X-Xs3lerator-Cache-Key": cache_key,
         })
         if resp.status_code != 200:
             LOG.warning("xs3lerator fallback returned %s for key=%s", resp.status_code, cache_key)
