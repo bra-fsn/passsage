@@ -1217,7 +1217,7 @@ class TestXs3leratorIntegration:
         alias_doc_id = alias_key.replace("/", "%2F")
         es_url = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
         es_resp = requests.get(
-            f"{es_url}/xs3_manifests/_doc/{alias_doc_id}",
+            f"{es_url}/passsage_meta/_doc/{alias_doc_id}",
             timeout=10,
         )
         assert es_resp.status_code == 200, (

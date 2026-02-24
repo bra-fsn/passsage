@@ -46,9 +46,13 @@ def es_get_doc(index: str, doc_id: str) -> dict | None:
 
 
 def es_index_doc(index: str, doc_id: str, body: dict) -> None:
-    """PUT _doc/{id} -- index (create or overwrite) a document."""
+    """Upsert a document via POST _update with doc_as_upsert.
+
+    Uses partial update semantics so that fields written by other programs
+    (e.g. manifest_b64 written by xs3lerator) are preserved.
+    """
     es = _get_es_client()
-    es.index(index=index, id=doc_id, document=body)
+    es.update(index=index, id=doc_id, doc=body, doc_as_upsert=True)
 
 
 def es_create_index(index: str, body: dict) -> None:
