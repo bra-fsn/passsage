@@ -52,7 +52,7 @@ def es_index_doc(index: str, doc_id: str, body: dict) -> None:
     (e.g. manifest_b64 written by xs3lerator) are preserved.
     """
     es = _get_es_client()
-    es.update(index=index, id=doc_id, doc=body, doc_as_upsert=True)
+    es.update(index=index, id=doc_id, doc=body, doc_as_upsert=True, retry_on_conflict=3)
 
 
 def es_create_index(index: str, body: dict) -> None:
