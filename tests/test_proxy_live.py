@@ -357,6 +357,7 @@ class TestProxyLive:
             expected_version = 2 if config["expect_updated"] else 1
             assert version_from_response(r2) == expected_version
             if config["expect_cache"]:
+                time.sleep(SYNC_SETTLE_SECONDS)
                 cached2 = get_cached_without_upstream(
                     proxy_session,
                     url,
