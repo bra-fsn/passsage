@@ -1184,7 +1184,7 @@ def _fallback_fetch_from_object_store(flow) -> bool:
     if not xs3lerator_url:
         return False
     parsed = urlparse(xs3lerator_url)
-    url = f"{parsed.scheme}://{parsed.netloc}/{S3_BUCKET}/{cache_key}"
+    url = f"{parsed.scheme}://{parsed.netloc}/{cache_key}"
     try:
         resp = requests.get(url, timeout=30, headers={
             "X-Xs3lerator-Upstream-Url": base64.b64encode(

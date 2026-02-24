@@ -1165,7 +1165,7 @@ class TestXs3leratorIntegration:
         url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=direct")
         upstream_url = base64.b64encode(url.encode()).decode()
         resp = requests.get(
-            f"{XS3LERATOR_URL}/{S3_BUCKET}/test-direct-key",
+            f"{XS3LERATOR_URL}/test-direct-key",
             headers={
                 "X-Xs3lerator-Upstream-Url": upstream_url,
                 "X-Xs3lerator-Cache-Skip": "true",
@@ -1177,12 +1177,12 @@ class TestXs3leratorIntegration:
 
     def test_xs3lerator_post_without_link_header_returns_500(self):
         """POST without X-Xs3lerator-Link-Manifest header returns 500."""
-        resp = requests.post(f"{XS3LERATOR_URL}/proxy-cache/some-key", timeout=5)
+        resp = requests.post(f"{XS3LERATOR_URL}/some-key", timeout=5)
         assert resp.status_code == 500
 
     def test_xs3lerator_returns_405_for_put(self):
         """xs3lerator only supports GET and POST; other methods should return 405."""
-        resp = requests.put(f"{XS3LERATOR_URL}/proxy-cache/some-key", timeout=5)
+        resp = requests.put(f"{XS3LERATOR_URL}/some-key", timeout=5)
         assert resp.status_code == 405
 
     def test_manifest_alias_post(
@@ -1195,7 +1195,7 @@ class TestXs3leratorIntegration:
         upstream_b64 = base64.b64encode(url.encode()).decode()
         source_key = f"test-alias-source-{cache_bust_random}"
         resp = requests.get(
-            f"{XS3LERATOR_URL}/{S3_BUCKET}/{source_key}",
+            f"{XS3LERATOR_URL}/{source_key}",
             headers={
                 "X-Xs3lerator-Upstream-Url": upstream_b64,
                 "X-Xs3lerator-Cache-Skip": "true",
@@ -1207,13 +1207,13 @@ class TestXs3leratorIntegration:
 
         alias_key = f"test-alias-dest-{cache_bust_random}"
         post_resp = requests.post(
-            f"{XS3LERATOR_URL}/{S3_BUCKET}/{alias_key}",
+            f"{XS3LERATOR_URL}/{alias_key}",
             headers={"X-Xs3lerator-Link-Manifest": source_key},
             timeout=30,
         )
         assert post_resp.status_code == 204
 
-        alias_doc_id = f"{S3_BUCKET}/{alias_key}".replace("/", "%2F")
+        alias_doc_id = alias_key.replace("/", "%2F")
         es_url = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
         es_resp = requests.get(
             f"{es_url}/xs3_manifests/_doc/{alias_doc_id}",
