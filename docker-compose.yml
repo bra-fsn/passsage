@@ -72,7 +72,6 @@ services:
       - "${XS3_PORT:-8888}:8080"
     environment:
       - XS3_DATA_DIR=/mnt/shared/bucket
-      - XS3_CHUNK_SIZE=5MiB
       - XS3_UPSTREAM_TLS_SKIP_VERIFY=true
       - XS3_ELASTICSEARCH_URL=http://elasticsearch:9200
       - XS3_ELASTICSEARCH_MANIFEST_INDEX=xs3_manifests
