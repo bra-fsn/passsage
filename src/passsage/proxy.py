@@ -1677,8 +1677,8 @@ class Proxy:
                 flow._short_circuit = True
                 flow._serve_reason = "head_synthetic_from_cache"
                 return
-            # Stale/miss HEAD: fall through to existing upstream HEAD logic.
-            # xs3lerator is never involved for HEAD requests.
+            # Stale/miss HEAD: fall through to upstream HEAD logic below.
+            # The HEAD request is routed through xs3lerator for connection pooling.
             return
 
         if cache_hit:
@@ -1743,13 +1743,8 @@ class Proxy:
                     flow._upstream_error = ctx._banned.get(key)
 
         if not upstream_failed:
-            # If the upstream is not banned, we do an upstream HEAD request
-            # to see whether the site is available or the file was modified.
-            # Sadly, mitmproxy doesn't support request retries on upstream failure,
-            # that's why we have to do the availability check ourselves.
             upstream_hdrs = {}
             for k, v in flow.request.headers.items():
-                # pass through some headers for testing
                 if (k.lower().startswith("x-echo-")
                         or k.lower() in ("x-sleep", "x-status-code")):
                     upstream_hdrs[k] = v
@@ -1762,8 +1757,12 @@ class Proxy:
             try:
                 timeout = getattr(ctx.options, "upstream_head_timeout", UPSTREAM_TIMEOUT)
                 start = time.perf_counter()
+                head_url = flow.request.url
+                if xs3lerator_enabled:
+                    xs3_parsed = urlparse(ctx.options.xs3lerator_url)
+                    head_url = f"{xs3_parsed.scheme}://{xs3_parsed.netloc}/{flow.request.url}"
                 flow._upstream_head = requests.head(
-                    flow.request.url,
+                    head_url,
                     timeout=timeout,
                     headers=upstream_hdrs,
                 )
