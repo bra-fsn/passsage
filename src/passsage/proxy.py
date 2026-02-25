@@ -1207,6 +1207,22 @@ def _rewrite_to_xs3lerator_miss(flow):
     _rewrite_to_xs3lerator(flow, cache_skip=True)
 
 
+def _rewrite_head_to_xs3lerator(flow):
+    """Rewrite a stale/miss HEAD to route through xs3lerator for connection pooling."""
+    xs3lerator_url = getattr(ctx.options, "xs3lerator_url", "")
+    if not xs3lerator_url:
+        return
+    parsed = urlparse(xs3lerator_url)
+    flow._original_url = flow.request.url
+    flow.request.scheme = parsed.scheme or "http"
+    flow.request.host = parsed.hostname
+    flow.request.port = parsed.port or 8080
+    flow.request.path = f"/{flow._original_url}"
+    flow._save_response = False
+    flow._xs3lerator_rewrite = True
+    flow._serve_reason = "head_via_xs3lerator"
+
+
 def _fallback_fetch_from_object_store(flow) -> bool:
     """Fetch cached object via xs3lerator as stale-if-error fallback.
 
@@ -1677,8 +1693,9 @@ class Proxy:
                 flow._short_circuit = True
                 flow._serve_reason = "head_synthetic_from_cache"
                 return
-            # Stale/miss HEAD: fall through to upstream HEAD logic below.
-            # The HEAD request is routed through xs3lerator for connection pooling.
+            # Stale/miss HEAD: rewrite the flow to route through xs3lerator
+            # for upstream connection pooling.
+            _rewrite_head_to_xs3lerator(flow)
             return
 
         if cache_hit:
@@ -1757,12 +1774,8 @@ class Proxy:
             try:
                 timeout = getattr(ctx.options, "upstream_head_timeout", UPSTREAM_TIMEOUT)
                 start = time.perf_counter()
-                head_url = flow.request.url
-                if xs3lerator_enabled:
-                    xs3_parsed = urlparse(ctx.options.xs3lerator_url)
-                    head_url = f"{xs3_parsed.scheme}://{xs3_parsed.netloc}/{flow.request.url}"
                 flow._upstream_head = requests.head(
-                    head_url,
+                    flow.request.url,
                     timeout=timeout,
                     headers=upstream_hdrs,
                 )
