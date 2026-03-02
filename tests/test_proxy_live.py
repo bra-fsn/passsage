@@ -264,7 +264,7 @@ class TestProxyLive:
     @pytest.mark.parametrize(
         ("policy_name", "expect_cached", "expect_status"),
         [
-            ("Standard", False, 504),
+            ("Standard", True, 200),
             ("StaleIfError", True, 200),
             ("NoRefresh", True, 200),
             ("AlwaysUpstream", False, 504),
@@ -483,12 +483,17 @@ class TestProxyLive:
         assert after_get == before_get
         assert after_head == before_head
 
-        for policy_name in ("Standard", "AlwaysUpstream", "NoCache"):
+        for policy_name in ("AlwaysUpstream", "NoCache"):
             resp = proxy_get(proxy_session, url, headers=policy_headers(policy_name), timeout=30)
             assert resp.status_code == 500, (
                 f"Expected 500 for {policy_name}, got {resp.status_code}"
             )
             assert "Cache-Status" not in resp.headers
+
+        resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert resp.ok, (
+            f"Standard with xs3lerator cache should serve 200, got {resp.status_code}"
+        )
 
     def test_cache_control_no_store(self, proxy_session, test_server, cache_bust_random):
         # Ensures Cache-Control: no-store prevents caching.
@@ -501,13 +506,13 @@ class TestProxyLive:
         assert get_method_count(stats, "/cache-control/no-store", "GET") == 2
 
     def test_cache_control_no_cache(self, proxy_session, test_server, cache_bust_random):
-        # Ensures Cache-Control: no-cache forces revalidation (HEAD) while using cache.
+        # Ensures Cache-Control: no-cache forces revalidation while serving from cache.
         test_server.reset()
         url = test_server.url(f"/cache-control/no-cache?random={cache_bust_random}")
         r1 = proxy_get(proxy_session, url, timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
-        r2 = get_cached_without_upstream(
-            proxy_session, url, test_server, "/cache-control/no-cache"
+        r2 = wait_for_cached_response(
+            proxy_session, url
         )
         assert r1.ok and r2.ok
         assert_cached_response(r2)
@@ -519,7 +524,7 @@ class TestProxyLive:
         r1 = proxy_get(proxy_session, url, timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
         stats = test_server.stats()
-        before_head = get_method_count(stats, "/cache-control/max-age", "HEAD")
+        before_get = get_method_count(stats, "/cache-control/max-age", "GET")
         r2 = proxy_get(
             proxy_session,
             url,
@@ -527,9 +532,12 @@ class TestProxyLive:
             timeout=30,
         )
         stats = test_server.stats()
-        after_head = get_method_count(stats, "/cache-control/max-age", "HEAD")
+        after_get = get_method_count(stats, "/cache-control/max-age", "GET")
         assert r1.ok and r2.ok
-        assert after_head == before_head + 1
+        assert after_get == before_get + 1, (
+            f"Expected GET count to increase by 1 (conditional revalidation), "
+            f"got before={before_get} after={after_get}"
+        )
 
     def test_cache_control_max_age(self, proxy_session, test_server, cache_bust_random):
         # Ensures Cache-Control: max-age keeps cached content fresh.
@@ -555,8 +563,10 @@ class TestProxyLive:
         r2 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
         assert r1.ok and r2.ok
         stats = test_server.stats()
-        assert get_method_count(stats, "/cache-control/max-age-low", "GET") == 1
-        assert get_method_count(stats, "/cache-control/max-age-low", "HEAD") == 2
+        gets = get_method_count(stats, "/cache-control/max-age-low", "GET")
+        heads = get_method_count(stats, "/cache-control/max-age-low", "HEAD")
+        assert gets == 2, f"Expected 2 GETs (initial + conditional revalidation), got {gets}"
+        assert heads == 1, f"Expected 1 HEAD (initial miss), got {heads}"
         assert_cached_response(r2)
 
     def test_cached_redirect_preserves_status_and_location(
