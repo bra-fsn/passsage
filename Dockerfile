@@ -15,12 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml README.md ./
 RUN mkdir -p src/passsage \
     && echo '__version__ = "0.0.0"' > src/passsage/__init__.py \
-    && uv pip install --system --no-cache ".[ui]" \
+    && uv pip install --system --no-cache --link-mode=copy ".[ui]" \
     && rm -rf src/passsage
 
 # Copy source and install package only (dependencies already satisfied)
 COPY src/ ./src/
-RUN uv pip install --system --no-cache --no-deps .
+RUN uv pip install --system --no-cache --link-mode=copy --no-deps .
 
 # Expose proxy port
 EXPOSE 8080
