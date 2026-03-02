@@ -681,6 +681,70 @@ RULES = [
 ]
 ```
 
+### Upstream Timeout Overrides
+
+When Passsage is deployed with xs3lerator, you can configure per-rule upstream
+timeouts. These override xs3lerator's server-wide defaults (`--upstream-connect-timeout`
+and `--upstream-read-timeout`) on a per-request basis.
+
+xs3lerator defaults to a 30 s connect timeout and a 300 s (5 min) read timeout,
+matching common HTTP clients like pip and curl. Rules can tighten or relax these
+as needed.
+
+Timeouts are specified with `TimeoutConfig` and attached to any rule type via
+the `timeouts` keyword argument:
+
+```python
+# /path/to/policies.py
+from passsage.default_policies import default_rules
+from passsage.policy import (
+    HostContainsRule,
+    PolicyResolver,
+    StaleIfError,
+    Standard,
+    SuffixRule,
+    TimeoutConfig,
+)
+
+def get_rules():
+    rules = default_rules()
+
+    # Large ML model files: allow up to 15 min read timeout
+    rules.insert(0, SuffixRule(
+        ".safetensors",
+        StaleIfError,
+        timeouts=TimeoutConfig(read_timeout=900),
+    ))
+
+    # Slow internal registry: longer connect + read timeouts
+    rules.insert(0, HostContainsRule(
+        "registry.internal.example.com",
+        StaleIfError,
+        timeouts=TimeoutConfig(connect_timeout=60, read_timeout=600),
+    ))
+
+    # Fast API that should fail quickly
+    rules.insert(0, HostContainsRule(
+        "api.example.com",
+        Standard,
+        timeouts=TimeoutConfig(connect_timeout=5, read_timeout=30),
+    ))
+
+    return rules
+```
+
+`TimeoutConfig` fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `connect_timeout` | `float \| None` | TCP/TLS handshake timeout in seconds. `None` = use xs3lerator default (30 s). |
+| `read_timeout` | `float \| None` | Idle time between data chunks in seconds. `None` = use xs3lerator default (300 s). `0` = no timeout. |
+
+Under the hood, Passsage sends `X-Xs3lerator-Connect-Timeout` and
+`X-Xs3lerator-Read-Timeout` headers on the rewritten request. xs3lerator
+creates (or reuses) an HTTP client configured with those timeouts. The
+headers are stripped from client responses.
+
 ## License
 
 See `LICENSE` and `NOTICE` for copyright and attribution details.

@@ -151,6 +151,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond_stream(size_bytes, bandwidth, send_body)
             return
 
+        if path.startswith("/slow-read/"):
+            parts = path.split("/slow-read/", 1)[1].split("/", 1)
+            pause = float(parts[0]) if parts else 2.0
+            size = int(parts[1]) if len(parts) > 1 else 1024
+            self._respond_slow_read(pause, size, send_body)
+            return
+
         if path == "/stats":
             payload = json.dumps(self.server.state.snapshot()).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -444,6 +451,26 @@ class _Handler(BaseHTTPRequestHandler):
                     time.sleep(to_send / bandwidth)
         except BrokenPipeError:
             return
+
+    def _respond_slow_read(self, pause: float, size: int, send_body: bool) -> None:
+        """Send headers immediately, then pause before sending the body.
+
+        This simulates an upstream that accepts the connection quickly but is
+        slow to produce data — triggering read timeouts in the proxy.
+        """
+        body = bytes(i % 256 for i in range(size))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if send_body:
+            self.wfile.flush()
+            time.sleep(pause)
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                return
 
     def _respond_text(self, status: int | HTTPStatus, text: str, send_body: bool) -> None:
         body = text.encode("utf-8")
