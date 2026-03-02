@@ -70,6 +70,9 @@ Repository = "https://github.com/bra-fsn/passsage"
 [tool.hatch.version]
 path = "src/passsage/__init__.py"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/passsage"]
 include = ["src/passsage/onboarding/proxy-env.sh"]
