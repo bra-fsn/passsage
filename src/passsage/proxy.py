@@ -1981,7 +1981,11 @@ class Proxy:
                 flow.response.status_code >= 500
                 or (flow.response.status_code == 404 and flow._policy == StaleIfError)
             )
-            and (flow._policy == StaleIfError or getattr(flow, "_allow_stale_if_error", False))
+            and (
+                flow._policy == StaleIfError
+                or getattr(flow, "_allow_stale_if_error", False)
+                or getattr(flow, "_xs3lerator_rewrite", False)
+            )
         ):
             if _fallback_fetch_from_object_store(flow):
                 flow._serve_reason = "stale_if_error_fallback"
