@@ -36,7 +36,7 @@ dependencies = [
     "click>=8.0",
     "elasticsearch9",
     "flask>=2.0",
-    "mitmproxy>=12,<13",
+    "mitmproxy @ https://github.com/bra-fsn/mitmproxy/archive/refs/heads/connection_pool.zip",
     "pyarrow",
     "pytz>=2023.0",
     "requests>=2.28",
