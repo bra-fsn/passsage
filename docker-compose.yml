@@ -3,6 +3,10 @@ services:
     image: localstack/localstack:latest
     ports:
       - "4566:4566"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       - SERVICES=s3
       - DEBUG=0
@@ -15,6 +19,51 @@ services:
       timeout: 5s
       retries: 10
 
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+    ports:
+      - "9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  xs3lerator:
+    image: ghcr.io/bra-fsn/xs3lerator:latest
+    pull_policy: always
+    ports:
+      - "${XS3_PORT:-8888}:8080"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - XS3_S3_BUCKET=proxy-cache
+      - XS3_S3_ENDPOINT=http://localstack:4566
+      - XS3_S3_REGION=${AWS_DEFAULT_REGION:-us-west-2}
+      - XS3_CACHE_DIR=/var/cache/xs3lerator
+      - XS3_UPSTREAM_TLS_SKIP_VERIFY=true
+      - XS3_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
+      - AWS_ALLOW_HTTP=true
+    volumes:
+      - xs3lerator-cache:/var/cache/xs3lerator
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      localstack:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
   passsage:
     build:
       context: .
@@ -23,11 +72,13 @@ services:
       - "${PROXY_PORT:-8080}:8080"
       - "${HEALTH_PORT:-8082}:8082"
     environment:
-      - PASSSAGE_ALLOW_POLICY_HEADER=${PASSSAGE_ALLOW_POLICY_HEADER:-}
+      - PASSSAGE_ALLOW_POLICY_HEADER=${PASSSAGE_ALLOW_POLICY_HEADER:-1}
       - PASSSAGE_DEBUG_PROXY=${PASSSAGE_DEBUG_PROXY:-}
-      - PASSSAGE_OBJECT_STORE_URL=http://localstack:4566/proxy-cache
+      - PASSSAGE_XS3LERATOR_URL=http://xs3lerator:8080
+      - PASSSAGE_S3_HASH_PREFIX_DEPTH=4
       - PASSSAGE_HEALTH_PORT=8082
       - PASSSAGE_HEALTH_HOST=0.0.0.0
+      - PASSSAGE_ELASTICSEARCH_URL=http://elasticsearch:9200
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
@@ -38,6 +89,10 @@ services:
     depends_on:
       localstack:
         condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      xs3lerator:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
       interval: 5s
@@ -46,3 +101,4 @@ services:
 
 volumes:
   localstack-data:
+  xs3lerator-cache:

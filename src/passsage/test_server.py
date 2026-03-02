@@ -151,6 +151,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond_stream(size_bytes, bandwidth, send_body)
             return
 
+        if path.startswith("/slow-read/"):
+            parts = path.split("/slow-read/", 1)[1].split("/", 1)
+            pause = float(parts[0]) if parts else 2.0
+            size = int(parts[1]) if len(parts) > 1 else 1024
+            self._respond_slow_read(pause, size, send_body)
+            return
+
         if path == "/stats":
             payload = json.dumps(self.server.state.snapshot()).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -168,6 +175,36 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._respond_text(HTTPStatus.NOT_FOUND, "not found", send_body)
 
+    def _check_conditional(self, etag: str, last_modified: str | None, send_body: bool) -> bool:
+        """Return True and send 304 if the request's conditional headers match.
+
+        Per RFC 7232 §3.2, If-None-Match takes precedence over If-Modified-Since.
+        """
+        inm = self.headers.get("If-None-Match")
+        if inm is not None:
+            if inm.strip() == etag or inm.strip().strip('"') == etag.strip('"'):
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.send_header("ETag", etag)
+                if last_modified:
+                    self.send_header("Last-Modified", last_modified)
+                self.end_headers()
+                return True
+
+        ims = self.headers.get("If-Modified-Since")
+        if ims is not None and last_modified is not None:
+            try:
+                ims_dt = datetime.strptime(ims.strip(), RFC1123).replace(tzinfo=timezone.utc)
+                lm_dt = datetime.strptime(last_modified.strip(), RFC1123).replace(tzinfo=timezone.utc)
+                if lm_dt <= ims_dt:
+                    self.send_response(HTTPStatus.NOT_MODIFIED)
+                    self.send_header("ETag", etag)
+                    self.send_header("Last-Modified", last_modified)
+                    self.end_headers()
+                    return True
+            except ValueError:
+                pass
+        return False
+
     def _respond_policy(self, policy_name: str, query: dict, send_body: bool) -> None:
         path = f"/policy/{policy_name}"
         override = self.server.state.policy_overrides.get(path, {})
@@ -180,12 +217,16 @@ class _Handler(BaseHTTPRequestHandler):
         if status is None and "status" in query:
             status = int(query.get("status", ["200"])[0])
         status = status or HTTPStatus.OK
+        etag = f"\"{policy_name}-etag\""
+        last_modified = _httpdate(self.server.state.last_modified)
+        if status == HTTPStatus.OK and self._check_conditional(etag, last_modified, send_body):
+            return
         body = f"policy {policy_name}".encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
-        self.send_header("ETag", f"\"{policy_name}-etag\"")
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("ETag", etag)
         self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
         if send_body:
@@ -223,10 +264,13 @@ class _Handler(BaseHTTPRequestHandler):
             cache_control = "max-age=1"
             body = f"version={self.server.state.version}".encode("utf-8")
             etag = f"\"cache-changing-{self.server.state.version}\""
+        last_modified = _httpdate(self.server.state.last_modified)
+        if status == HTTPStatus.OK and self._check_conditional(etag, last_modified, send_body):
+            return
         self.send_response(status)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
+        self.send_header("Last-Modified", last_modified)
         self.send_header("ETag", etag)
         if cache_control:
             self.send_header("Cache-Control", cache_control)
@@ -252,6 +296,10 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _respond_gzip_json(self, send_body: bool) -> None:
+        etag = "\"encoding-gzip\""
+        last_modified = _httpdate(self.server.state.last_modified)
+        if self._check_conditional(etag, last_modified, send_body):
+            return
         payload = json.dumps({"status": "ok", "encoding": "gzip"}).encode("utf-8")
         body = gzip.compress(payload)
         self.send_response(HTTPStatus.OK)
@@ -260,8 +308,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Vary", "Accept-Encoding")
         self.send_header("Cache-Control", "public, max-age=3600")
-        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
-        self.send_header("ETag", "\"encoding-gzip\"")
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("ETag", etag)
         self.end_headers()
         if send_body:
             self.wfile.write(body)
@@ -300,15 +348,18 @@ class _Handler(BaseHTTPRequestHandler):
         """
         range_header = self.headers.get("Range", "")
         etag = f'"range-data-{total_size}"'
+        last_modified = _httpdate(self.server.state.last_modified)
 
         if not range_header:
+            if self._check_conditional(etag, last_modified, send_body):
+                return
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(total_size))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("ETag", etag)
             self.send_header("Cache-Control", "public, max-age=3600")
-            self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
+            self.send_header("Last-Modified", last_modified)
             self.end_headers()
             if send_body:
                 self._write_deterministic(0, total_size)
@@ -330,7 +381,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("ETag", etag)
         self.send_header("Cache-Control", "public, max-age=3600")
-        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
+        self.send_header("Last-Modified", last_modified)
         self.end_headers()
         if send_body:
             self._write_deterministic(start, length)
@@ -373,11 +424,15 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
     def _respond_stream(self, size_bytes: int, bandwidth: float | None, send_body: bool) -> None:
+        etag = f"\"stream-{size_bytes}\""
+        last_modified = _httpdate(self.server.state.last_modified)
+        if self._check_conditional(etag, last_modified, send_body):
+            return
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(size_bytes))
-        self.send_header("Last-Modified", _httpdate(self.server.state.last_modified))
-        self.send_header("ETag", f"\"stream-{size_bytes}\"")
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("ETag", etag)
         self.send_header("Cache-Control", "public, max-age=60")
         self.end_headers()
         if not send_body:
@@ -396,6 +451,26 @@ class _Handler(BaseHTTPRequestHandler):
                     time.sleep(to_send / bandwidth)
         except BrokenPipeError:
             return
+
+    def _respond_slow_read(self, pause: float, size: int, send_body: bool) -> None:
+        """Send headers immediately, then pause before sending the body.
+
+        This simulates an upstream that accepts the connection quickly but is
+        slow to produce data — triggering read timeouts in the proxy.
+        """
+        body = bytes(i % 256 for i in range(size))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if send_body:
+            self.wfile.flush()
+            time.sleep(pause)
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                return
 
     def _respond_text(self, status: int | HTTPStatus, text: str, send_body: bool) -> None:
         body = text.encode("utf-8")

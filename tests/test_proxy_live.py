@@ -7,6 +7,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import boto3
 import pytest
 import psutil
 import requests
@@ -19,6 +20,9 @@ from passsage.test_server import TestServer
 urllib3.disable_warnings(InsecureRequestWarning)
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8080")
+XS3LERATOR_URL = os.environ.get("XS3LERATOR_URL", "http://localhost:8888")
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "http://localhost:4566")
+S3_BUCKET = os.environ.get("S3_BUCKET", "proxy-cache")
 TEST_SERVER_BIND_HOST = os.environ.get("PASSSAGE_TEST_SERVER_BIND_HOST", "127.0.0.1")
 TEST_SERVER_PUBLIC_HOST = os.environ.get("PASSSAGE_TEST_SERVER_HOST")
 SYNC_SETTLE_SECONDS = float(os.environ.get("PASSSAGE_SYNC_SETTLE_SECONDS", "1.0"))
@@ -260,7 +264,7 @@ class TestProxyLive:
     @pytest.mark.parametrize(
         ("policy_name", "expect_cached", "expect_status"),
         [
-            ("Standard", False, 504),
+            ("Standard", True, 200),
             ("StaleIfError", True, 200),
             ("NoRefresh", True, 200),
             ("AlwaysUpstream", False, 504),
@@ -352,6 +356,7 @@ class TestProxyLive:
             expected_version = 2 if config["expect_updated"] else 1
             assert version_from_response(r2) == expected_version
             if config["expect_cache"]:
+                time.sleep(SYNC_SETTLE_SECONDS)
                 cached2 = get_cached_without_upstream(
                     proxy_session,
                     url,
@@ -478,10 +483,17 @@ class TestProxyLive:
         assert after_get == before_get
         assert after_head == before_head
 
-        for policy_name in ("Standard", "AlwaysUpstream", "NoCache"):
+        for policy_name in ("AlwaysUpstream", "NoCache"):
             resp = proxy_get(proxy_session, url, headers=policy_headers(policy_name), timeout=30)
-            assert resp.status_code == 500
+            assert resp.status_code == 500, (
+                f"Expected 500 for {policy_name}, got {resp.status_code}"
+            )
             assert "Cache-Status" not in resp.headers
+
+        resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert resp.ok, (
+            f"Standard with xs3lerator cache should serve 200, got {resp.status_code}"
+        )
 
     def test_cache_control_no_store(self, proxy_session, test_server, cache_bust_random):
         # Ensures Cache-Control: no-store prevents caching.
@@ -494,13 +506,13 @@ class TestProxyLive:
         assert get_method_count(stats, "/cache-control/no-store", "GET") == 2
 
     def test_cache_control_no_cache(self, proxy_session, test_server, cache_bust_random):
-        # Ensures Cache-Control: no-cache forces revalidation (HEAD) while using cache.
+        # Ensures Cache-Control: no-cache forces revalidation while serving from cache.
         test_server.reset()
         url = test_server.url(f"/cache-control/no-cache?random={cache_bust_random}")
         r1 = proxy_get(proxy_session, url, timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
-        r2 = get_cached_without_upstream(
-            proxy_session, url, test_server, "/cache-control/no-cache"
+        r2 = wait_for_cached_response(
+            proxy_session, url
         )
         assert r1.ok and r2.ok
         assert_cached_response(r2)
@@ -512,7 +524,7 @@ class TestProxyLive:
         r1 = proxy_get(proxy_session, url, timeout=30)
         time.sleep(SYNC_SETTLE_SECONDS)
         stats = test_server.stats()
-        before_head = get_method_count(stats, "/cache-control/max-age", "HEAD")
+        before_get = get_method_count(stats, "/cache-control/max-age", "GET")
         r2 = proxy_get(
             proxy_session,
             url,
@@ -520,9 +532,12 @@ class TestProxyLive:
             timeout=30,
         )
         stats = test_server.stats()
-        after_head = get_method_count(stats, "/cache-control/max-age", "HEAD")
+        after_get = get_method_count(stats, "/cache-control/max-age", "GET")
         assert r1.ok and r2.ok
-        assert after_head == before_head + 1
+        assert after_get == before_get + 1, (
+            f"Expected GET count to increase by 1 (conditional revalidation), "
+            f"got before={before_get} after={after_get}"
+        )
 
     def test_cache_control_max_age(self, proxy_session, test_server, cache_bust_random):
         # Ensures Cache-Control: max-age keeps cached content fresh.
@@ -548,8 +563,10 @@ class TestProxyLive:
         r2 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
         assert r1.ok and r2.ok
         stats = test_server.stats()
-        assert get_method_count(stats, "/cache-control/max-age-low", "GET") == 1
-        assert get_method_count(stats, "/cache-control/max-age-low", "HEAD") == 2
+        gets = get_method_count(stats, "/cache-control/max-age-low", "GET")
+        heads = get_method_count(stats, "/cache-control/max-age-low", "HEAD")
+        assert gets == 2, f"Expected 2 GETs (initial + conditional revalidation), got {gets}"
+        assert heads == 1, f"Expected 1 HEAD (initial miss), got {heads}"
         assert_cached_response(r2)
 
     def test_cached_redirect_preserves_status_and_location(
@@ -1057,3 +1074,331 @@ class TestRangeRequests:
             "A range request may have overwritten the cached full response."
         )
         assert full2.content == expected_bytes(0, size)
+
+
+# ---------------------------------------------------------------------------
+# xs3lerator integration tests
+# ---------------------------------------------------------------------------
+
+def _s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT_URL,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "test"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-west-2"),
+    )
+
+
+def _s3_list_objects(prefix: str = "") -> list[str]:
+    s3 = _s3_client()
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    return keys
+
+
+@pytest.mark.integration
+class TestXs3leratorIntegration:
+    """Tests that verify the xs3lerator sidecar integration works end-to-end."""
+
+    def test_xs3lerator_healthcheck(self):
+        resp = requests.get(f"{XS3LERATOR_URL}/healthz", timeout=5)
+        assert resp.status_code == 200
+        assert resp.text == "ok"
+
+    def test_cache_miss_stores_in_s3(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """A cache miss GET through passsage should trigger xs3lerator to store the
+        object in S3 via content-addressed chunks."""
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=miss")
+        resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert resp.ok
+        time.sleep(SYNC_SETTLE_SECONDS + 1)
+        keys = _s3_list_objects()
+        assert len(keys) > 0, "xs3lerator should have stored at least one object in S3"
+
+    def test_s3_and_es_storage_after_cache_miss(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """After a cache miss, S3 should contain data/ chunks; metadata and manifests are in ES."""
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=ns")
+        resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert resp.ok
+        time.sleep(SYNC_SETTLE_SECONDS + 2)
+
+        data_keys = _s3_list_objects("data/")
+        assert len(data_keys) > 0, "Expected data chunks under data/"
+
+    def test_cache_hit_served_from_s3(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """After a cache miss populates S3, subsequent requests should be served from
+        S3 cache without hitting the upstream test server."""
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=hit")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert r1.ok
+        time.sleep(SYNC_SETTLE_SECONDS + 1)
+
+        r2 = get_cached_without_upstream(
+            proxy_session,
+            url,
+            test_server,
+            "/policy/Standard",
+            headers=policy_headers("Standard"),
+        )
+        assert r2.ok
+        assert_cached_response(r2)
+
+    def test_xs3lerator_headers_stripped_from_client_response(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """xs3lerator response headers (X-Xs3lerator-*) must not leak to the client."""
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=strip")
+        resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert resp.ok
+        for header in resp.headers:
+            assert not header.lower().startswith("x-xs3lerator-"), (
+                f"xs3lerator header {header!r} leaked to client response"
+            )
+
+    def test_xs3lerator_direct_cache_skip(self, test_server, cache_bust_random):
+        """Direct request to xs3lerator with Cache-Skip=true should fetch from upstream
+        and return the correct body."""
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=direct")
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Key": "test-direct-key",
+                "X-Xs3lerator-Cache-Skip": "true",
+            },
+            timeout=30,
+        )
+        assert resp.ok
+        assert "policy Standard" in resp.text
+
+    def test_xs3lerator_post_without_link_header_returns_500(self):
+        """POST without X-Xs3lerator-Link-Manifest-Source header returns 500."""
+        resp = requests.post(f"{XS3LERATOR_URL}/some-key", timeout=5)
+        assert resp.status_code == 500
+
+    def test_xs3lerator_returns_405_for_put(self):
+        """xs3lerator only supports GET and POST; other methods should return 405."""
+        resp = requests.put(f"{XS3LERATOR_URL}/some-key", timeout=5)
+        assert resp.status_code == 405
+
+    def test_manifest_alias_post(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """POST with X-Xs3lerator-Link-Manifest-Source/Target should create a manifest alias."""
+        test_server.reset()
+        size = 4096
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&xs3=alias")
+        source_key = f"test-alias-source-{cache_bust_random}"
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Key": source_key,
+                "X-Xs3lerator-Cache-Skip": "true",
+            },
+            timeout=30,
+        )
+        assert resp.ok
+        time.sleep(SYNC_SETTLE_SECONDS + 1)
+
+        alias_key = f"test-alias-dest-{cache_bust_random}"
+        post_resp = requests.post(
+            f"{XS3LERATOR_URL}/manifest-alias",
+            headers={
+                "X-Xs3lerator-Link-Manifest-Source": source_key,
+                "X-Xs3lerator-Link-Manifest-Target": alias_key,
+            },
+            timeout=30,
+        )
+        assert post_resp.status_code == 204
+
+        alias_doc_id = alias_key.replace("/", "%2F")
+        es_url = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
+        es_resp = requests.get(
+            f"{es_url}/passsage_meta/_doc/{alias_doc_id}",
+            timeout=10,
+        )
+        assert es_resp.status_code == 200, (
+            f"Manifest alias should exist in Elasticsearch, got {es_resp.status_code}"
+        )
+        doc = es_resp.json()
+        assert doc.get("found") is True
+        assert "manifest_b64" in doc.get("_source", {})
+
+    def test_large_file_through_xs3lerator(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """A larger file (1 MiB) should be correctly fetched and cached through
+        xs3lerator with content integrity preserved."""
+        test_server.reset()
+        size = 1024 * 1024
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&xs3=large")
+        resp = proxy_get(proxy_session, url, timeout=60, stream=True)
+        assert resp.status_code == 200
+        h = hashlib.sha256()
+        received = 0
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            h.update(chunk)
+            received += len(chunk)
+        assert received == size
+        expected_hash = hashlib.sha256(expected_bytes(0, size)).hexdigest()
+        assert h.hexdigest() == expected_hash
+
+    def test_range_request_through_xs3lerator(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """Range requests should work correctly through the passsage+xs3lerator stack."""
+        test_server.reset()
+        size = 64 * 1024
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&xs3=range")
+        full = proxy_get(proxy_session, url, timeout=30)
+        assert full.status_code == 200
+        assert len(full.content) == size
+        time.sleep(SYNC_SETTLE_SECONDS)
+
+        start, end = 1000, 2000
+        resp = proxy_get(
+            proxy_session, url,
+            headers={"Range": f"bytes={start}-{end}"},
+            timeout=30,
+        )
+        assert resp.status_code in (200, 206)
+        expected = expected_bytes(start, end - start + 1)
+        actual = resp.content[:end - start + 1]
+        assert actual == expected
+
+    def test_cache_miss_then_hit_content_identical(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """Content from a cache miss (upstream) and cache hit (S3) must be byte-identical."""
+        test_server.reset()
+        size = 8192
+        url = test_server.url(f"/range-data/{size}?r={cache_bust_random}&xs3=identical")
+        r1 = proxy_get(proxy_session, url, timeout=30)
+        assert r1.status_code == 200
+        body_miss = r1.content
+        time.sleep(SYNC_SETTLE_SECONDS + 1)
+
+        r2 = get_cached_without_upstream(
+            proxy_session,
+            url,
+            test_server,
+            f"/range-data/{size}",
+        )
+        body_hit = r2.content
+        assert r2.ok
+        assert body_miss == body_hit, "Cache hit body differs from cache miss body"
+
+
+@pytest.mark.integration
+class TestXs3leratorTimeouts:
+    """Tests that verify upstream timeout contract headers between passsage and xs3lerator."""
+
+    def test_xs3lerator_connect_timeout_header_forwarded(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """When a policy rule specifies connect_timeout, the header reaches xs3lerator
+        and the request succeeds normally (the timeout is just an upper bound)."""
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=ct")
+        resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert resp.ok
+
+    def test_xs3lerator_read_timeout_allows_normal_response(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """A read timeout longer than the upstream response time does not interfere."""
+        url = test_server.url(f"/delay/1?random={cache_bust_random}&xs3=rt")
+        resp = proxy_get(proxy_session, url, timeout=30)
+        assert resp.ok
+
+    def test_xs3lerator_direct_timeout_headers_accepted(
+        self, test_server, cache_bust_random
+    ):
+        """xs3lerator accepts and honors X-Xs3lerator-Connect-Timeout and
+        X-Xs3lerator-Read-Timeout headers on direct requests."""
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=direct_to")
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Key": f"test-timeout-{cache_bust_random}",
+                "X-Xs3lerator-Cache-Skip": "true",
+                "X-Xs3lerator-Connect-Timeout": "30",
+                "X-Xs3lerator-Read-Timeout": "60",
+            },
+            timeout=30,
+        )
+        assert resp.ok
+
+    def test_xs3lerator_read_timeout_triggers_on_slow_upstream(
+        self, test_server, cache_bust_random
+    ):
+        """A very short read timeout should cause xs3lerator to abort a slow upstream."""
+        url = test_server.url(f"/slow-read/10/1024?random={cache_bust_random}")
+        t0 = time.perf_counter()
+        try:
+            resp = requests.get(
+                f"{XS3LERATOR_URL}/{url}",
+                headers={
+                    "X-Xs3lerator-Cache-Skip": "true",
+                    "X-Xs3lerator-Read-Timeout": "2",
+                },
+                timeout=15,
+            )
+            elapsed = time.perf_counter() - t0
+            assert resp.status_code == 502 or elapsed < 8, (
+                f"Expected 502 or quick failure with 2s read timeout on 10s-delayed upstream, "
+                f"got status={resp.status_code} in {elapsed:.1f}s"
+            )
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError):
+            elapsed = time.perf_counter() - t0
+            assert elapsed < 8, (
+                f"Connection aborted (expected with read timeout) but took {elapsed:.1f}s"
+            )
+
+    def test_xs3lerator_connect_timeout_on_unreachable_host(
+        self, cache_bust_random
+    ):
+        """A short connect timeout should fail quickly against an unreachable host."""
+        url = "http://192.0.2.1/unreachable"
+        t0 = time.perf_counter()
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Skip": "true",
+                "X-Xs3lerator-Connect-Timeout": "2",
+            },
+            timeout=15,
+        )
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 502
+        assert elapsed < 10, (
+            f"Expected connect timeout within ~2s, took {elapsed:.1f}s"
+        )
+
+    def test_xs3lerator_zero_read_timeout_disables_timeout(
+        self, test_server, cache_bust_random
+    ):
+        """Read-Timeout: 0 should disable the read timeout entirely."""
+        url = test_server.url(f"/slow-read/2/512?random={cache_bust_random}")
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Skip": "true",
+                "X-Xs3lerator-Read-Timeout": "0",
+            },
+            timeout=30,
+        )
+        assert resp.ok
+        assert len(resp.content) == 512

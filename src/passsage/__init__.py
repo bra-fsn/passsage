@@ -9,7 +9,7 @@ requires mitmproxy's hooks to be registered first, which only happens when
 mitmproxy loads the proxy script.
 """
 
-__version__ = "0.2.5"
+__version__ = "0.3.1"
 
 from passsage.policy import (
     AlwaysUpstream,
@@ -24,9 +24,11 @@ from passsage.policy import (
     PolicyResolver,
     PrefixRule,
     RegexRule,
+    ResolvedPolicy,
     StaleIfError,
     Standard,
     SuffixRule,
+    TimeoutConfig,
     default_rules,
     get_default_resolver,
     policy_from_name,
@@ -52,6 +54,8 @@ __all__ = [
     "AlwaysUpstream",
     "Context",
     "PolicyResolver",
+    "ResolvedPolicy",
+    "TimeoutConfig",
     "PrefixRule",
     "SuffixRule",
     "HostPrefixRule",
