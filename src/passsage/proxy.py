@@ -46,8 +46,10 @@ from passsage.policy import (
     NoCache,
     NoRefresh,
     PolicyResolver,
+    ResolvedPolicy,
     StaleIfError,
     Standard,
+    TimeoutConfig,
     get_default_resolver,
     policy_from_name,
     set_default_resolver,
@@ -465,6 +467,7 @@ def get_policy(flow):
             policy = POLICY_BY_NAME.get(policy_name.strip().lower())
             if policy:
                 LOG.debug("Policy header override=%s", policy_name)
+                flow._timeout_config = None
                 return policy
             LOG.warning("Unknown policy header override=%s", policy_name)
     request_ctx = PolicyContext(
@@ -475,7 +478,9 @@ def get_policy(flow):
     resolver = get_default_resolver()
     if hasattr(ctx, "options") and hasattr(ctx.options, "default_policy"):
         resolver.set_default_policy(policy_from_name(ctx.options.default_policy))
-    return resolver.resolve(request_ctx)
+    resolved = resolver.resolve(request_ctx)
+    flow._timeout_config = resolved.timeouts
+    return resolved.policy
 
 
 def http_2xx(r):
@@ -1192,6 +1197,13 @@ def _rewrite_to_xs3lerator(flow, cache_skip: bool):
         manifest_b64 = flow._cache_head.meta.get("manifest_b64")
         if manifest_b64 and len(manifest_b64) <= 65536:
             flow.request.headers["X-Xs3lerator-Manifest"] = manifest_b64
+
+    tc = getattr(flow, "_timeout_config", None)
+    if tc is not None:
+        if tc.connect_timeout is not None:
+            flow.request.headers["X-Xs3lerator-Connect-Timeout"] = str(tc.connect_timeout)
+        if tc.read_timeout is not None:
+            flow.request.headers["X-Xs3lerator-Read-Timeout"] = str(tc.read_timeout)
 
     flow._xs3lerator_rewrite = True
     flow._object_store_rewrite = True

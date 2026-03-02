@@ -17,6 +17,18 @@ from urllib.parse import urlparse
 from passsage.default_policies import default_rules
 
 
+@dataclass(frozen=True)
+class TimeoutConfig:
+    """Per-request upstream timeout overrides sent to xs3lerator.
+
+    Values are in seconds. None means "use xs3lerator's server default".
+    0 means "no timeout" (disable the timeout).
+    """
+
+    connect_timeout: Optional[float] = None
+    read_timeout: Optional[float] = None
+
+
 class Policy:
     pass
 
@@ -50,6 +62,14 @@ class AlwaysUpstream(Policy):
 
 
 @dataclass(frozen=True)
+class ResolvedPolicy:
+    """Policy plus optional timeout overrides resolved for a request."""
+
+    policy: type[Policy]
+    timeouts: Optional[TimeoutConfig] = None
+
+
+@dataclass(frozen=True)
 class Context:
     """Request context passed to rules and dynamic callables."""
 
@@ -78,11 +98,18 @@ class Rule(Protocol):
 class PrefixRule:
     """Fast: match URL prefix (case-insensitive). Longest prefix wins if multiple match."""
 
-    __slots__ = ("prefix", "policy", "_prefix_lower")
+    __slots__ = ("prefix", "policy", "timeouts", "_prefix_lower")
 
-    def __init__(self, prefix: str, policy: type[Policy]) -> None:
+    def __init__(
+        self,
+        prefix: str,
+        policy: type[Policy],
+        *,
+        timeouts: Optional[TimeoutConfig] = None,
+    ) -> None:
         self.prefix = prefix
         self.policy = policy
+        self.timeouts = timeouts
         self._prefix_lower = prefix.lower()
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -94,11 +121,18 @@ class PrefixRule:
 class SuffixRule:
     """Fast: match URL suffix (e.g. .deb)."""
 
-    __slots__ = ("suffix", "policy", "_suffix_lower")
+    __slots__ = ("suffix", "policy", "timeouts", "_suffix_lower")
 
-    def __init__(self, suffix: str, policy: type[Policy]) -> None:
+    def __init__(
+        self,
+        suffix: str,
+        policy: type[Policy],
+        *,
+        timeouts: Optional[TimeoutConfig] = None,
+    ) -> None:
         self.suffix = suffix
         self.policy = policy
+        self.timeouts = timeouts
         self._suffix_lower = suffix.lower()
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -110,11 +144,18 @@ class SuffixRule:
 class HostPrefixRule:
     """Fast: match host prefix (e.g. 169.254.169. for link-local)."""
 
-    __slots__ = ("prefix", "policy", "_prefix_lower")
+    __slots__ = ("prefix", "policy", "timeouts", "_prefix_lower")
 
-    def __init__(self, prefix: str, policy: type[Policy]) -> None:
+    def __init__(
+        self,
+        prefix: str,
+        policy: type[Policy],
+        *,
+        timeouts: Optional[TimeoutConfig] = None,
+    ) -> None:
         self.prefix = prefix
         self.policy = policy
+        self.timeouts = timeouts
         self._prefix_lower = prefix.lower()
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -126,7 +167,7 @@ class HostPrefixRule:
 class HostContainsRule:
     """Fast: match substring in host (e.g. amazonaws.com, then exclude codeartifact)."""
 
-    __slots__ = ("contains", "policy", "exclude", "_contains_lower", "_exclude_lower")
+    __slots__ = ("contains", "policy", "timeouts", "exclude", "_contains_lower", "_exclude_lower")
 
     def __init__(
         self,
@@ -134,9 +175,11 @@ class HostContainsRule:
         policy: type[Policy],
         *,
         exclude: Optional[str] = None,
+        timeouts: Optional[TimeoutConfig] = None,
     ) -> None:
         self.contains = contains
         self.policy = policy
+        self.timeouts = timeouts
         self.exclude = exclude
         self._contains_lower = contains.lower()
         self._exclude_lower = exclude.lower() if exclude else None
@@ -155,11 +198,18 @@ class HostContainsRule:
 class PathContainsRule:
     """Fast: match substring in URL path (e.g. /mitm.it/)."""
 
-    __slots__ = ("contains", "policy", "_contains_lower")
+    __slots__ = ("contains", "policy", "timeouts", "_contains_lower")
 
-    def __init__(self, contains: str, policy: type[Policy]) -> None:
+    def __init__(
+        self,
+        contains: str,
+        policy: type[Policy],
+        *,
+        timeouts: Optional[TimeoutConfig] = None,
+    ) -> None:
         self.contains = contains
         self.policy = policy
+        self.timeouts = timeouts
         self._contains_lower = contains.lower()
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -171,11 +221,18 @@ class PathContainsRule:
 class RegexRule:
     """Complex: match URL with a compiled regex."""
 
-    __slots__ = ("pattern", "policy", "_compiled")
+    __slots__ = ("pattern", "policy", "timeouts", "_compiled")
 
-    def __init__(self, pattern: str | re.Pattern[str], policy: type[Policy]) -> None:
+    def __init__(
+        self,
+        pattern: str | re.Pattern[str],
+        policy: type[Policy],
+        *,
+        timeouts: Optional[TimeoutConfig] = None,
+    ) -> None:
         self.pattern = pattern
         self.policy = policy
+        self.timeouts = timeouts
         self._compiled = re.compile(pattern, re.IGNORECASE) if isinstance(pattern, str) else pattern
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -187,10 +244,16 @@ class RegexRule:
 class CallableRule:
     """Dynamic: user callable(ctx) -> Policy | None."""
 
-    __slots__ = ("func",)
+    __slots__ = ("func", "timeouts")
 
-    def __init__(self, func: Callable[[Context], Optional[Policy]]) -> None:
+    def __init__(
+        self,
+        func: Callable[[Context], Optional[Policy]],
+        *,
+        timeouts: Optional[TimeoutConfig] = None,
+    ) -> None:
         self.func = func
+        self.timeouts = timeouts
 
     def match(self, ctx: Context) -> Optional[Policy]:
         return self.func(ctx)
@@ -214,18 +277,18 @@ class PolicyResolver:
         self._prefix_rules = sorted(prefix_rules, key=lambda r: len(r.prefix), reverse=True)
         self._default_policy = default_policy
 
-    def resolve(self, ctx: Context) -> Policy:
+    def resolve(self, ctx: Context) -> ResolvedPolicy:
         for rule in self._prefix_rules:
             p = rule.match(ctx)
             if p is not None:
-                return p
+                return ResolvedPolicy(policy=p, timeouts=getattr(rule, "timeouts", None))
         for rule in self._rules:
             if isinstance(rule, PrefixRule):
                 continue
             p = rule.match(ctx)
             if p is not None:
-                return p
-        return self._default_policy
+                return ResolvedPolicy(policy=p, timeouts=getattr(rule, "timeouts", None))
+        return ResolvedPolicy(policy=self._default_policy)
 
     def add_rule(self, rule: Rule, index: int = 0) -> None:
         """Insert a rule (default at front) for programmatic overrides."""
@@ -257,7 +320,7 @@ def set_default_resolver(resolver: PolicyResolver) -> None:
 
 def resolve_policy(
     url: str, method: str = "GET", headers: Optional[Sequence[tuple[str, str]]] = None
-) -> Policy:
+) -> ResolvedPolicy:
     """Resolve policy for a request. Uses default resolver unless overridden."""
     ctx = Context(url=url, method=method, headers=headers)
     return get_default_resolver().resolve(ctx)

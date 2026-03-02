@@ -1300,3 +1300,99 @@ class TestXs3leratorIntegration:
         body_hit = r2.content
         assert r2.ok
         assert body_miss == body_hit, "Cache hit body differs from cache miss body"
+
+
+@pytest.mark.integration
+class TestXs3leratorTimeouts:
+    """Tests that verify upstream timeout contract headers between passsage and xs3lerator."""
+
+    def test_xs3lerator_connect_timeout_header_forwarded(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """When a policy rule specifies connect_timeout, the header reaches xs3lerator
+        and the request succeeds normally (the timeout is just an upper bound)."""
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=ct")
+        resp = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert resp.ok
+
+    def test_xs3lerator_read_timeout_allows_normal_response(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """A read timeout longer than the upstream response time does not interfere."""
+        url = test_server.url(f"/delay/1?random={cache_bust_random}&xs3=rt")
+        resp = proxy_get(proxy_session, url, timeout=30)
+        assert resp.ok
+
+    def test_xs3lerator_direct_timeout_headers_accepted(
+        self, test_server, cache_bust_random
+    ):
+        """xs3lerator accepts and honors X-Xs3lerator-Connect-Timeout and
+        X-Xs3lerator-Read-Timeout headers on direct requests."""
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&xs3=direct_to")
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Key": f"test-timeout-{cache_bust_random}",
+                "X-Xs3lerator-Cache-Skip": "true",
+                "X-Xs3lerator-Connect-Timeout": "30",
+                "X-Xs3lerator-Read-Timeout": "60",
+            },
+            timeout=30,
+        )
+        assert resp.ok
+
+    def test_xs3lerator_read_timeout_triggers_on_slow_upstream(
+        self, test_server, cache_bust_random
+    ):
+        """A very short read timeout should cause xs3lerator to abort a slow upstream."""
+        url = test_server.url(f"/slow-read/10/1024?random={cache_bust_random}")
+        t0 = time.perf_counter()
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Skip": "true",
+                "X-Xs3lerator-Read-Timeout": "2",
+            },
+            timeout=15,
+        )
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 502 or elapsed < 8, (
+            f"Expected 502 or quick failure with 2s read timeout on 10s-delayed upstream, "
+            f"got status={resp.status_code} in {elapsed:.1f}s"
+        )
+
+    def test_xs3lerator_connect_timeout_on_unreachable_host(
+        self, cache_bust_random
+    ):
+        """A short connect timeout should fail quickly against an unreachable host."""
+        url = "http://192.0.2.1/unreachable"
+        t0 = time.perf_counter()
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Skip": "true",
+                "X-Xs3lerator-Connect-Timeout": "2",
+            },
+            timeout=15,
+        )
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 502
+        assert elapsed < 10, (
+            f"Expected connect timeout within ~2s, took {elapsed:.1f}s"
+        )
+
+    def test_xs3lerator_zero_read_timeout_disables_timeout(
+        self, test_server, cache_bust_random
+    ):
+        """Read-Timeout: 0 should disable the read timeout entirely."""
+        url = test_server.url(f"/slow-read/2/512?random={cache_bust_random}")
+        resp = requests.get(
+            f"{XS3LERATOR_URL}/{url}",
+            headers={
+                "X-Xs3lerator-Cache-Skip": "true",
+                "X-Xs3lerator-Read-Timeout": "0",
+            },
+            timeout=30,
+        )
+        assert resp.ok
+        assert len(resp.content) == 512
