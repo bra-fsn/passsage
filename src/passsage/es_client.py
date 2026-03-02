@@ -45,6 +45,28 @@ def es_get_doc(index: str, doc_id: str) -> dict | None:
         raise
 
 
+def es_mget_docs(index: str, doc_ids: list[str]) -> dict[str, dict | None]:
+    """Fetch multiple documents in a single _mget round-trip.
+
+    Returns a dict mapping each doc_id to its _source (or None if not found).
+    """
+    if not doc_ids:
+        return {}
+    es = _get_es_client()
+    resp = es.mget(index=index, ids=doc_ids)
+    result: dict[str, dict | None] = {}
+    for doc in resp.get("docs", []):
+        did = doc.get("_id")
+        if doc.get("found"):
+            result[did] = doc.get("_source")
+        else:
+            result[did] = None
+    for did in doc_ids:
+        if did not in result:
+            result[did] = None
+    return result
+
+
 def es_index_doc(index: str, doc_id: str, body: dict) -> None:
     """Upsert a document via POST _update with doc_as_upsert.
 
@@ -93,16 +115,17 @@ def _is_not_found(exc: Exception) -> bool:
 
 
 class LastAccessBatcher:
-    """Batched, non-blocking last_access timestamp updates.
+    """Batched, non-blocking last_access and stored_at timestamp updates.
 
-    Proxy request threads call touch() which is a fast dict write under a lock.
-    A background daemon thread periodically flushes accumulated timestamps via
-    the ES bulk API using a lock+swap ("double buffer") pattern.
+    Proxy request threads call touch() / refresh_stored_at() which are fast
+    dict writes under a lock.  A background daemon thread periodically flushes
+    accumulated timestamps via the ES bulk API using a lock+swap pattern.
     """
 
     def __init__(self, es_index: str, flush_interval: float = 30.0):
         self._lock = threading.Lock()
         self._pending: dict[str, str] = {}
+        self._pending_stored_at: dict[str, str] = {}
         self._index = es_index
         self._flush_interval = flush_interval
         self._stop = threading.Event()
@@ -115,6 +138,12 @@ class LastAccessBatcher:
         with self._lock:
             self._pending[doc_id] = now
 
+    def refresh_stored_at(self, doc_id: str) -> None:
+        """Record a stored_at refresh (after 304 revalidation). Batched like touch()."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._pending_stored_at[doc_id] = now
+
     def _run(self) -> None:
         while not self._stop.wait(self._flush_interval):
             self._flush()
@@ -122,12 +151,20 @@ class LastAccessBatcher:
     def _flush(self) -> None:
         with self._lock:
             batch, self._pending = self._pending, {}
-        if not batch:
+            stored_batch, self._pending_stored_at = self._pending_stored_at, {}
+        if not batch and not stored_batch:
             return
         actions: list[dict] = []
         for doc_id, ts in batch.items():
             actions.append({"update": {"_index": self._index, "_id": doc_id}})
-            actions.append({"doc": {"last_access": ts}})
+            stored_ts = stored_batch.pop(doc_id, None)
+            if stored_ts:
+                actions.append({"doc": {"last_access": ts, "stored_at": stored_ts}})
+            else:
+                actions.append({"doc": {"last_access": ts}})
+        for doc_id, ts in stored_batch.items():
+            actions.append({"update": {"_index": self._index, "_id": doc_id}})
+            actions.append({"doc": {"stored_at": ts}})
         try:
             es = _get_es_client()
             es.bulk(operations=actions, refresh=False)

@@ -65,6 +65,7 @@ from passsage.cache_utils import (
 from passsage.es_client import (
     configure as _es_configure,
     es_get_doc,
+    es_mget_docs,
     es_index_doc,
     es_create_index,
     LastAccessBatcher,
@@ -1592,14 +1593,29 @@ class Proxy:
             depth = _s3_hash_prefix_depth()
             vary_index_key = es_vary_index_id(normalized_url)
             flow._vary_index_key = vary_index_key
-            LOG.debug("Cache lookup vary index key=%s", vary_index_key)
-            vary_index_head = get_vary_index(vary_index_key)
+
+            # Speculatively compute cache key using proactive vary so we can
+            # batch both ES lookups into a single _mget round-trip.
+            speculative_vk = compute_proactive_vary_key(flow.request.headers)
+            speculative_cache_key = es_doc_id(normalized_url, speculative_vk)
+
+            LOG.debug("Cache lookup vary index key=%s speculative_cache_key=%s", vary_index_key, speculative_cache_key)
+            mget_results = es_mget_docs(_es_meta_index(), [vary_index_key, speculative_cache_key])
+
+            vary_data = mget_results.get(vary_index_key)
+            vary_index_head = (
+                CacheMeta(200, vary_data, source="elasticsearch")
+                if vary_data is not None
+                else CacheMeta(404, {}, source="elasticsearch")
+            )
             LOG.debug(
                 "Vary index status=%s source=%s key=%s",
                 vary_index_head.status_code,
                 vary_index_head.source,
                 vary_index_key,
             )
+
+            need_extra_get = False
             if http_2xx(vary_index_head) and (vary_hdr := vary_index_head.meta.get("vary")):
                 flow._cache_vary = vary_hdr
                 if "*" not in vary_hdr:
@@ -1612,20 +1628,34 @@ class Proxy:
                             vary_key,
                             flow._cache_key,
                         )
+                        if flow._cache_key != speculative_cache_key:
+                            need_extra_get = True
+
             if flow._cache_key is None and flow._cache_vary != "*":
-                proactive_vk = compute_proactive_vary_key(flow.request.headers)
-                flow._cache_key = es_doc_id(normalized_url, proactive_vk)
-                flow._proactive_vary_key = proactive_vk
-                if proactive_vk:
+                flow._cache_key = speculative_cache_key
+                flow._proactive_vary_key = speculative_vk
+                if speculative_vk:
                     LOG.debug(
                         "Cache lookup proactive vary key=%s cache_key=%s",
-                        proactive_vk,
+                        speculative_vk,
                         flow._cache_key,
                     )
                 else:
                     LOG.debug("Cache lookup default key=%s", flow._cache_key)
+
             if flow._cache_key:
-                flow._cache_head = get_cache_metadata(flow._cache_key)
+                if flow._cache_key == speculative_cache_key and not need_extra_get:
+                    # Already fetched in the _mget batch
+                    spec_data = mget_results.get(speculative_cache_key)
+                    if spec_data is not None:
+                        flow._cache_head = CacheMeta(200, spec_data, source="elasticsearch")
+                        batcher = getattr(ctx, "_last_access_batcher", None)
+                        if batcher:
+                            batcher.touch(flow._cache_key)
+                    else:
+                        flow._cache_head = CacheMeta(404, {}, source="elasticsearch")
+                else:
+                    flow._cache_head = get_cache_metadata(flow._cache_key)
                 flow._metadata_source = flow._cache_head.source
                 LOG.debug(
                     "Cache HEAD status=%s source=%s key=%s",
@@ -1919,11 +1949,15 @@ class Proxy:
                 flow._serve_reason = "cache_hit_revalidated"
                 _rewrite_to_object_store(flow)
                 if flow._cache_key:
-                    ctx._executor.submit(
-                        refresh_cache_metadata,
-                        flow._cache_key,
-                        flow._cache_head.meta,
-                    )
+                    batcher = getattr(ctx, "_last_access_batcher", None)
+                    if batcher:
+                        batcher.refresh_stored_at(flow._cache_key)
+                    else:
+                        ctx._executor.submit(
+                            refresh_cache_metadata,
+                            flow._cache_key,
+                            flow._cache_head.meta,
+                        )
                 return
             flow._serve_reason = "cache_revalidated_content_changed"
 
@@ -1977,11 +2011,15 @@ class Proxy:
                 else:
                     flow._serve_reason = "stale_if_error_xs3lerator"
                 if flow._cache_key:
-                    ctx._executor.submit(
-                        refresh_cache_metadata,
-                        flow._cache_key,
-                        flow._cache_head.meta,
-                    )
+                    batcher = getattr(ctx, "_last_access_batcher", None)
+                    if batcher:
+                        batcher.refresh_stored_at(flow._cache_key)
+                    else:
+                        ctx._executor.submit(
+                            refresh_cache_metadata,
+                            flow._cache_key,
+                            flow._cache_head.meta,
+                        )
             elif xs3_cache_hit == "false":
                 flow._save_response = True
             # Strip all X-Xs3lerator-* response headers before forwarding to client
