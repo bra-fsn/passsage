@@ -701,7 +701,7 @@ def request_requires_revalidation(request_headers: dict[str, str], freshness: Ca
     if "no-cache" in cc:
         return True
     if (req_max_age := parse_cache_control_seconds(cc, "max-age")) is not None:
-        return freshness.age_seconds > req_max_age
+        return freshness.age_seconds >= req_max_age
     return False
 
 
