@@ -1347,19 +1347,25 @@ class TestXs3leratorTimeouts:
         """A very short read timeout should cause xs3lerator to abort a slow upstream."""
         url = test_server.url(f"/slow-read/10/1024?random={cache_bust_random}")
         t0 = time.perf_counter()
-        resp = requests.get(
-            f"{XS3LERATOR_URL}/{url}",
-            headers={
-                "X-Xs3lerator-Cache-Skip": "true",
-                "X-Xs3lerator-Read-Timeout": "2",
-            },
-            timeout=15,
-        )
-        elapsed = time.perf_counter() - t0
-        assert resp.status_code == 502 or elapsed < 8, (
-            f"Expected 502 or quick failure with 2s read timeout on 10s-delayed upstream, "
-            f"got status={resp.status_code} in {elapsed:.1f}s"
-        )
+        try:
+            resp = requests.get(
+                f"{XS3LERATOR_URL}/{url}",
+                headers={
+                    "X-Xs3lerator-Cache-Skip": "true",
+                    "X-Xs3lerator-Read-Timeout": "2",
+                },
+                timeout=15,
+            )
+            elapsed = time.perf_counter() - t0
+            assert resp.status_code == 502 or elapsed < 8, (
+                f"Expected 502 or quick failure with 2s read timeout on 10s-delayed upstream, "
+                f"got status={resp.status_code} in {elapsed:.1f}s"
+            )
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError):
+            elapsed = time.perf_counter() - t0
+            assert elapsed < 8, (
+                f"Connection aborted (expected with read timeout) but took {elapsed:.1f}s"
+            )
 
     def test_xs3lerator_connect_timeout_on_unreachable_host(
         self, cache_bust_random
