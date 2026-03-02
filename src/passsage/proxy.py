@@ -1207,6 +1207,35 @@ def _rewrite_to_xs3lerator_miss(flow):
     _rewrite_to_xs3lerator(flow, cache_skip=True)
 
 
+def _rewrite_to_xs3lerator_revalidate(flow):
+    """Rewrite a stale-cache GET to do conditional revalidation via xs3lerator.
+
+    Sends the cached ETag/Last-Modified as contract headers so xs3lerator
+    can issue a conditional GET to upstream.  On 304, xs3lerator serves from
+    its S3 cache.  On upstream error (when stale-if-error is eligible),
+    xs3lerator serves cached content instead of passing the error through.
+    """
+    xs3lerator_url = getattr(ctx.options, "xs3lerator_url", "")
+    if not xs3lerator_url:
+        return
+    _rewrite_to_xs3lerator(flow, cache_skip=False)
+
+    cm = flow._cache_head.meta
+    etag = cm.get("headers", {}).get("etag")
+    if etag:
+        flow.request.headers["X-Xs3lerator-If-None-Match"] = etag
+    last_modified = cm.get("last_modified")
+    if last_modified:
+        flow.request.headers["X-Xs3lerator-If-Modified-Since"] = last_modified
+
+    if flow._policy == StaleIfError or getattr(flow, "_allow_stale_if_error", False):
+        flow.request.headers["X-Xs3lerator-Stale-If-Error"] = "true"
+
+    flow._cached = False
+    flow._save_response = False
+    flow._conditional_revalidation = True
+
+
 def _rewrite_head_to_xs3lerator(flow):
     """Rewrite a stale/miss HEAD to route through xs3lerator for connection pooling."""
     xs3lerator_url = getattr(ctx.options, "xs3lerator_url", "")
@@ -1730,6 +1759,19 @@ class Proxy:
                 LOG.debug("Cache hit: stale-while-revalidate -> rewrite to object store")
                 _rewrite_to_object_store(flow)
                 return
+            if (xs3lerator_enabled
+                    and flow.request.method == "GET"
+                    and policy in (Standard, StaleIfError)):
+                cm = flow._cache_head.meta
+                has_validators = (
+                    cm.get("headers", {}).get("etag")
+                    or cm.get("last_modified")
+                )
+                if has_validators:
+                    flow._serve_reason = "conditional_revalidation_xs3lerator"
+                    LOG.debug("Cache hit: stale, conditional revalidation via xs3lerator")
+                    _rewrite_to_xs3lerator_revalidate(flow)
+                    return
         else:
             if (flow.request.method == "GET"
                     and flow.request.headers.get("if-modified-since")):
@@ -1912,9 +1954,23 @@ class Proxy:
             # Process xs3lerator response headers
             xs3_cache_hit = flow.response.headers.get("x-xs3lerator-cache-hit")
             xs3_full_size = flow.response.headers.get("x-xs3lerator-full-size")
+            xs3_revalidated = flow.response.headers.get("x-xs3lerator-revalidated")
             if xs3_full_size:
                 flow._xs3lerator_full_size = int(xs3_full_size)
-            if xs3_cache_hit == "false":
+            if xs3_revalidated in ("true", "stale-error"):
+                flow._cached = True
+                flow._save_response = False
+                if xs3_revalidated == "true":
+                    flow._serve_reason = "cache_hit_revalidated"
+                else:
+                    flow._serve_reason = "stale_if_error_xs3lerator"
+                if flow._cache_key:
+                    ctx._executor.submit(
+                        refresh_cache_metadata,
+                        flow._cache_key,
+                        flow._cache_head.meta,
+                    )
+            elif xs3_cache_hit == "false":
                 flow._save_response = True
             # Strip all X-Xs3lerator-* response headers before forwarding to client
             to_remove = [k for k in flow.response.headers if k.lower().startswith("x-xs3lerator-")]
