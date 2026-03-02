@@ -1938,7 +1938,7 @@ class Proxy:
             upstream_etag = _normalize_etag(flow._upstream_head.headers.get("etag"))
             cached_etag = _normalize_etag(flow._cache_head.meta.get("headers", {}).get("etag"))
             upstream_lastmod = flow._upstream_head.headers.get("last-modified")
-            cached_lastmod = flow._cache_head.meta.get("last_modified")
+            cached_lastmod = flow._cache_head.meta.get("headers", {}).get("last-modified")
             if upstream_etag and cached_etag:
                 content_unchanged = upstream_etag == cached_etag
             elif upstream_lastmod or cached_lastmod:
