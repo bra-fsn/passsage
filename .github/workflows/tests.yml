@@ -11,6 +11,9 @@ on:
 jobs:
   integration:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -20,8 +23,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build passsage image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: passsage_passsage:latest
+          cache-from: type=gha,scope=compose
+          cache-to: type=gha,scope=compose,mode=max
+          platforms: linux/amd64
+
+      - name: Build mount-s3 image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          file: docker/Dockerfile.mount-s3
+          load: true
+          tags: passsage_mount-s3:latest
+          cache-from: type=gha,scope=compose-mount-s3
+          cache-to: type=gha,scope=compose-mount-s3,mode=max
+          platforms: linux/amd64
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          github-token: ${{ github.token }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,15 +73,25 @@ jobs:
         env:
           PASSSAGE_ALLOW_POLICY_HEADER: "1"
           PASSSAGE_DEBUG_PROXY: "1"
+          RUST_LOG: "debug"
         run: |
-          docker compose up -d --build --wait
+          mkdir -p .data
+          docker compose up -d --wait
           docker compose ps
+          docker compose logs xs3lerator
 
       - name: Run tests
         env:
           PROXY_URL: http://localhost:8080
+          XS3LERATOR_URL: http://localhost:8888
+          S3_ENDPOINT_URL: http://localhost:4566
+          S3_BUCKET: proxy-cache
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-west-2
           PASSSAGE_TEST_SERVER_BIND_HOST: 0.0.0.0
           PASSSAGE_TEST_SERVER_HOST: host.docker.internal
+          PASSSAGE_SYNC_SETTLE_SECONDS: "2"
         run: |
           pytest -m "not slow"
 

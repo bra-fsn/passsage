@@ -34,7 +34,7 @@ dependencies = [
     "boto3>=1.26",
     "cachetools>=5.0",
     "click>=8.0",
-    "pymemcache>=4.0",
+    "elasticsearch9",
     "flask>=2.0",
     "mitmproxy>=12,<13",
     "pyarrow",
