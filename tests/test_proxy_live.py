@@ -28,6 +28,22 @@ TEST_SERVER_PUBLIC_HOST = os.environ.get("PASSSAGE_TEST_SERVER_HOST")
 SYNC_SETTLE_SECONDS = float(os.environ.get("PASSSAGE_SYNC_SETTLE_SECONDS", "1.0"))
 POLICY_HEADER = "X-Passsage-Policy"
 
+FDB_CLUSTER_FILE = os.environ.get("FDB_CLUSTER_FILE", None)
+MANIFEST_PREFIX = b'\x03'
+
+
+def _fdb_get_manifest(cache_key: str) -> bytes | None:
+    """Read manifest from FDB using passsage's fdb_client module."""
+    from passsage.fdb_client import configure, _get_db, _split_read, PREFIX_MANIFEST, _make_key
+    try:
+        _get_db()
+    except RuntimeError:
+        configure(FDB_CLUSTER_FILE)
+    db = _get_db()
+    tr = db.create_transaction()
+    key = _make_key(PREFIX_MANIFEST, cache_key)
+    return _split_read(tr, key)
+
 CONCURRENT_DELAY = 5
 # Each request includes upstream HEAD + GET. If HEAD is delayed too, a single request
 # takes ~2*CONCURRENT_DELAY. We expect concurrency, so each request should finish
@@ -1224,18 +1240,9 @@ class TestXs3leratorIntegration:
         )
         assert post_resp.status_code == 204
 
-        alias_doc_id = alias_key.replace("/", "%2F")
-        es_url = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
-        es_resp = requests.get(
-            f"{es_url}/passsage_meta/_doc/{alias_doc_id}",
-            timeout=10,
-        )
-        assert es_resp.status_code == 200, (
-            f"Manifest alias should exist in Elasticsearch, got {es_resp.status_code}"
-        )
-        doc = es_resp.json()
-        assert doc.get("found") is True
-        assert "manifest_b64" in doc.get("_source", {})
+        data = _fdb_get_manifest(alias_key)
+        assert data is not None, "Manifest alias not found in FoundationDB"
+        assert data[:4] == b"XS3M", f"Expected XS3M magic, got {data[:4]!r}"
 
     def test_large_file_through_xs3lerator(
         self, proxy_session, test_server, cache_bust_random

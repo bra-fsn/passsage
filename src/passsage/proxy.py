@@ -59,15 +59,17 @@ from passsage.cache_utils import (
     hashed_s3_key as _hashed_s3_key,
     get_cache_key,
     get_vary_index_key,
-    es_doc_id,
-    es_vary_index_id,
+    meta_doc_id,
+    vary_index_id,
 )
-from passsage.es_client import (
-    configure as _es_configure,
-    es_get_doc,
-    es_mget_docs,
-    es_index_doc,
-    es_create_index,
+from passsage.fdb_client import (
+    configure as _fdb_configure,
+    fdb_get_meta,
+    fdb_get_vary,
+    fdb_mget_docs,
+    fdb_put_meta,
+    fdb_put_vary,
+    fdb_delete_meta,
     LastAccessBatcher,
 )
 from passsage.log_storage import AccessLogWriter, ErrorLogWriter, build_access_log_config, build_error_log_config
@@ -218,7 +220,7 @@ class CacheMeta:
 
     *status_code* is 200 when metadata was found, 404 otherwise.
     *meta* is the parsed JSON metadata dict (empty on miss).
-    *source* tracks where the metadata came from ("elasticsearch").
+    *source* tracks where the metadata came from ("fdb").
     """
     status_code: int
     meta: dict
@@ -734,36 +736,30 @@ def apply_cached_metadata(flow: http.HTTPFlow) -> None:
 
 
 def refresh_cache_metadata(cache_key: str, meta: dict) -> None:
-    """Update stored_at timestamp in the ES doc."""
+    """Update stored_at timestamp in the FDB metadata."""
     meta = dict(meta)
     meta["stored_at"] = datetime.now(timezone.utc).isoformat()
     try:
-        es_meta_index = os.environ.get("PASSSAGE_ELASTICSEARCH_META_INDEX", "passsage_meta")
-        doc_id = cache_key
-        es_index_doc(es_meta_index, doc_id, meta)
+        fdb_put_meta(cache_key, meta)
     except Exception as exc:
         LOG.warning("Cache metadata refresh failed for %s: %s", cache_key, exc)
 
 
-def _es_meta_index() -> str:
-    return os.environ.get("PASSSAGE_ELASTICSEARCH_META_INDEX", "passsage_meta")
-
-
 def get_cache_metadata(cache_key: str) -> CacheMeta:
-    data = es_get_doc(_es_meta_index(), cache_key)
+    data = fdb_get_meta(cache_key)
     if data is None:
-        return CacheMeta(404, {}, source="elasticsearch")
+        return CacheMeta(404, {}, source="fdb")
     batcher = getattr(ctx, "_last_access_batcher", None)
     if batcher:
         batcher.touch(cache_key)
-    return CacheMeta(200, data, source="elasticsearch")
+    return CacheMeta(200, data, source="fdb")
 
 
 def get_vary_index(vary_index_key: str) -> CacheMeta:
-    data = es_get_doc(_es_meta_index(), vary_index_key)
+    data = fdb_get_vary(vary_index_key)
     if data is None:
-        return CacheMeta(404, {}, source="elasticsearch")
-    return CacheMeta(200, data, source="elasticsearch")
+        return CacheMeta(404, {}, source="fdb")
+    return CacheMeta(200, data, source="fdb")
 
 
 def get_refresh_patterns() -> list[RefreshPattern]:
@@ -905,56 +901,17 @@ def _init_error_logs() -> None:
     ctx._error_log_writer.start()
 
 
-_ES_MAPPING = {
-    "settings": {
-        "number_of_shards": 9,
-        "number_of_replicas": 1,
-        "refresh_interval": "60s",
-    },
-    "mappings": {
-        "dynamic": False,
-        "properties": {
-            "status_code": {"type": "integer", "index": False},
-            "url": {"type": "keyword"},
-            "extension": {"type": "keyword"},
-            "content_size": {"type": "long", "index": False},
-            "stored_at": {"type": "date"},
-            "last_access": {"type": "date"},
-            "headers": {"type": "object", "enabled": False},
-            "vary": {"type": "keyword", "index": False},
-            "vary_request": {"type": "keyword", "index": False},
-            "doc_type": {"type": "keyword"},
-            "manifest_b64": {"type": "keyword", "index": False, "doc_values": False},
-        },
-    },
-}
-
-
-def _init_elasticsearch() -> None:
-    if getattr(ctx, "_es_initialized", False):
+def _init_foundationdb() -> None:
+    if getattr(ctx, "_fdb_initialized", False):
         return
-    es_url = os.environ.get("PASSSAGE_ELASTICSEARCH_URL", "")
-    if not es_url:
-        return
-    meta_index = os.environ.get("PASSSAGE_ELASTICSEARCH_META_INDEX", "passsage_meta")
-    flush_interval = float(os.environ.get("PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL", "30"))
+    cluster_file = os.environ.get("PASSSAGE_FDB_CLUSTER_FILE", "")
+    flush_interval = float(os.environ.get("PASSSAGE_FDB_FLUSH_INTERVAL", "30"))
 
-    shards = int(os.environ.get("PASSSAGE_ELASTICSEARCH_SHARDS", "9"))
-    replicas = int(os.environ.get("PASSSAGE_ELASTICSEARCH_REPLICAS", "1"))
+    _fdb_configure(cluster_file or None)
 
-    _es_configure(es_url)
-
-    mapping = dict(_ES_MAPPING)
-    mapping["settings"] = {
-        "number_of_shards": shards,
-        "number_of_replicas": replicas,
-        "refresh_interval": "60s",
-    }
-    es_create_index(meta_index, mapping)
-
-    ctx._last_access_batcher = LastAccessBatcher(meta_index, flush_interval)
-    ctx._es_initialized = True
-    LOG.info("Elasticsearch initialized: url=%s index=%s flush_interval=%ss", es_url, meta_index, flush_interval)
+    ctx._last_access_batcher = LastAccessBatcher(flush_interval)
+    ctx._fdb_initialized = True
+    LOG.info("FoundationDB initialized: cluster_file=%s flush_interval=%ss", cluster_file or "(default)", flush_interval)
 
 
 def _build_access_log_record(flow, error: str | None = None) -> dict:
@@ -1501,7 +1458,7 @@ class Proxy:
             "error_log_flush_bytes",
         }.intersection(updated):
             _init_error_logs()
-        _init_elasticsearch()
+        _init_foundationdb()
 
     @staticmethod
     def cache_expired(cache):
@@ -1591,22 +1548,20 @@ class Proxy:
         try:
             normalized_url = _normalize_url(flow)
             depth = _s3_hash_prefix_depth()
-            vary_index_key = es_vary_index_id(normalized_url)
+            vary_index_key = vary_index_id(normalized_url)
             flow._vary_index_key = vary_index_key
 
-            # Speculatively compute cache key using proactive vary so we can
-            # batch both ES lookups into a single _mget round-trip.
             speculative_vk = compute_proactive_vary_key(flow.request.headers)
-            speculative_cache_key = es_doc_id(normalized_url, speculative_vk)
+            speculative_cache_key = meta_doc_id(normalized_url, speculative_vk)
 
             LOG.debug("Cache lookup vary index key=%s speculative_cache_key=%s", vary_index_key, speculative_cache_key)
-            mget_results = es_mget_docs(_es_meta_index(), [vary_index_key, speculative_cache_key])
+            mget_results = fdb_mget_docs([vary_index_key, speculative_cache_key])
 
             vary_data = mget_results.get(vary_index_key)
             vary_index_head = (
-                CacheMeta(200, vary_data, source="elasticsearch")
+                CacheMeta(200, vary_data, source="fdb")
                 if vary_data is not None
-                else CacheMeta(404, {}, source="elasticsearch")
+                else CacheMeta(404, {}, source="fdb")
             )
             LOG.debug(
                 "Vary index status=%s source=%s key=%s",
@@ -1621,7 +1576,7 @@ class Proxy:
                 if "*" not in vary_hdr:
                     vary_key = compute_vary_key(vary_hdr, flow.request.headers)
                     if vary_key is not None:
-                        flow._cache_key = es_doc_id(normalized_url, vary_key)
+                        flow._cache_key = meta_doc_id(normalized_url, vary_key)
                         LOG.debug(
                             "Cache lookup vary header=%s vary_key=%s cache_key=%s",
                             vary_hdr,
@@ -1648,12 +1603,12 @@ class Proxy:
                     # Already fetched in the _mget batch
                     spec_data = mget_results.get(speculative_cache_key)
                     if spec_data is not None:
-                        flow._cache_head = CacheMeta(200, spec_data, source="elasticsearch")
+                        flow._cache_head = CacheMeta(200, spec_data, source="fdb")
                         batcher = getattr(ctx, "_last_access_batcher", None)
                         if batcher:
                             batcher.touch(flow._cache_key)
                     else:
-                        flow._cache_head = CacheMeta(404, {}, source="elasticsearch")
+                        flow._cache_head = CacheMeta(404, {}, source="fdb")
                 else:
                     flow._cache_head = get_cache_metadata(flow._cache_key)
                 flow._metadata_source = flow._cache_head.source
@@ -2142,7 +2097,7 @@ class Proxy:
                 f.seek(0)
 
             if xs3lerator_handled and vary_header:
-                source_key = xs3lerator_stored_key or es_doc_id(normalized_url)
+                source_key = xs3lerator_stored_key or meta_doc_id(normalized_url)
                 if source_key != cache_key:
                     _xs3lerator_link_manifest(source_key, cache_key)
 
@@ -2192,14 +2147,12 @@ class Proxy:
             if vary_request:
                 meta["vary_request"] = vary_request
 
-            es_index = _es_meta_index()
-            es_index_doc(es_index, cache_key, meta)
+            fdb_put_meta(cache_key, meta)
 
-            # 3. Write the vary index (if applicable)
             if vary_header:
-                vary_index_key = es_vary_index_id(normalized_url)
+                vary_index_key = vary_index_id(normalized_url)
                 vary_data = {"vary": vary_header, "doc_type": "vary_index"}
-                es_index_doc(es_index, vary_index_key, vary_data)
+                fdb_put_vary(vary_index_key, vary_data)
         except Exception as e:
             LOG.error("Cache save error %s, %s", url, e)
             _log_exception(
@@ -2258,7 +2211,7 @@ class Proxy:
                 vary_key = compute_vary_key(vary_header, flow.request.headers)
                 if vary_key:
                     normalized_url = _normalize_url(flow)
-                    flow._cache_key = es_doc_id(normalized_url, vary_key)
+                    flow._cache_key = meta_doc_id(normalized_url, vary_key)
                     flow._cache_vary = vary_header
                     flow._cache_vary_request = build_vary_request(
                         vary_header, flow.request.headers
@@ -2287,7 +2240,7 @@ class Proxy:
 
             if is_xs3lerator:
                 normalized_url = _normalize_url(flow)
-                cache_key = flow._cache_key or es_doc_id(normalized_url)
+                cache_key = flow._cache_key or meta_doc_id(normalized_url)
                 flow._cache_saved = True
                 save_headers = flow.response.headers.copy()
                 if "content-range" in save_headers:
@@ -2372,7 +2325,7 @@ class Proxy:
                         self.cleanup(flow)
                     return
                 normalized_url = _normalize_url(flow)
-                cache_key = flow._cache_key or es_doc_id(normalized_url)
+                cache_key = flow._cache_key or meta_doc_id(normalized_url)
                 flow._cache_saved = True
                 LOG.debug("Cache save enqueue key=%s", cache_key)
                 save_headers = flow.response.headers

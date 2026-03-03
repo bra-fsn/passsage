@@ -36,7 +36,7 @@ services:
       retries: 20
 
   xs3lerator:
-    image: ghcr.io/bra-fsn/xs3lerator:latest
+    image: ghcr.io/bra-fsn/xs3lerator:${XS3LERATOR_TAG:-latest}
     pull_policy: always
     ports:
       - "${XS3_PORT:-8888}:8080"
