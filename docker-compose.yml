@@ -19,22 +19,24 @@ services:
       timeout: 5s
       retries: 10
 
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+  foundationdb:
+    image: foundationdb/foundationdb:7.3.63
     ports:
-      - "9200:9200"
+      - "4500:4500"
     environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+      - FDB_NETWORKING_MODE=container
+      - FDB_COORDINATOR_PORT=4500
+    volumes:
+      - fdb-data:/var/fdb/data
+      - fdb-config:/var/fdb/shared
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      test: ["CMD-SHELL", "fdbcli --exec 'configure new single ssd' >/dev/null 2>&1; cp -f /var/fdb/fdb.cluster /var/fdb/shared/fdb.cluster 2>/dev/null; fdbcli --exec 'status minimal' 2>/dev/null | grep -q 'The database is available'"]
       interval: 5s
-      timeout: 5s
-      retries: 15
+      timeout: 10s
+      retries: 20
 
   xs3lerator:
-    image: ghcr.io/bra-fsn/xs3lerator:latest
+    image: ghcr.io/bra-fsn/xs3lerator:${XS3LERATOR_TAG:-latest}
     pull_policy: always
     ports:
       - "${XS3_PORT:-8888}:8080"
@@ -49,19 +51,20 @@ services:
       - XS3_S3_REGION=${AWS_DEFAULT_REGION:-us-west-2}
       - XS3_CACHE_DIR=/var/cache/xs3lerator
       - XS3_UPSTREAM_TLS_SKIP_VERIFY=true
-      - XS3_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - XS3_FDB_CLUSTER_FILE=/var/fdb/shared/fdb.cluster
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
       - AWS_ALLOW_HTTP=true
     volumes:
       - xs3lerator-cache:/var/cache/xs3lerator
+      - fdb-config:/var/fdb/shared:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       localstack:
         condition: service_healthy
-      elasticsearch:
+      foundationdb:
         condition: service_healthy
 
   passsage:
@@ -78,18 +81,20 @@ services:
       - PASSSAGE_S3_HASH_PREFIX_DEPTH=4
       - PASSSAGE_HEALTH_PORT=8082
       - PASSSAGE_HEALTH_HOST=0.0.0.0
-      - PASSSAGE_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - PASSSAGE_FDB_CLUSTER_FILE=/var/fdb/shared/fdb.cluster
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
       - S3_ENDPOINT_URL=http://localstack:4566
       - S3_BUCKET=proxy-cache
+    volumes:
+      - fdb-config:/var/fdb/shared:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       localstack:
         condition: service_healthy
-      elasticsearch:
+      foundationdb:
         condition: service_healthy
       xs3lerator:
         condition: service_started
@@ -102,3 +107,5 @@ services:
 volumes:
   localstack-data:
   xs3lerator-cache:
+  fdb-data:
+  fdb-config:

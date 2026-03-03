@@ -232,41 +232,21 @@ import click
     "(env: PASSSAGE_MITM_CA)"
 )
 @click.option(
-    "--elasticsearch-url",
-    envvar="PASSSAGE_ELASTICSEARCH_URL",
-    required=True,
-    help="Elasticsearch URL for metadata storage (env: PASSSAGE_ELASTICSEARCH_URL)"
-)
-@click.option(
-    "--elasticsearch-meta-index",
-    envvar="PASSSAGE_ELASTICSEARCH_META_INDEX",
-    default="passsage_meta",
+    "--fdb-cluster-file",
+    envvar="PASSSAGE_FDB_CLUSTER_FILE",
+    default="",
     show_default=True,
-    help="Elasticsearch index name for metadata (env: PASSSAGE_ELASTICSEARCH_META_INDEX)"
+    help="Path to FoundationDB cluster file for metadata storage. "
+    "Empty string uses the default system cluster file. "
+    "(env: PASSSAGE_FDB_CLUSTER_FILE)"
 )
 @click.option(
-    "--elasticsearch-replicas",
-    envvar="PASSSAGE_ELASTICSEARCH_REPLICAS",
-    type=int,
-    default=1,
-    show_default=True,
-    help="Number of ES index replicas (env: PASSSAGE_ELASTICSEARCH_REPLICAS)"
-)
-@click.option(
-    "--elasticsearch-shards",
-    envvar="PASSSAGE_ELASTICSEARCH_SHARDS",
-    type=int,
-    default=9,
-    show_default=True,
-    help="Number of ES index shards (env: PASSSAGE_ELASTICSEARCH_SHARDS)"
-)
-@click.option(
-    "--elasticsearch-flush-interval",
-    envvar="PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL",
+    "--fdb-flush-interval",
+    envvar="PASSSAGE_FDB_FLUSH_INTERVAL",
     type=float,
     default=30.0,
     show_default=True,
-    help="Last-access batcher flush interval in seconds (env: PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL)"
+    help="Last-access batcher flush interval in seconds (env: PASSSAGE_FDB_FLUSH_INTERVAL)"
 )
 @click.option(
     "--xs3lerator-url",
@@ -320,11 +300,8 @@ def main(
     connection_strategy,
     mitm_ca_cert,
     mitm_ca,
-    elasticsearch_url,
-    elasticsearch_meta_index,
-    elasticsearch_replicas,
-    elasticsearch_shards,
-    elasticsearch_flush_interval,
+    fdb_cluster_file,
+    fdb_flush_interval,
     xs3lerator_url,
     s3_hash_prefix_depth,
 ):
@@ -380,11 +357,8 @@ def main(
             connection_strategy,
             mitm_ca_cert,
             mitm_ca,
-            elasticsearch_url,
-            elasticsearch_meta_index,
-            elasticsearch_replicas,
-            elasticsearch_shards,
-            elasticsearch_flush_interval,
+            fdb_cluster_file,
+            fdb_flush_interval,
             xs3lerator_url,
             s3_hash_prefix_depth,
         )
@@ -443,11 +417,8 @@ def run_proxy(
     connection_strategy="lazy",
     mitm_ca_cert=None,
     mitm_ca=None,
-    elasticsearch_url="",
-    elasticsearch_meta_index="passsage_meta",
-    elasticsearch_replicas=1,
-    elasticsearch_shards=9,
-    elasticsearch_flush_interval=30.0,
+    fdb_cluster_file="",
+    fdb_flush_interval=30.0,
     xs3lerator_url="",
     s3_hash_prefix_depth=4,
 ):
@@ -526,11 +497,9 @@ def run_proxy(
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
     args.extend(["--set", f"connection_strategy={connection_strategy}"])
-    os.environ["PASSSAGE_ELASTICSEARCH_URL"] = elasticsearch_url
-    os.environ["PASSSAGE_ELASTICSEARCH_META_INDEX"] = elasticsearch_meta_index
-    os.environ["PASSSAGE_ELASTICSEARCH_REPLICAS"] = str(elasticsearch_replicas)
-    os.environ["PASSSAGE_ELASTICSEARCH_SHARDS"] = str(elasticsearch_shards)
-    os.environ["PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL"] = str(elasticsearch_flush_interval)
+    if fdb_cluster_file:
+        os.environ["PASSSAGE_FDB_CLUSTER_FILE"] = fdb_cluster_file
+    os.environ["PASSSAGE_FDB_FLUSH_INTERVAL"] = str(fdb_flush_interval)
     os.environ["PASSSAGE_XS3LERATOR_URL"] = xs3lerator_url
     args.extend(["--set", f"xs3lerator_url={xs3lerator_url}"])
     args.extend(["--set", f"s3_hash_prefix_depth={s3_hash_prefix_depth}"])

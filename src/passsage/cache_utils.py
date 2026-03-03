@@ -7,8 +7,8 @@ import hashlib
 from urllib.parse import urlparse
 
 
-def es_doc_id(normalized_url: str, vary_key: str | None = None) -> str:
-    """Compute the Elasticsearch document _id for a normalized URL.
+def meta_doc_id(normalized_url: str, vary_key: str | None = None) -> str:
+    """Compute the metadata document ID for a normalized URL.
 
     Format: {scheme}/{host}/{sha224hex} or {scheme}/{host}/{sha224hex}+{vary_sha224}
     No S3-style hash prefix dirs, no meta/ prefix, no extension.
@@ -22,13 +22,19 @@ def es_doc_id(normalized_url: str, vary_key: str | None = None) -> str:
     return f"{scheme}/{host}/{digest}"
 
 
-def es_vary_index_id(normalized_url: str) -> str:
-    """Compute the Elasticsearch document _id for a vary-index entry."""
+es_doc_id = meta_doc_id
+
+
+def vary_index_id(normalized_url: str) -> str:
+    """Compute the document ID for a vary-index entry."""
     parsed = urlparse(normalized_url)
     scheme = (parsed.scheme or "https").lower()
     host = (parsed.hostname or "unknown").lower()
     digest = hashlib.sha224(normalized_url.encode("utf-8")).hexdigest()
     return f"{scheme}/{host}/_vary/{digest}"
+
+
+es_vary_index_id = vary_index_id
 
 
 def url_ext(url: str, max_len: int = 20) -> str:

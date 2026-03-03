@@ -9,6 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     less \
     procps \
+    && ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in amd64) FDB_ARCH=amd64 ;; arm64) FDB_ARCH=aarch64 ;; *) echo "unsupported: $ARCH" && exit 1 ;; esac \
+    && curl -fsSL "https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_${FDB_ARCH}.deb" -o /tmp/fdb-clients.deb \
+    && dpkg -i /tmp/fdb-clients.deb \
+    && rm /tmp/fdb-clients.deb \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies first (this layer is cached until pyproject.toml changes)
