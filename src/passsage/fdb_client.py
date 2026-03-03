@@ -75,12 +75,12 @@ def fdb_get_meta(cache_key: str) -> dict | None:
     """Get metadata for a cache key. Returns deserialized dict or None."""
     db = _get_db()
     key = _make_key(PREFIX_META, cache_key)
-    data = db.create_transaction().get(key).wait()
+    tr = db.create_transaction()
+    data = tr.get(key).wait()
     if data is None:
         return None
     if len(data) < SPLIT_VALUE_CHUNK:
         return msgpack.unpackb(data, raw=False)
-    tr = db.create_transaction()
     full = _split_read(tr, key)
     if full is None:
         return None
@@ -138,7 +138,8 @@ def fdb_get_vary(vary_key: str) -> dict | None:
     """Get vary index entry."""
     db = _get_db()
     key = _make_key(PREFIX_VARY, vary_key)
-    data = db.create_transaction().get(key).wait()
+    tr = db.create_transaction()
+    data = tr.get(key).wait()
     if data is None:
         return None
     return msgpack.unpackb(bytes(data), raw=False)
