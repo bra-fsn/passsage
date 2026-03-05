@@ -181,3 +181,126 @@ class TestResolverWithTimeouts:
         result = resolver.resolve(Context(url="https://files.pythonhosted.org/torch.whl"))
         assert result.policy is StaleIfError
         assert result.timeouts is None
+
+
+class TestForcedSwrSeconds:
+    def test_resolved_policy_default_no_forced_swr(self):
+        rp = ResolvedPolicy(policy=Standard)
+        assert rp.forced_swr_seconds is None
+
+    def test_resolved_policy_with_forced_swr(self):
+        rp = ResolvedPolicy(policy=StaleIfError, forced_swr_seconds=86400)
+        assert rp.forced_swr_seconds == 86400
+
+    def test_prefix_rule_with_forced_swr(self):
+        rule = PrefixRule(
+            "https://pypi.org/simple",
+            StaleIfError,
+            forced_swr_seconds=86400,
+        )
+        ctx = Context(url="https://pypi.org/simple/requests/")
+        assert rule.match(ctx) is StaleIfError
+        assert rule.forced_swr_seconds == 86400
+
+    def test_suffix_rule_with_forced_swr(self):
+        rule = SuffixRule(".deb", StaleIfError, forced_swr_seconds=3600)
+        assert rule.forced_swr_seconds == 3600
+
+    def test_host_contains_rule_with_forced_swr(self):
+        rule = HostContainsRule(
+            "pypi.org", StaleIfError, forced_swr_seconds=43200,
+        )
+        ctx = Context(url="https://pypi.org/simple/flask/")
+        assert rule.match(ctx) is StaleIfError
+        assert rule.forced_swr_seconds == 43200
+
+    def test_path_contains_rule_with_forced_swr(self):
+        rule = PathContainsRule(
+            "pypi.org/simple", StaleIfError, forced_swr_seconds=86400,
+        )
+        ctx = Context(url="https://pypi.org/simple/flask/")
+        assert rule.match(ctx) is StaleIfError
+        assert rule.forced_swr_seconds == 86400
+
+    def test_regex_rule_with_forced_swr(self):
+        rule = RegexRule(
+            r".*\.tar\.gz$", StaleIfError, forced_swr_seconds=7200,
+        )
+        assert rule.forced_swr_seconds == 7200
+
+    def test_callable_rule_with_forced_swr(self):
+        rule = CallableRule(
+            lambda ctx: StaleIfError if "slow" in ctx.url else None,
+            forced_swr_seconds=600,
+        )
+        assert rule.forced_swr_seconds == 600
+
+    def test_rule_without_forced_swr_defaults_none(self):
+        rule = PrefixRule("https://example.com/", Standard)
+        assert rule.forced_swr_seconds is None
+
+    def test_resolver_propagates_forced_swr(self):
+        rules = [
+            PathContainsRule(
+                "pypi.org/simple", StaleIfError, forced_swr_seconds=86400,
+            ),
+        ]
+        resolver = PolicyResolver(rules=rules)
+        result = resolver.resolve(
+            Context(url="https://pypi.org/simple/requests/")
+        )
+        assert result.policy is StaleIfError
+        assert result.forced_swr_seconds == 86400
+
+    def test_resolver_no_forced_swr_for_default_policy(self):
+        rules = [
+            PathContainsRule(
+                "pypi.org/simple", StaleIfError, forced_swr_seconds=86400,
+            ),
+        ]
+        resolver = PolicyResolver(rules=rules)
+        result = resolver.resolve(
+            Context(url="https://example.com/unknown")
+        )
+        assert result.policy is Standard
+        assert result.forced_swr_seconds is None
+
+    def test_resolver_no_forced_swr_when_rule_has_none(self):
+        rules = [SuffixRule(".deb", StaleIfError)]
+        resolver = PolicyResolver(rules=rules)
+        result = resolver.resolve(Context(url="https://example.com/pkg.deb"))
+        assert result.policy is StaleIfError
+        assert result.forced_swr_seconds is None
+
+    def test_default_rules_have_no_forced_swr(self):
+        resolver = PolicyResolver()
+        # pypi.org/simple now has forced SWR enabled by default
+        result = resolver.resolve(
+            Context(url="https://pypi.org/simple/requests/")
+        )
+        assert result.policy is StaleIfError
+        assert result.forced_swr_seconds == 86400
+
+        # other rules should not have forced SWR
+        result = resolver.resolve(
+            Context(url="https://files.pythonhosted.org/packages/foo.whl")
+        )
+        assert result.policy is StaleIfError
+        assert result.forced_swr_seconds is None
+
+    def test_forced_swr_combined_with_timeouts(self):
+        tc = TimeoutConfig(connect_timeout=5, read_timeout=120)
+        rule = PrefixRule(
+            "https://pypi.org/simple",
+            StaleIfError,
+            timeouts=tc,
+            forced_swr_seconds=86400,
+        )
+        rules = [rule]
+        resolver = PolicyResolver(rules=rules)
+        result = resolver.resolve(
+            Context(url="https://pypi.org/simple/requests/")
+        )
+        assert result.policy is StaleIfError
+        assert result.timeouts is tc
+        assert result.forced_swr_seconds == 86400
