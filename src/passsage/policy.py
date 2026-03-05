@@ -7,6 +7,25 @@ Rule types (evaluated in order; first match wins):
 
 Use default_rules() for built-in behaviour, or pass custom rules to PolicyResolver(rules=...).
 Override globally before starting the proxy: set_default_resolver(PolicyResolver(my_rules)).
+
+Forced Stale-While-Revalidate (SWR)
+------------------------------------
+Any rule can set ``forced_swr_seconds`` to enable proxy-side stale-while-revalidate,
+independent of origin Cache-Control headers.  When a cached response is stale but
+younger than ``forced_swr_seconds``, the proxy serves the cached body immediately
+and asks xs3lerator to revalidate with the origin in the background.  If the origin
+returns 304 Not Modified, xs3lerator refreshes the ``stored_at`` timestamp in
+Elasticsearch so the entry appears fresh again.  If the origin returns new content,
+xs3lerator downloads and stores it normally — subsequent requests will see the update.
+
+This eliminates the latency of foreground conditional revalidation for origins that
+rarely change (e.g. PyPI simple index pages), while still keeping the cache
+eventually consistent.  Responses older than the configured window fall back to
+normal foreground revalidation.
+
+Only applies to Standard and StaleIfError policies, and only when the cached response
+carries validators (ETag or Last-Modified) so a conditional GET is possible.
+Client-forced revalidation (``Cache-Control: no-cache``) bypasses this.
 """
 
 import re
@@ -67,6 +86,14 @@ class ResolvedPolicy:
 
     policy: type[Policy]
     timeouts: Optional[TimeoutConfig] = None
+    forced_swr_seconds: Optional[int] = None
+    """Proxy-side stale-while-revalidate window in seconds (None = disabled).
+
+    When set, stale cached responses younger than this many seconds are served
+    immediately while xs3lerator revalidates with the origin in the background.
+    Responses older than this window undergo normal foreground revalidation.
+    See module docstring for full details.
+    """
 
 
 @dataclass(frozen=True)
@@ -98,7 +125,7 @@ class Rule(Protocol):
 class PrefixRule:
     """Fast: match URL prefix (case-insensitive). Longest prefix wins if multiple match."""
 
-    __slots__ = ("prefix", "policy", "timeouts", "_prefix_lower")
+    __slots__ = ("prefix", "policy", "timeouts", "forced_swr_seconds", "_prefix_lower")
 
     def __init__(
         self,
@@ -106,10 +133,12 @@ class PrefixRule:
         policy: type[Policy],
         *,
         timeouts: Optional[TimeoutConfig] = None,
+        forced_swr_seconds: Optional[int] = None,
     ) -> None:
         self.prefix = prefix
         self.policy = policy
         self.timeouts = timeouts
+        self.forced_swr_seconds = forced_swr_seconds
         self._prefix_lower = prefix.lower()
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -121,7 +150,7 @@ class PrefixRule:
 class SuffixRule:
     """Fast: match URL suffix (e.g. .deb)."""
 
-    __slots__ = ("suffix", "policy", "timeouts", "_suffix_lower")
+    __slots__ = ("suffix", "policy", "timeouts", "forced_swr_seconds", "_suffix_lower")
 
     def __init__(
         self,
@@ -129,10 +158,12 @@ class SuffixRule:
         policy: type[Policy],
         *,
         timeouts: Optional[TimeoutConfig] = None,
+        forced_swr_seconds: Optional[int] = None,
     ) -> None:
         self.suffix = suffix
         self.policy = policy
         self.timeouts = timeouts
+        self.forced_swr_seconds = forced_swr_seconds
         self._suffix_lower = suffix.lower()
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -144,7 +175,7 @@ class SuffixRule:
 class HostPrefixRule:
     """Fast: match host prefix (e.g. 169.254.169. for link-local)."""
 
-    __slots__ = ("prefix", "policy", "timeouts", "_prefix_lower")
+    __slots__ = ("prefix", "policy", "timeouts", "forced_swr_seconds", "_prefix_lower")
 
     def __init__(
         self,
@@ -152,10 +183,12 @@ class HostPrefixRule:
         policy: type[Policy],
         *,
         timeouts: Optional[TimeoutConfig] = None,
+        forced_swr_seconds: Optional[int] = None,
     ) -> None:
         self.prefix = prefix
         self.policy = policy
         self.timeouts = timeouts
+        self.forced_swr_seconds = forced_swr_seconds
         self._prefix_lower = prefix.lower()
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -167,7 +200,10 @@ class HostPrefixRule:
 class HostContainsRule:
     """Fast: match substring in host (e.g. amazonaws.com, then exclude codeartifact)."""
 
-    __slots__ = ("contains", "policy", "timeouts", "exclude", "_contains_lower", "_exclude_lower")
+    __slots__ = (
+        "contains", "policy", "timeouts", "forced_swr_seconds",
+        "exclude", "_contains_lower", "_exclude_lower",
+    )
 
     def __init__(
         self,
@@ -176,10 +212,12 @@ class HostContainsRule:
         *,
         exclude: Optional[str] = None,
         timeouts: Optional[TimeoutConfig] = None,
+        forced_swr_seconds: Optional[int] = None,
     ) -> None:
         self.contains = contains
         self.policy = policy
         self.timeouts = timeouts
+        self.forced_swr_seconds = forced_swr_seconds
         self.exclude = exclude
         self._contains_lower = contains.lower()
         self._exclude_lower = exclude.lower() if exclude else None
@@ -198,7 +236,7 @@ class HostContainsRule:
 class PathContainsRule:
     """Fast: match substring in URL path (e.g. /mitm.it/)."""
 
-    __slots__ = ("contains", "policy", "timeouts", "_contains_lower")
+    __slots__ = ("contains", "policy", "timeouts", "forced_swr_seconds", "_contains_lower")
 
     def __init__(
         self,
@@ -206,10 +244,12 @@ class PathContainsRule:
         policy: type[Policy],
         *,
         timeouts: Optional[TimeoutConfig] = None,
+        forced_swr_seconds: Optional[int] = None,
     ) -> None:
         self.contains = contains
         self.policy = policy
         self.timeouts = timeouts
+        self.forced_swr_seconds = forced_swr_seconds
         self._contains_lower = contains.lower()
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -221,7 +261,7 @@ class PathContainsRule:
 class RegexRule:
     """Complex: match URL with a compiled regex."""
 
-    __slots__ = ("pattern", "policy", "timeouts", "_compiled")
+    __slots__ = ("pattern", "policy", "timeouts", "forced_swr_seconds", "_compiled")
 
     def __init__(
         self,
@@ -229,10 +269,12 @@ class RegexRule:
         policy: type[Policy],
         *,
         timeouts: Optional[TimeoutConfig] = None,
+        forced_swr_seconds: Optional[int] = None,
     ) -> None:
         self.pattern = pattern
         self.policy = policy
         self.timeouts = timeouts
+        self.forced_swr_seconds = forced_swr_seconds
         self._compiled = re.compile(pattern, re.IGNORECASE) if isinstance(pattern, str) else pattern
 
     def match(self, ctx: Context) -> Optional[Policy]:
@@ -244,16 +286,18 @@ class RegexRule:
 class CallableRule:
     """Dynamic: user callable(ctx) -> Policy | None."""
 
-    __slots__ = ("func", "timeouts")
+    __slots__ = ("func", "timeouts", "forced_swr_seconds")
 
     def __init__(
         self,
         func: Callable[[Context], Optional[Policy]],
         *,
         timeouts: Optional[TimeoutConfig] = None,
+        forced_swr_seconds: Optional[int] = None,
     ) -> None:
         self.func = func
         self.timeouts = timeouts
+        self.forced_swr_seconds = forced_swr_seconds
 
     def match(self, ctx: Context) -> Optional[Policy]:
         return self.func(ctx)
@@ -281,13 +325,21 @@ class PolicyResolver:
         for rule in self._prefix_rules:
             p = rule.match(ctx)
             if p is not None:
-                return ResolvedPolicy(policy=p, timeouts=getattr(rule, "timeouts", None))
+                return ResolvedPolicy(
+                    policy=p,
+                    timeouts=getattr(rule, "timeouts", None),
+                    forced_swr_seconds=getattr(rule, "forced_swr_seconds", None),
+                )
         for rule in self._rules:
             if isinstance(rule, PrefixRule):
                 continue
             p = rule.match(ctx)
             if p is not None:
-                return ResolvedPolicy(policy=p, timeouts=getattr(rule, "timeouts", None))
+                return ResolvedPolicy(
+                    policy=p,
+                    timeouts=getattr(rule, "timeouts", None),
+                    forced_swr_seconds=getattr(rule, "forced_swr_seconds", None),
+                )
         return ResolvedPolicy(policy=self._default_policy)
 
     def add_rule(self, rule: Rule, index: int = 0) -> None:

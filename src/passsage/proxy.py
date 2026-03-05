@@ -469,6 +469,7 @@ def get_policy(flow):
             if policy:
                 LOG.debug("Policy header override=%s", policy_name)
                 flow._timeout_config = None
+                flow._forced_swr_seconds = None
                 return policy
             LOG.warning("Unknown policy header override=%s", policy_name)
     request_ctx = PolicyContext(
@@ -481,6 +482,7 @@ def get_policy(flow):
         resolver.set_default_policy(policy_from_name(ctx.options.default_policy))
     resolved = resolver.resolve(request_ctx)
     flow._timeout_config = resolved.timeouts
+    flow._forced_swr_seconds = resolved.forced_swr_seconds
     return resolved.policy
 
 
@@ -1014,6 +1016,7 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "cache_fresh": getattr(flow, "_cache_fresh", None),
         "stale_while_revalidate": getattr(flow, "_allow_stale_while_revalidate", None),
         "stale_if_error": getattr(flow, "_allow_stale_if_error", None),
+        "forced_swr": getattr(flow, "_forced_swr", False),
         "upstream_head_status": upstream_head.status_code if upstream_head else None,
         "upstream_error": str(upstream_error) if upstream_error else None,
         "upstream_head_time_ms": upstream_head_time,
@@ -1247,6 +1250,35 @@ def _rewrite_to_xs3lerator_revalidate(flow):
     flow._cached = False
     flow._save_response = False
     flow._conditional_revalidation = True
+
+
+def _rewrite_to_object_store_with_bg_revalidation(flow):
+    """Rewrite a stale-cache GET to serve from cache immediately while
+    requesting xs3lerator to do a background conditional revalidation.
+
+    xs3lerator returns the cached body right away and spawns an async
+    task to revalidate with the upstream origin.
+    """
+    xs3lerator_url = getattr(ctx.options, "xs3lerator_url", "")
+    if not xs3lerator_url:
+        return
+    _rewrite_to_xs3lerator(flow, cache_skip=False)
+
+    cm = flow._cache_head.meta
+    etag = cm.get("headers", {}).get("etag")
+    if etag:
+        flow.request.headers["X-Xs3lerator-If-None-Match"] = etag
+    last_modified = (cm.get("headers") or {}).get("last-modified")
+    if not last_modified:
+        last_modified = cm.get("last_modified")
+    if last_modified:
+        flow.request.headers["X-Xs3lerator-If-Modified-Since"] = last_modified
+
+    flow.request.headers["X-Xs3lerator-Background-Revalidate"] = "true"
+    flow.request.headers["X-Xs3lerator-Stale-If-Error"] = "true"
+
+    flow._cached = True
+    flow._save_response = False
 
 
 def _rewrite_head_to_xs3lerator(flow):
@@ -1537,6 +1569,7 @@ class Proxy:
         flow._xs3lerator_full_size = None
         flow._original_url = None
         flow._proactive_vary_key = None
+        flow._forced_swr = False
         policy = flow._policy = get_policy(flow)
         if _is_s3_cache_request(flow):
             flow._save_response = False
@@ -1764,6 +1797,28 @@ class Proxy:
                 flow._short_circuit = True
                 flow._serve_reason = "head_synthetic_from_cache"
                 return
+            forced_swr = getattr(flow, "_forced_swr_seconds", None)
+            if (cache_hit
+                    and forced_swr is not None
+                    and freshness is not None
+                    and freshness.age_seconds <= forced_swr
+                    and policy in (Standard, StaleIfError)
+                    and not request_requires_revalidation(request_headers, freshness)):
+                meta = flow._cache_head.meta
+                headers_dict = meta.get("headers", {})
+                flow.response = http.Response.make(
+                    meta.get("status_code", 200), b"", headers_dict,
+                )
+                flow._save_response = False
+                flow._cached = True
+                flow._short_circuit = True
+                flow._forced_swr = True
+                flow._serve_reason = "head_forced_swr_synthetic"
+                LOG.debug(
+                    "HEAD forced SWR (age=%ds <= %ds) -> synthetic from cache",
+                    freshness.age_seconds, forced_swr,
+                )
+                return
             # Stale/miss HEAD: rewrite the flow to route through xs3lerator
             # for upstream connection pooling.
             _rewrite_head_to_xs3lerator(flow)
@@ -1801,6 +1856,29 @@ class Proxy:
                 LOG.debug("Cache hit: stale-while-revalidate -> rewrite to object store")
                 _rewrite_to_object_store(flow)
                 return
+            forced_swr = getattr(flow, "_forced_swr_seconds", None)
+            if (xs3lerator_enabled
+                    and flow.request.method == "GET"
+                    and policy in (Standard, StaleIfError)
+                    and forced_swr is not None
+                    and freshness is not None
+                    and freshness.age_seconds <= forced_swr
+                    and not request_requires_revalidation(request_headers, freshness)):
+                cm = flow._cache_head.meta
+                has_validators = (
+                    cm.get("headers", {}).get("etag")
+                    or cm.get("last_modified")
+                )
+                if has_validators:
+                    flow._serve_reason = "cache_hit_forced_swr"
+                    flow._forced_swr = True
+                    LOG.debug(
+                        "Cache hit: forced SWR (age=%ds <= %ds) -> "
+                        "serve from cache + background revalidation",
+                        freshness.age_seconds, forced_swr,
+                    )
+                    _rewrite_to_object_store_with_bg_revalidation(flow)
+                    return
             if (xs3lerator_enabled
                     and flow.request.method == "GET"
                     and policy in (Standard, StaleIfError)):
@@ -2005,6 +2083,7 @@ class Proxy:
             xs3_cache_hit = flow.response.headers.get("x-xs3lerator-cache-hit")
             xs3_full_size = flow.response.headers.get("x-xs3lerator-full-size")
             xs3_revalidated = flow.response.headers.get("x-xs3lerator-revalidated")
+            xs3_bg_revalidate = flow.response.headers.get("x-xs3lerator-background-revalidate")
             if xs3_full_size:
                 flow._xs3lerator_full_size = int(xs3_full_size)
             if xs3_revalidated in ("true", "stale-error"):
@@ -2026,6 +2105,8 @@ class Proxy:
                         )
             elif xs3_cache_hit == "false":
                 flow._save_response = True
+            if xs3_bg_revalidate == "accepted":
+                LOG.debug("xs3lerator accepted background revalidation for key=%s", flow._cache_key)
             # Strip all X-Xs3lerator-* response headers before forwarding to client
             to_remove = [k for k in flow.response.headers if k.lower().startswith("x-xs3lerator-")]
             for k in to_remove:
