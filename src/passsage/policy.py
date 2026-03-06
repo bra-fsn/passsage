@@ -25,7 +25,8 @@ normal foreground revalidation.
 
 Only applies to Standard and StaleIfError policies, and only when the cached response
 carries validators (ETag or Last-Modified) so a conditional GET is possible.
-Client-forced revalidation (``Cache-Control: no-cache``) bypasses this.
+Client-forced revalidation (``Cache-Control: no-cache``) is intentionally ignored
+when forced SWR is configured — the proxy-side window takes precedence.
 """
 
 import re
