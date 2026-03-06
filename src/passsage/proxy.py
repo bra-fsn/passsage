@@ -1802,8 +1802,7 @@ class Proxy:
                     and forced_swr is not None
                     and freshness is not None
                     and freshness.age_seconds <= forced_swr
-                    and policy in (Standard, StaleIfError)
-                    and not request_requires_revalidation(request_headers, freshness)):
+                    and policy in (Standard, StaleIfError)):
                 meta = flow._cache_head.meta
                 headers_dict = meta.get("headers", {})
                 flow.response = http.Response.make(
@@ -1862,8 +1861,7 @@ class Proxy:
                     and policy in (Standard, StaleIfError)
                     and forced_swr is not None
                     and freshness is not None
-                    and freshness.age_seconds <= forced_swr
-                    and not request_requires_revalidation(request_headers, freshness)):
+                    and freshness.age_seconds <= forced_swr):
                 cm = flow._cache_head.meta
                 has_validators = (
                     cm.get("headers", {}).get("etag")
