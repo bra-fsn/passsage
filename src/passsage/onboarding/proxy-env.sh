@@ -96,6 +96,8 @@ install_cert() {
   esac
 }
 
+NO_PROXY_HOSTS="localhost,127.0.0.1,::1,169.254.169.254,169.254.170.2,__PASSSAGE_S3_HOST__"
+
 write_env_file() {
   env_dir="${HOME:-$PWD}/.passsage"
   env_file="$env_dir/proxy-env.sh"
@@ -105,10 +107,10 @@ write_env_file() {
   if ! {
     printf 'export HTTP_PROXY="%s"\n' "$proxy_url"
     printf 'export HTTPS_PROXY="%s"\n' "$proxy_url"
-    printf 'export NO_PROXY="localhost,127.0.0.1,::1,__PASSSAGE_S3_HOST__"\n'
+    printf 'export NO_PROXY="%s"\n' "$NO_PROXY_HOSTS"
     printf 'export http_proxy="%s"\n' "$proxy_url"
     printf 'export https_proxy="%s"\n' "$proxy_url"
-    printf 'export no_proxy="localhost,127.0.0.1,::1,__PASSSAGE_S3_HOST__"\n'
+    printf 'export no_proxy="%s"\n' "$NO_PROXY_HOSTS"
     if [ -n "$ca_bundle" ]; then
       printf 'export SSL_CERT_FILE="%s"\n' "$ca_bundle"
       printf 'export REQUESTS_CA_BUNDLE="%s"\n' "$ca_bundle"
@@ -140,10 +142,10 @@ main() {
 
   export HTTP_PROXY="$proxy_url"
   export HTTPS_PROXY="$proxy_url"
-  export NO_PROXY="localhost,127.0.0.1,::1,__PASSSAGE_S3_HOST__"
+  export NO_PROXY="$NO_PROXY_HOSTS"
   export http_proxy="$proxy_url"
   export https_proxy="$proxy_url"
-  export no_proxy="localhost,127.0.0.1,::1,__PASSSAGE_S3_HOST__"
+  export no_proxy="$NO_PROXY_HOSTS"
   if [ -n "$ca_bundle" ]; then
     export SSL_CERT_FILE="$ca_bundle"
     export REQUESTS_CA_BUNDLE="$ca_bundle"
