@@ -244,17 +244,13 @@ def _xs3lerator_link_manifest(base_key: str, vary_key: str) -> None:
         LOG.warning("Manifest alias failed (%s -> %s): %s", base_key, vary_key, exc)
 
 
-def _no_proxy_s3_hosts() -> str:
-    return S3_HOST
-
-
 def load_proxy_env_script() -> bytes:
     try:
         from importlib import resources
         script = resources.files("passsage").joinpath("onboarding/proxy-env.sh").read_text()
         public_url = os.environ.get("PASSSAGE_PUBLIC_PROXY_URL", "").strip() or "http://localhost:8080"
         script = script.replace("__PASSSAGE_PUBLIC_PROXY_URL__", public_url)
-        script = script.replace("__PASSSAGE_S3_HOST__", _no_proxy_s3_hosts())
+        script = script.replace("__PASSSAGE_S3_HOST__", S3_HOST)
         cert_pem = _read_ca_cert_pem()
         if cert_pem:
             script = script.replace("__PASSSAGE_MITM_CA_PEM__", cert_pem)
