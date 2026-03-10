@@ -1890,6 +1890,9 @@ class Proxy:
             if (flow.request.method == "GET"
                     and flow.request.headers.get("if-modified-since")):
                 flow._orig_data["if-modified-since"] = flow.request.headers.pop("if-modified-since", None)
+            if (flow.request.method == "GET"
+                    and flow.request.headers.get("if-none-match")):
+                flow._orig_data["if-none-match"] = flow.request.headers.pop("if-none-match", None)
             if xs3lerator_enabled and flow.request.method == "GET":
                 # With xs3lerator, pass Range through -- xs3lerator handles
                 # full-file download for S3 caching and serves the requested
@@ -2412,7 +2415,7 @@ class Proxy:
                         getattr(flow, "_cache_vary_request", None),
                         normalized_url,
                     )
-                elif 300 <= flow.response.status_code < 400:
+                elif 300 <= flow.response.status_code < 400 and flow.response.status_code != 304:
                     LOG.debug(
                         "Cache save enqueue (redirect metadata only, xs3lerator) key=%s status=%d",
                         cache_key, flow.response.status_code,
