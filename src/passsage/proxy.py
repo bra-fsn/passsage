@@ -37,6 +37,12 @@ from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 from werkzeug.http import parse_date
 
+from passsage.range_utils import (
+    parse_single_range as _parse_single_range_impl,
+    is_unsatisfiable_range as _is_unsatisfiable_range_impl,
+    if_range_matches as _if_range_matches_impl,
+)
+
 from passsage.cache_key import (
     CacheKeyResolver,
     Context as CacheKeyContext,
@@ -476,65 +482,19 @@ def save_response(proxy, flow, data: bytes) -> Union[bytes, Iterable[bytes]]:
 
 def _parse_single_range(header: str, total: int) -> tuple[int, int] | None:
     """Parse a single-range ``Range`` header.  Returns (start, end) inclusive or None."""
-    if not header or not header.startswith("bytes="):
-        return None
-    spec = header[len("bytes="):].strip()
-    if "," in spec:
-        return None  # multi-range — not supported
-    try:
-        if spec.startswith("-"):
-            suffix_len = int(spec[1:])
-            if suffix_len <= 0 or suffix_len > total:
-                return None
-            return total - suffix_len, total - 1
-        parts = spec.split("-", 1)
-        start = int(parts[0])
-        end = int(parts[1]) if parts[1] else total - 1
-        end = min(end, total - 1)
-        if start > end or start >= total:
-            return None
-        return start, end
-    except (ValueError, IndexError):
-        return None
+    return _parse_single_range_impl(header, total)
 
 
 def _is_unsatisfiable_range(header: str, total: int) -> bool:
     """Return True when the Range spec is syntactically valid but wholly outside [0, total)."""
-    if not header or not header.startswith("bytes="):
-        return False
-    spec = header[len("bytes="):].strip()
-    if "," in spec:
-        return False  # multi-range — not an error, just unsupported
-    try:
-        if spec.startswith("-"):
-            suffix_len = int(spec[1:])
-            return suffix_len <= 0 or suffix_len > total
-        parts = spec.split("-", 1)
-        start = int(parts[0])
-        return start >= total
-    except (ValueError, IndexError):
-        return False
+    return _is_unsatisfiable_range_impl(header, total)
 
 
 def _if_range_matches(flow) -> bool:
-    """Evaluate If-Range against cached metadata per RFC 9110 Section 14.5.
-
-    Returns True if the Range should be honored (If-Range matches or is absent).
-    Returns False if the Range should be ignored (serve full 200 instead).
-    """
+    """Evaluate If-Range against cached metadata per RFC 9110 Section 14.5."""
     if_range = flow.request.headers.get("if-range")
-    if not if_range:
-        return True
     meta = flow._cache_head.meta if getattr(flow, "_cache_head", None) else None
-    if not meta:
-        return False
-    if if_range.startswith('"') or if_range.startswith("W/"):
-        if if_range.startswith("W/"):
-            return False  # weak ETags not allowed in If-Range per RFC
-        cached_etag = meta.get("headers", {}).get("etag", "")
-        return if_range == cached_etag
-    cached_lm = meta.get("last_modified") or meta.get("headers", {}).get("last-modified", "")
-    return if_range == cached_lm
+    return _if_range_matches_impl(if_range, meta)
 
 
 def _make_range_stream(proxy, flow, start: int, end: int):
