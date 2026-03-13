@@ -107,6 +107,13 @@ import click
     help="Public proxy URL embedded in mitm.it/proxy-env responses (env: PASSSAGE_PUBLIC_PROXY_URL)"
 )
 @click.option(
+    "--no-proxy-extra",
+    envvar="PASSSAGE_NO_PROXY_EXTRA",
+    default="",
+    show_default=True,
+    help="Extra comma-separated hosts to add to NO_PROXY in mitm.it/proxy-env responses (env: PASSSAGE_NO_PROXY_EXTRA)"
+)
+@click.option(
     "--access-logs",
     is_flag=True,
     default=True,
@@ -304,6 +311,7 @@ def main(
     policy_file,
     allow_policy_header,
     public_proxy_url,
+    no_proxy_extra,
     access_logs,
     access_log_prefix,
     access_log_dir,
@@ -364,6 +372,7 @@ def main(
             policy_file,
             allow_policy_header,
             public_proxy_url,
+            no_proxy_extra,
             access_logs,
             access_log_prefix,
             access_log_dir,
@@ -427,6 +436,7 @@ def run_proxy(
     policy_file,
     allow_policy_header,
     public_proxy_url,
+    no_proxy_extra,
     access_logs,
     access_log_prefix,
     access_log_dir,
@@ -464,6 +474,8 @@ def run_proxy(
         os.environ["PASSSAGE_ALLOW_POLICY_HEADER"] = "1"
     if public_proxy_url:
         os.environ["PASSSAGE_PUBLIC_PROXY_URL"] = public_proxy_url
+    if no_proxy_extra:
+        os.environ["PASSSAGE_NO_PROXY_EXTRA"] = no_proxy_extra
     if access_logs:
         os.environ["PASSSAGE_ACCESS_LOGS"] = "1"
     if access_log_prefix:
