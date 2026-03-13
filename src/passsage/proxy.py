@@ -1,7 +1,3 @@
-# redirects
-# handle upstream authentication
-# collect and expose metrics/stats (with limited number of entries), like top list for misses, hits, etc.
-
 import copy
 import json
 import hashlib
