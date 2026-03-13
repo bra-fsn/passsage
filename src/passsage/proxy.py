@@ -1,11 +1,15 @@
 import copy
+import faulthandler
+import io
 import json
 import hashlib
 import logging
 import os
 import re
+import signal
 import socket
 import ssl
+import sys
 import tempfile
 import traceback
 from functools import wraps
@@ -18,6 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, Union
 from urllib.parse import urlparse
+
+faulthandler.enable(file=sys.stderr)
+faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
 import boto3
 import pytz
@@ -149,17 +156,31 @@ class _HealthHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
-        if self.path != "/health":
+        if self.path == "/health":
+            ok, message = _health_check()
+            body = (message or "ok").encode("utf-8")
+            self.send_response(200 if ok else 503)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/debug/threads":
+            body = _dump_all_threads().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/debug/connections":
+            body = _dump_connections().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
             self.send_response(404)
             self.end_headers()
-            return
-        ok, message = _health_check()
-        body = (message or "ok").encode("utf-8")
-        self.send_response(200 if ok else 503)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
 
 def _health_check() -> tuple[bool, str]:
@@ -169,6 +190,72 @@ def _health_check() -> tuple[bool, str]:
         except Exception as exc:
             return False, f"s3_unhealthy: {exc}"
     return True, "ok"
+
+
+def _dump_all_threads() -> str:
+    """Dump Python tracebacks for all threads."""
+    buf = io.StringIO()
+    buf.write(f"Thread dump at {datetime.now(timezone.utc).isoformat()}\n")
+    buf.write(f"Total threads: {threading.active_count()}\n\n")
+    frames = sys._current_frames()
+    for thread in threading.enumerate():
+        frame = frames.get(thread.ident)
+        buf.write(f"--- Thread {thread.ident} ({thread.name}) daemon={thread.daemon} ---\n")
+        if frame:
+            for line in traceback.format_stack(frame):
+                buf.write(line)
+        else:
+            buf.write("  (no frame)\n")
+        buf.write("\n")
+    return buf.getvalue()
+
+
+_TCP_STATES = {
+    "01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2", "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT",
+    "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING",
+}
+
+
+def _dump_connections() -> str:
+    """Dump TCP connection info from /proc/net/tcp."""
+    buf = io.StringIO()
+    buf.write(f"TCP connections at {datetime.now(timezone.utc).isoformat()}\n\n")
+    try:
+        lines = Path("/proc/net/tcp").read_text().splitlines()[1:]
+    except Exception as exc:
+        buf.write(f"Error reading /proc/net/tcp: {exc}\n")
+        return buf.getvalue()
+
+    state_counts: dict[str, int] = {}
+    connections: list[str] = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local_hex, local_port_hex = parts[1].split(":")
+        remote_hex, remote_port_hex = parts[2].split(":")
+        st = parts[3]
+        state_name = _TCP_STATES.get(st, f"UNKNOWN({st})")
+        state_counts[state_name] = state_counts.get(state_name, 0) + 1
+
+        def _hex_to_ip(h: str) -> str:
+            b = bytes.fromhex(h)
+            return f"{b[3]}.{b[2]}.{b[1]}.{b[0]}"
+
+        lip = _hex_to_ip(local_hex)
+        lp = int(local_port_hex, 16)
+        rip = _hex_to_ip(remote_hex)
+        rp = int(remote_port_hex, 16)
+        connections.append(f"  {lip}:{lp} -> {rip}:{rp}  {state_name}")
+
+    buf.write("State summary:\n")
+    for k, v in sorted(state_counts.items(), key=lambda x: -x[1]):
+        buf.write(f"  {k}: {v}\n")
+    buf.write(f"\nAll connections ({len(connections)}):\n")
+    for c in connections:
+        buf.write(c + "\n")
+    return buf.getvalue()
 
 
 def _start_health_server() -> None:
