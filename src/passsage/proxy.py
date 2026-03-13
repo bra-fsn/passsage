@@ -516,6 +516,27 @@ def _is_unsatisfiable_range(header: str, total: int) -> bool:
         return False
 
 
+def _if_range_matches(flow) -> bool:
+    """Evaluate If-Range against cached metadata per RFC 9110 Section 14.5.
+
+    Returns True if the Range should be honored (If-Range matches or is absent).
+    Returns False if the Range should be ignored (serve full 200 instead).
+    """
+    if_range = flow.request.headers.get("if-range")
+    if not if_range:
+        return True
+    meta = flow._cache_head.meta if getattr(flow, "_cache_head", None) else None
+    if not meta:
+        return False
+    if if_range.startswith('"') or if_range.startswith("W/"):
+        if if_range.startswith("W/"):
+            return False  # weak ETags not allowed in If-Range per RFC
+        cached_etag = meta.get("headers", {}).get("etag", "")
+        return if_range == cached_etag
+    cached_lm = meta.get("last_modified") or meta.get("headers", {}).get("last-modified", "")
+    return if_range == cached_lm
+
+
 def _make_range_stream(proxy, flow, start: int, end: int):
     """Return a stream function that saves the full body but serves only [start, end] to the client."""
     pos = [0]
@@ -1292,6 +1313,7 @@ def _rewrite_to_xs3lerator(flow, cache_skip: bool):
     flow._object_store_rewrite = True
     flow._cached = not cache_skip
     flow._save_response = cache_skip
+    flow.request.headers.pop("If-Range", None)
 
 
 def _rewrite_to_xs3lerator_miss(flow):
@@ -1919,6 +1941,14 @@ class Proxy:
                 LOG.debug("Cache hit: redirect %d -> synthetic response", int(cached_status))
                 return
 
+            if (flow.request.method == "GET"
+                    and "Range" in flow.request.headers
+                    and flow.request.headers.get("if-range")):
+                if not _if_range_matches(flow):
+                    flow.request.headers.pop("Range", None)
+                    flow.request.headers.pop("If-Range", None)
+                    LOG.debug("If-Range mismatch on cache hit, stripped Range to serve full response")
+
             if policy == NoRefresh:
                 flow._serve_reason = "cache_hit_norefresh"
                 LOG.debug("Cache hit: NoRefresh -> rewrite to object store")
@@ -1977,17 +2007,22 @@ class Proxy:
                     and flow.request.headers.get("if-none-match")):
                 flow._orig_data["if-none-match"] = flow.request.headers.pop("if-none-match", None)
             if xs3lerator_enabled and flow.request.method == "GET":
-                # With xs3lerator, pass Range through -- xs3lerator handles
-                # full-file download for S3 caching and serves the requested
-                # range to the client.
-                pass
+                if ("Range" in flow.request.headers
+                        and flow.request.headers.get("if-range")):
+                    flow.request.headers.pop("Range", None)
+                    flow.request.headers.pop("If-Range", None)
+                    LOG.debug("If-Range on cache miss (xs3lerator): no validators to compare, serving full response")
+                else:
+                    flow.request.headers.pop("If-Range", None)
             elif flow.request.method == "GET" and "Range" in flow.request.headers:
-                # Strip Range on cache miss so upstream returns the full 200.
-                # We cache the full object and serve the requested range slice
-                # to the client in responseheaders.
-                flow._orig_range = flow.request.headers.pop("Range")
-                flow._range_stripped = True
-                LOG.debug("Stripped Range header on cache miss: %s", flow._orig_range)
+                if flow.request.headers.get("if-range"):
+                    flow.request.headers.pop("Range", None)
+                    flow.request.headers.pop("If-Range", None)
+                    LOG.debug("If-Range on cache miss (direct): no validators to compare, serving full response")
+                else:
+                    flow._orig_range = flow.request.headers.pop("Range")
+                    flow._range_stripped = True
+                    LOG.debug("Stripped Range header on cache miss: %s", flow._orig_range)
 
         upstream_failed = False
         flow._upstream_error = None
