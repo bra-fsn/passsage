@@ -55,10 +55,49 @@ def _tracemalloc_snapshot_text(top_n: int = 30) -> str:
     return buf.getvalue()
 
 
+def _memory_profile_text() -> str:
+    """Lightweight memory profile: RSS, gc object type counts, tracemalloc summary."""
+    import gc
+    import resource
+    buf = io.StringIO()
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    buf.write(f"Peak RSS: {rss_kb / 1024:.0f} MiB\n")
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS", "RssAnon", "VmData")):
+                    buf.write(f"  {line.strip()}\n")
+    except OSError:
+        pass
+    buf.write("\n")
+    if _tracemalloc.is_tracing():
+        current, peak = _tracemalloc.get_traced_memory()
+        buf.write(f"tracemalloc: current={current / 1024 / 1024:.1f} MiB, peak={peak / 1024 / 1024:.1f} MiB\n\n")
+    type_counts: dict[str, list[int]] = {}
+    for obj in gc.get_objects():
+        tp = type(obj).__name__
+        sz = sys.getsizeof(obj, 0)
+        entry = type_counts.get(tp)
+        if entry:
+            entry[0] += 1
+            entry[1] += sz
+        else:
+            type_counts[tp] = [1, sz]
+    sorted_by_size = sorted(type_counts.items(), key=lambda x: -x[1][1])
+    buf.write("Top 30 types by total shallow size:\n")
+    for tp, (count, total_sz) in sorted_by_size[:30]:
+        buf.write(f"  {tp:40s} count={count:>10,}  size={total_sz / 1024 / 1024:>10.1f} MiB\n")
+    buf.write(f"\nTop 30 types by count:\n")
+    sorted_by_count = sorted(type_counts.items(), key=lambda x: -x[1][0])
+    for tp, (count, total_sz) in sorted_by_count[:30]:
+        buf.write(f"  {tp:40s} count={count:>10,}  size={total_sz / 1024 / 1024:>10.1f} MiB\n")
+    return buf.getvalue()
+
+
 def _sigusr2_handler(signum, frame):
-    text = _tracemalloc_snapshot_text()
+    text = _memory_profile_text()
     sys.stderr.write(f"\n{'='*60}\n")
-    sys.stderr.write(f"SIGUSR2 tracemalloc dump\n")
+    sys.stderr.write(f"SIGUSR2 memory profile\n")
     sys.stderr.write(f"{'='*60}\n")
     sys.stderr.write(text)
     sys.stderr.write(f"{'='*60}\n\n")
@@ -226,7 +265,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == "/debug/memory" or self.path.startswith("/debug/memory?"):
-            body = _tracemalloc_snapshot_text().encode("utf-8")
+            if "tracemalloc" in self.path:
+                body = _tracemalloc_snapshot_text().encode("utf-8")
+            else:
+                body = _memory_profile_text().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
