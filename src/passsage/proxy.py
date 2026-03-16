@@ -26,6 +26,47 @@ from urllib.parse import urlparse
 faulthandler.enable(file=sys.stderr)
 faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
+import tracemalloc as _tracemalloc
+
+_TRACEMALLOC_ACTIVE = _tracemalloc.is_tracing()
+
+
+def _tracemalloc_snapshot_text(top_n: int = 30) -> str:
+    """Return a human-readable tracemalloc snapshot, or a status message if not tracing."""
+    if not _tracemalloc.is_tracing():
+        return "tracemalloc is not active. Set PYTHONTRACEMALLOC=<nframes> to enable.\n"
+    snap = _tracemalloc.take_snapshot()
+    snap = snap.filter_traces([
+        _tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+        _tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
+        _tracemalloc.Filter(False, "<unknown>"),
+    ])
+    buf = io.StringIO()
+    current, peak = _tracemalloc.get_traced_memory()
+    buf.write(f"tracemalloc: current={current / 1024 / 1024:.1f} MiB, peak={peak / 1024 / 1024:.1f} MiB\n\n")
+    stats = snap.statistics("lineno")
+    buf.write(f"Top {top_n} allocations by line:\n")
+    for i, stat in enumerate(stats[:top_n], 1):
+        buf.write(f"  #{i}: {stat}\n")
+    buf.write(f"\nTop {top_n} allocations by file:\n")
+    stats_file = snap.statistics("filename")
+    for i, stat in enumerate(stats_file[:top_n], 1):
+        buf.write(f"  #{i}: {stat}\n")
+    return buf.getvalue()
+
+
+def _sigusr2_handler(signum, frame):
+    text = _tracemalloc_snapshot_text()
+    sys.stderr.write(f"\n{'='*60}\n")
+    sys.stderr.write(f"SIGUSR2 tracemalloc dump\n")
+    sys.stderr.write(f"{'='*60}\n")
+    sys.stderr.write(text)
+    sys.stderr.write(f"{'='*60}\n\n")
+    sys.stderr.flush()
+
+
+signal.signal(signal.SIGUSR2, _sigusr2_handler)
+
 import boto3
 import pytz
 import requests
@@ -179,6 +220,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/debug/connections":
             body = _dump_connections().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/debug/memory" or self.path.startswith("/debug/memory?"):
+            body = _tracemalloc_snapshot_text().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
