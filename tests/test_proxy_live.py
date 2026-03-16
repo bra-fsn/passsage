@@ -720,6 +720,93 @@ class TestProxyLive:
         stats = test_server.stats()
         assert get_method_count(stats, "/encoding/gzip", "GET") == 1
 
+    def test_cached_gzip_content_length_matches_body(self, proxy_session, test_server, cache_bust_random):
+        """Cached gzip responses must advertise a content-length that matches the actual
+        body bytes delivered. A mismatch causes HTTP/2 PROTOCOL_ERROR in strict clients
+        like uv/hyper (regression test for the apply_cached_metadata framing bug)."""
+        test_server.reset()
+        url = test_server.url(f"/encoding/gzip?random={cache_bust_random}&cltest=1")
+        headers = {"Accept-Encoding": "gzip"}
+        r1 = proxy_get(proxy_session, url, headers=headers, timeout=30)
+        assert r1.ok
+        time.sleep(SYNC_SETTLE_SECONDS)
+        r2 = get_cached_without_upstream(
+            proxy_session,
+            url,
+            test_server,
+            "/encoding/gzip",
+            headers=headers,
+        )
+        assert r2.ok
+        assert_cached_response(r2)
+        raw_content = r2.content
+        cl_header = r2.headers.get("Content-Length")
+        if cl_header is not None:
+            assert int(cl_header) == len(raw_content), (
+                f"content-length header ({cl_header}) does not match actual body "
+                f"size ({len(raw_content)}); apply_cached_metadata may have "
+                f"overwritten framing headers with stale cached values"
+            )
+
+    def test_cached_gzip_large_content_length_matches_body(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """Large gzip responses amplify the content-length mismatch: the compressed
+        size is a few KiB while the uncompressed body is ~100 KiB. If
+        apply_cached_metadata overwrites content-length with the cached (compressed)
+        value, the H2 frame will carry far fewer bytes than the body, triggering
+        PROTOCOL_ERROR."""
+        test_server.reset()
+        url = test_server.url(f"/encoding/gzip-large?random={cache_bust_random}")
+        headers = {"Accept-Encoding": "gzip"}
+        r1 = proxy_get(proxy_session, url, headers=headers, timeout=30)
+        assert r1.ok
+        time.sleep(SYNC_SETTLE_SECONDS)
+        r2 = get_cached_without_upstream(
+            proxy_session,
+            url,
+            test_server,
+            "/encoding/gzip-large",
+            headers=headers,
+        )
+        assert r2.ok
+        assert_cached_response(r2)
+        raw_content = r2.content
+        cl_header = r2.headers.get("Content-Length")
+        if cl_header is not None:
+            assert int(cl_header) == len(raw_content), (
+                f"content-length header ({cl_header}) does not match actual body "
+                f"size ({len(raw_content)}) for large gzip response"
+            )
+
+    def test_cached_plain_content_length_matches_body(
+        self, proxy_session, test_server, cache_bust_random
+    ):
+        """Non-encoded (plain) cached responses must also have a matching
+        content-length. This is a sanity check that the framing-header
+        preservation logic does not regress plain responses."""
+        test_server.reset()
+        url = test_server.url(f"/policy/Standard?random={cache_bust_random}&framing=plain")
+        r1 = proxy_get(proxy_session, url, headers=policy_headers("Standard"), timeout=30)
+        assert r1.ok
+        time.sleep(SYNC_SETTLE_SECONDS)
+        r2 = get_cached_without_upstream(
+            proxy_session,
+            url,
+            test_server,
+            "/policy/Standard",
+            headers=policy_headers("Standard"),
+        )
+        assert r2.ok
+        assert_cached_response(r2)
+        raw_content = r2.content
+        cl_header = r2.headers.get("Content-Length")
+        if cl_header is not None:
+            assert int(cl_header) == len(raw_content), (
+                f"content-length header ({cl_header}) does not match actual body "
+                f"size ({len(raw_content)}) for plain cached response"
+            )
+
     def test_refresh_pattern_override(self, proxy_session, test_server, cache_bust_random):
         # Ensures refresh_pattern overrides response headers for caching decisions.
         if not os.environ.get("PASSSAGE_REFRESH_PATTERN"):

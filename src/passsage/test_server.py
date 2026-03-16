@@ -116,6 +116,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond_vary_accept_encoding(send_body)
             return
 
+        if path.startswith("/encoding/gzip-large"):
+            self._respond_gzip_large(send_body)
+            return
+
         if path.startswith("/encoding/gzip"):
             self._respond_gzip_json(send_body)
             return
@@ -291,6 +295,31 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Vary", "Accept-Encoding")
         self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def _respond_gzip_large(self, send_body: bool) -> None:
+        """Serve a large, highly compressible body with Content-Encoding: gzip.
+
+        The uncompressed body is ~100 KiB of repeated text; gzip compresses it
+        to a few KiB.  This amplifies the content-length mismatch that occurs
+        when cached metadata overwrites framing headers with the compressed size.
+        """
+        etag = "\"encoding-gzip-large\""
+        last_modified = _httpdate(self.server.state.last_modified)
+        if self._check_conditional(etag, last_modified, send_body):
+            return
+        payload = (b"The quick brown fox jumps over the lazy dog. " * 2500)
+        body = gzip.compress(payload)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("ETag", etag)
         self.end_headers()
         if send_body:
             self.wfile.write(body)
