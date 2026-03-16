@@ -2352,16 +2352,17 @@ class Proxy:
             LOG.debug("Cache response: serving from cache")
             flow.response.headers["cache-status"] = f"{SERVER_NAME};hit;detail=object-store"
             is_partial = flow.response.status_code == 206
-            saved_range_headers = {}
-            if is_partial:
-                for h in ("content-length", "content-range"):
-                    if h in flow.response.headers:
-                        saved_range_headers[h] = flow.response.headers[h]
+            saved_framing_headers = {}
+            for h in ("content-length", "content-range", "content-encoding", "transfer-encoding"):
+                if h in flow.response.headers:
+                    saved_framing_headers[h] = flow.response.headers[h]
             apply_cached_metadata(flow)
+            for h, v in saved_framing_headers.items():
+                flow.response.headers[h] = v
             if is_partial:
-                for h, v in saved_range_headers.items():
-                    flow.response.headers[h] = v
                 flow.response.status_code = 206
+            elif "content-length" not in saved_framing_headers:
+                flow.response.headers.pop("content-length", None)
             meta = flow._cache_head.meta if flow._cache_head else {}
             if (stored_dt := cache_stored_at(meta)):
                 stored_dt = stored_dt.astimezone(pytz.utc)
