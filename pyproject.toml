@@ -36,7 +36,7 @@ dependencies = [
     "click>=8.0",
     "elasticsearch9",
     "flask>=2.0",
-    "mitmproxy @ https://github.com/bra-fsn/mitmproxy/archive/refs/heads/h2_backpressure.tar.gz",
+    "mitmproxy @ https://github.com/bra-fsn/mitmproxy/archive/9de857e.tar.gz",
     "pyarrow",
     "pytz>=2023.0",
     "requests>=2.28",
