@@ -380,25 +380,30 @@ def _start_health_server() -> None:
     ctx._health_thread = thread
 
 
-def get_s3_client(tls=threading.local()):
-    """
-    Always return the same S3 client to the same thread.
+def _create_s3_client():
+    logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
+    kwargs = {"region_name": S3_REGION}
+    if _S3_ENDPOINT:
+        kwargs["endpoint_url"] = _S3_ENDPOINT
+        kwargs["config"] = BotoConfig(s3={"addressing_style": "path"})
+    else:
+        kwargs["config"] = BotoConfig(signature_version="s3v4")
+    return boto3.session.Session().client("s3", **kwargs)
 
-    This is to utilize urllib's HTTP connection pooling instead of creating a
-    new pool for each thread.
-    """
-    try:
-        return tls.s3
-    except AttributeError:
-        logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
-        kwargs = {"region_name": S3_REGION}
-        if _S3_ENDPOINT:
-            kwargs["endpoint_url"] = _S3_ENDPOINT
-            kwargs["config"] = BotoConfig(s3={"addressing_style": "path"})
-        else:
-            kwargs["config"] = BotoConfig(signature_version="s3v4")
-        tls.s3 = boto3.session.Session().client("s3", **kwargs)
-        return tls.s3
+
+_s3_client = None
+_s3_client_lock = threading.Lock()
+
+
+def get_s3_client():
+    """Return a process-wide shared S3 client (boto3 clients are thread-safe)."""
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+    with _s3_client_lock:
+        if _s3_client is None:
+            _s3_client = _create_s3_client()
+        return _s3_client
 
 
 @dataclass
