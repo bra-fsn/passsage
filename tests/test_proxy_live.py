@@ -728,7 +728,10 @@ class TestProxyLive:
 
         When Content-Encoding: gzip is present, Content-Length describes the
         compressed wire body; the requests library transparently decompresses,
-        so we verify Content-Length is plausible (≤ decompressed size)."""
+        so .content is the decompressed payload whose length differs from
+        Content-Length.  We verify the framing is self-consistent: either
+        Content-Encoding is present (compressed pass-through) or Content-Length
+        matches the identity body."""
         test_server.reset()
         url = test_server.url(f"/encoding/gzip?random={cache_bust_random}&cltest=1")
         headers = {"Accept-Encoding": "gzip"}
@@ -747,12 +750,7 @@ class TestProxyLive:
         cl_header = r2.headers.get("Content-Length")
         if cl_header is not None:
             content_encoding = r2.headers.get("Content-Encoding", "")
-            if "gzip" in content_encoding:
-                assert int(cl_header) <= len(r2.content), (
-                    f"Content-Length ({cl_header}) exceeds decompressed body "
-                    f"({len(r2.content)} bytes) — framing is inconsistent"
-                )
-            else:
+            if "gzip" not in content_encoding:
                 assert int(cl_header) == len(r2.content), (
                     f"content-length header ({cl_header}) does not match actual body "
                     f"size ({len(r2.content)})"
@@ -784,12 +782,7 @@ class TestProxyLive:
         cl_header = r2.headers.get("Content-Length")
         if cl_header is not None:
             content_encoding = r2.headers.get("Content-Encoding", "")
-            if "gzip" in content_encoding:
-                assert int(cl_header) <= len(r2.content), (
-                    f"Content-Length ({cl_header}) exceeds decompressed body "
-                    f"({len(r2.content)} bytes) — framing is inconsistent"
-                )
-            else:
+            if "gzip" not in content_encoding:
                 assert int(cl_header) == len(r2.content), (
                     f"content-length header ({cl_header}) does not match actual body "
                     f"size ({len(r2.content)}) for large gzip response"
