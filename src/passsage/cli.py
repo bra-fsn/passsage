@@ -538,6 +538,11 @@ def run_proxy(
         args.extend(["--set", f"public_proxy_url={public_proxy_url}"])
 
     args.extend(["--set", f"connection_strategy={connection_strategy}"])
+    # mitmproxy buffers entire response bodies in memory by default. Passsage already
+    # sets flow.response.stream in responseheaders for all responses, but this acts as
+    # a safety net: if the hook ever fails before setting .stream, mitmproxy will still
+    # stream rather than buffer gigabytes of data and OOM.
+    args.extend(["--set", "stream_large_bodies=0"])
     os.environ["PASSSAGE_ELASTICSEARCH_URL"] = elasticsearch_url
     os.environ["PASSSAGE_ELASTICSEARCH_META_INDEX"] = elasticsearch_meta_index
     os.environ["PASSSAGE_ELASTICSEARCH_REPLICAS"] = str(elasticsearch_replicas)
