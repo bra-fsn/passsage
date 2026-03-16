@@ -94,14 +94,24 @@ def _memory_profile_text() -> str:
     return buf.getvalue()
 
 
-def _sigusr2_handler(signum, frame):
+def _dump_tracemalloc_background():
+    """Run the expensive tracemalloc snapshot in a daemon thread to avoid blocking."""
     text = _memory_profile_text()
     sys.stderr.write(f"\n{'='*60}\n")
-    sys.stderr.write(f"SIGUSR2 memory profile\n")
+    sys.stderr.write(f"SIGUSR2 memory profile (gc objects)\n")
     sys.stderr.write(f"{'='*60}\n")
     sys.stderr.write(text)
+    if _tracemalloc.is_tracing():
+        sys.stderr.write(f"\n--- tracemalloc snapshot (may take a while) ---\n")
+        sys.stderr.flush()
+        tm_text = _tracemalloc_snapshot_text(top_n=50)
+        sys.stderr.write(tm_text)
     sys.stderr.write(f"{'='*60}\n\n")
     sys.stderr.flush()
+
+
+def _sigusr2_handler(signum, frame):
+    threading.Thread(target=_dump_tracemalloc_background, daemon=True).start()
 
 
 signal.signal(signal.SIGUSR2, _sigusr2_handler)
