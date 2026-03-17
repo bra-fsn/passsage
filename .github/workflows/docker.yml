@@ -118,11 +118,10 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest,enable=${{ github.event_name == 'push' }}
-            type=sha,format=long,enable=${{ github.event_name == 'push' }}
+            type=sha,prefix=,format=short,enable=${{ github.event_name == 'push' }}
             type=ref,event=pr
             type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
-            type=sha,format=short
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
