@@ -1,4 +1,3 @@
-import copy
 import faulthandler
 import io
 import json
@@ -120,7 +119,6 @@ import boto3
 import pytz
 import requests
 from requests.exceptions import ConnectionError as RequestsConnectionError
-from cachetools import TTLCache
 from mitmproxy import ctx, http
 from mitmproxy.script import concurrent
 from botocore.config import Config as BotoConfig
@@ -1500,43 +1498,6 @@ def _fallback_fetch_from_object_store(flow) -> bool:
         LOG.warning("xs3lerator fallback failed for key=%s: %s", cache_key, exc)
         return False
 
-
-
-def release_banned():
-    # first called from __init__, when we may not yet have the option
-    if not hasattr(ctx.options, "test"):
-        time.sleep(5)
-        ctx._executor.submit(release_banned)
-        return
-
-    if ctx.options.test:
-        # don't release banned sites in test mode
-        return
-
-    with ctx._lock:
-        banned = copy.deepcopy(ctx._banned)
-
-    for (host, port, scheme) in banned:
-        # this might take a while to loop through, so first check if it's
-        # still there
-        with ctx._lock:
-            if (host, port, scheme) not in ctx._banned:
-                continue
-
-        try:
-            requests.head(f"{scheme}://{host}:{port}/", timeout=8)
-        except Exception as e:
-            print(e)
-        else:
-            with ctx._lock:
-                if (host, port, scheme) in ctx._banned:
-                    LOG.info("REMOVE BAN for %s", (scheme, host, port))
-                    del ctx._banned[(host, port, scheme)]
-
-    time.sleep(60)
-    ctx._executor.submit(release_banned)
-
-
 class Proxy:
     def __init__(self):
         self.files = {}
@@ -1546,18 +1507,10 @@ class Proxy:
             # don't (re)create these on code reloads
             ctx._lock = threading.Lock()
             ctx._executor = ThreadPoolExecutor()
-            ctx._banned = TTLCache(maxsize=2048, ttl=600)
-            ctx._executor.submit(release_banned)
             _start_health_server()
 
     @_log_hook_errors("load")
     def load(self, loader):
-        loader.add_option(
-            name="test",
-            typespec=bool,
-            default=False,
-            help="Run in test mode, where banned sites are not removed",
-        )
         loader.add_option(
             name="default_policy",
             typespec=str,
@@ -2095,65 +2048,46 @@ class Proxy:
 
         upstream_failed = False
         flow._upstream_error = None
-        with ctx._lock:
-            key = (flow.request.host, flow.request.port, flow.request.scheme)
-            if key in ctx._banned:
-                if flow.request.headers.get("x-clear-ban"):
-                    # for testing
-                    del ctx._banned[key]
-                else:
-                    upstream_failed = True
-                    flow._upstream_error = ctx._banned.get(key)
 
-        if not upstream_failed:
-            upstream_hdrs = {}
-            for k, v in flow.request.headers.items():
-                if (k.lower().startswith("x-echo-")
-                        or k.lower() in ("x-sleep", "x-status-code")):
-                    upstream_hdrs[k] = v
-            if cache_hit and policy in (Standard, StaleIfError):
-                cm = flow._cache_head.meta
-                if (etag := cm.get("headers", {}).get("etag")):
-                    upstream_hdrs["If-None-Match"] = etag
-                if (lastmod := cm.get("last_modified")):
-                    upstream_hdrs["If-Modified-Since"] = lastmod
-            try:
-                timeout = getattr(ctx.options, "upstream_head_timeout", UPSTREAM_TIMEOUT)
-                start = time.perf_counter()
-                flow._upstream_head = requests.head(
-                    flow.request.url,
-                    timeout=timeout,
-                    headers=upstream_hdrs,
-                )
-                flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
-            except Exception as e:
-                flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
-                upstream_failed = True
-                flow._upstream_error = e
-                _log_exception(
-                    e,
-                    flow=flow,
-                    context={"hook": "requestheaders", "stage": "upstream_head"},
-                    error_type="upstream_head_error",
-                )
-                # put this server/host onto the ban list, so we don't have to
-                # wait for the timeout to happen in subsequent requests
-                with ctx._lock:
-                    ctx._banned[
-                        (flow.request.host,
-                         flow.request.port,
-                         flow.request.scheme)] = e
+        upstream_hdrs = {}
+        for k, v in flow.request.headers.items():
+            if (k.lower().startswith("x-echo-")
+                    or k.lower() in ("x-sleep", "x-status-code")):
+                upstream_hdrs[k] = v
+        if cache_hit and policy in (Standard, StaleIfError):
+            cm = flow._cache_head.meta
+            if (etag := cm.get("headers", {}).get("etag")):
+                upstream_hdrs["If-None-Match"] = etag
+            if (lastmod := cm.get("last_modified")):
+                upstream_hdrs["If-Modified-Since"] = lastmod
+        try:
+            timeout = getattr(ctx.options, "upstream_head_timeout", UPSTREAM_TIMEOUT)
+            start = time.perf_counter()
+            flow._upstream_head = requests.head(
+                flow.request.url,
+                timeout=timeout,
+                headers=upstream_hdrs,
+            )
+            flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
+        except Exception as e:
+            flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
+            upstream_failed = True
+            flow._upstream_error = e
+            _log_exception(
+                e,
+                flow=flow,
+                context={"hook": "requestheaders", "stage": "upstream_head"},
+                error_type="upstream_head_error",
+            )
 
-            # First, we check for StaleIfError and handle 404 status code
-            # Return cached on upstream 404 and StaleIfError policy or stale-if-error directive.
-            if (not upstream_failed and cache_hit
-                    and flow._upstream_head.status_code == 404
-                    and (policy == StaleIfError or allow_stale_if_error)):
-                flow._serve_reason = "stale_if_error_upstream_404"
-                _rewrite_to_object_store(flow)
-                return
+        if (not upstream_failed and cache_hit
+                and flow._upstream_head.status_code == 404
+                and (policy == StaleIfError or allow_stale_if_error)):
+            flow._serve_reason = "stale_if_error_upstream_404"
+            _rewrite_to_object_store(flow)
+            return
 
-        # On upstream errors or if it's banned, StaleIfError may serve cached content.
+        # On upstream errors, StaleIfError may serve cached content.
         if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
             if cache_hit and (policy == StaleIfError or allow_stale_if_error):
                 flow._serve_reason = "stale_if_error_upstream_failed"
@@ -2161,7 +2095,7 @@ class Proxy:
                 _rewrite_to_object_store(flow)
                 return
 
-        # If upstream didn't respond (or banned) and we have a cache miss,
+        # If upstream didn't respond and we have a cache miss,
         # return a 504 HTTP error
         if upstream_failed:
             flow._serve_reason = "upstream_failed"

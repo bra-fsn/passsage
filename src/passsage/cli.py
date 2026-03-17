@@ -38,14 +38,6 @@ import click
     help="S3 endpoint URL for S3-compatible services (env: S3_ENDPOINT_URL)"
 )
 @click.option(
-    "--test",
-    is_flag=True,
-    default=False,
-    envvar="PASSSAGE_TEST",
-    show_default=True,
-    help="Run in test mode (banned sites are not released) (env: PASSSAGE_TEST)"
-)
-@click.option(
     "-m", "--mode",
     type=click.Choice(["regular", "transparent", "wireguard", "upstream"]),
     default="regular",
@@ -302,7 +294,6 @@ def main(
     bind,
     s3_bucket,
     s3_endpoint,
-    test,
     mode,
     verbose,
     debug,
@@ -363,7 +354,6 @@ def main(
             bind,
             s3_bucket,
             s3_endpoint,
-            test,
             mode,
             verbose,
             debug,
@@ -427,7 +417,6 @@ def run_proxy(
     bind,
     s3_bucket,
     s3_endpoint,
-    test,
     mode,
     verbose,
     debug,
@@ -524,9 +513,6 @@ def run_proxy(
         "--listen-host", bind,
         "--listen-port", str(port),
     ]
-
-    if test:
-        args.extend(["--set", "test=true"])
 
     if mode != "regular":
         args.extend(["--mode", mode])

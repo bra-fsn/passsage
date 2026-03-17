@@ -99,10 +99,7 @@ def proxy_session(mitmproxy_ca_cert_path):
 
 
 def proxy_get(session: requests.Session, url: str, *, headers: dict | None = None, **kwargs) -> requests.Response:
-    merged = {"x-clear-ban": "1"}
-    if headers:
-        merged.update(headers)
-    return session.get(url, headers=merged, **kwargs)
+    return session.get(url, headers=headers or {}, **kwargs)
 
 
 def wait_for_cached_response(

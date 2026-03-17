@@ -282,7 +282,6 @@ Options:
   -b, --bind TEXT                 Address to bind to (env: PASSSAGE_HOST, default: 0.0.0.0)
   --s3-bucket TEXT                S3 bucket for cache storage
   --s3-endpoint TEXT              S3 endpoint URL for S3-compatible services
-  --test                          Run in test mode
   -m, --mode [regular|transparent|wireguard|upstream]
                                   Proxy mode (default: regular)
   -v, --verbose                   Enable verbose logging

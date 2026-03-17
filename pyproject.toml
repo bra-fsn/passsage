@@ -32,7 +32,6 @@ classifiers = [
 ]
 dependencies = [
     "boto3>=1.26",
-    "cachetools>=5.0",
     "click>=8.0",
     "elasticsearch9",
     "flask>=2.0",
