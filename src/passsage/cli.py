@@ -543,6 +543,8 @@ def run_proxy(
     # a safety net: if the hook ever fails before setting .stream, mitmproxy will still
     # stream rather than buffer gigabytes of data and OOM.
     args.extend(["--set", "stream_large_bodies=0"])
+    # mitmproxy's HTTP/2 implementation is not yet production-ready. It leaks buffers and seems to have framing issues
+    # (or at least that's the case with our xs3lerator implementation).
     args.extend(["--set", "http2=false"])
     os.environ["PASSSAGE_ELASTICSEARCH_URL"] = elasticsearch_url
     os.environ["PASSSAGE_ELASTICSEARCH_META_INDEX"] = elasticsearch_meta_index
