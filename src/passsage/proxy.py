@@ -199,7 +199,6 @@ else:
     S3_URL = f"{S3_SCHEME}://{S3_HOST}"
     S3_PATH_STYLE = False
 CACHE_TIMEOUT = 10
-UPSTREAM_TIMEOUT = 10
 
 _TRUTHY = ("1", "true", "yes")
 _FALSY = ("0", "false", "no")
@@ -880,13 +879,6 @@ def request_requires_revalidation(request_headers: dict[str, str], freshness: Ca
     return False
 
 
-def _normalize_etag(value: str | None) -> str | None:
-    if value is None:
-        return None
-    value = value.strip()
-    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
-        return value[1:-1]
-    return value
 
 
 def apply_cached_metadata(flow: http.HTTPFlow) -> None:
@@ -1152,9 +1144,7 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
     if content_length is None and response and response.content is not None:
         content_length = len(response.content)
     cache_head = getattr(flow, "_cache_head", None)
-    upstream_head = getattr(flow, "_upstream_head", None)
     upstream_error = getattr(flow, "_upstream_error", None)
-    upstream_head_time = getattr(flow, "_upstream_head_time_ms", None)
     return {
         "timestamp": start_dt,
         "request_id": getattr(flow, "id", None),
@@ -1184,9 +1174,7 @@ def _build_access_log_record(flow, error: str | None = None) -> dict:
         "stale_while_revalidate": getattr(flow, "_allow_stale_while_revalidate", None),
         "stale_if_error": getattr(flow, "_allow_stale_if_error", None),
         "forced_swr": getattr(flow, "_forced_swr", False),
-        "upstream_head_status": upstream_head.status_code if upstream_head else None,
         "upstream_error": str(upstream_error) if upstream_error else None,
-        "upstream_head_time_ms": upstream_head_time,
         "cache_head_status": cache_head.status_code if cache_head else None,
         "cache_head_etag": cache_head.meta.get("headers", {}).get("etag") if cache_head else None,
         "cache_head_last_modified": cache_head.meta.get("last_modified") if cache_head else None,
@@ -1239,7 +1227,6 @@ def _build_error_log_record(
         else {}
     )
     cache_head = getattr(flow, "_cache_head", None) if flow else None
-    upstream_head = getattr(flow, "_upstream_head", None) if flow else None
     upstream_error = getattr(flow, "_upstream_error", None) if flow else None
     policy = getattr(flow, "_policy", None) if flow else None
     return {
@@ -1264,7 +1251,6 @@ def _build_error_log_record(
         "cache_vary": getattr(flow, "_cache_vary", None) if flow else None,
         "serve_reason": getattr(flow, "_serve_reason", None) if flow else None,
         "cache_head_status": cache_head.status_code if cache_head else None,
-        "upstream_head_status": upstream_head.status_code if upstream_head else None,
         "upstream_error": str(upstream_error) if upstream_error else None,
         "error_type": error_type,
         "error_message": error_message,
@@ -1408,7 +1394,9 @@ def _rewrite_to_xs3lerator_revalidate(flow):
     etag = cm.get("headers", {}).get("etag")
     if etag:
         flow.request.headers["X-Xs3lerator-If-None-Match"] = etag
-    last_modified = cm.get("last_modified")
+    last_modified = (cm.get("headers") or {}).get("last-modified")
+    if not last_modified:
+        last_modified = cm.get("last_modified")
     if last_modified:
         flow.request.headers["X-Xs3lerator-If-Modified-Since"] = last_modified
 
@@ -1516,12 +1504,6 @@ class Proxy:
             typespec=str,
             default="Standard",
             help="Default policy when no rule matches (e.g. Standard, StaleIfError)",
-        )
-        loader.add_option(
-            name="upstream_head_timeout",
-            typespec=float,
-            default=UPSTREAM_TIMEOUT,
-            help="Timeout (seconds) for upstream HEAD requests",
         )
         loader.add_option(
             name="refresh_pattern",
@@ -1670,8 +1652,7 @@ class Proxy:
     @concurrent
     @_log_hook_errors("requestheaders")
     def requestheaders(self, flow: http.HTTPFlow) -> None:
-        # these two may hold object HTTP HEAD responses for upstream/cached version
-        flow._upstream_head = flow._cache_head = None
+        flow._cache_head = None
         flow._orig_data = {}
         flow._access_log_start = time.time()
         # we mark this flow as cached only if it returns data from the cache
@@ -2014,12 +1995,18 @@ class Proxy:
                 cm = flow._cache_head.meta
                 has_validators = (
                     cm.get("headers", {}).get("etag")
+                    or (cm.get("headers") or {}).get("last-modified")
                     or cm.get("last_modified")
                 )
                 if has_validators:
                     flow._serve_reason = "conditional_revalidation_xs3lerator"
                     LOG.debug("Cache hit: stale, conditional revalidation via xs3lerator")
                     _rewrite_to_xs3lerator_revalidate(flow)
+                    return
+                else:
+                    flow._serve_reason = "stale_no_validators"
+                    LOG.debug("Cache hit: stale, no validators -> fetch fresh via xs3lerator")
+                    _rewrite_to_xs3lerator_miss(flow)
                     return
         else:
             if (flow.request.method == "GET"
@@ -2046,120 +2033,6 @@ class Proxy:
                     flow._range_stripped = True
                     LOG.debug("Stripped Range header on cache miss: %s", flow._orig_range)
 
-        upstream_failed = False
-        flow._upstream_error = None
-
-        upstream_hdrs = {}
-        for k, v in flow.request.headers.items():
-            if (k.lower().startswith("x-echo-")
-                    or k.lower() in ("x-sleep", "x-status-code")):
-                upstream_hdrs[k] = v
-        if cache_hit and policy in (Standard, StaleIfError):
-            cm = flow._cache_head.meta
-            if (etag := cm.get("headers", {}).get("etag")):
-                upstream_hdrs["If-None-Match"] = etag
-            if (lastmod := cm.get("last_modified")):
-                upstream_hdrs["If-Modified-Since"] = lastmod
-        try:
-            timeout = getattr(ctx.options, "upstream_head_timeout", UPSTREAM_TIMEOUT)
-            start = time.perf_counter()
-            flow._upstream_head = requests.head(
-                flow.request.url,
-                timeout=timeout,
-                headers=upstream_hdrs,
-            )
-            flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
-        except Exception as e:
-            flow._upstream_head_time_ms = int((time.perf_counter() - start) * 1000)
-            upstream_failed = True
-            flow._upstream_error = e
-            _log_exception(
-                e,
-                flow=flow,
-                context={"hook": "requestheaders", "stage": "upstream_head"},
-                error_type="upstream_head_error",
-            )
-
-        if (not upstream_failed and cache_hit
-                and flow._upstream_head.status_code == 404
-                and (policy == StaleIfError or allow_stale_if_error)):
-            flow._serve_reason = "stale_if_error_upstream_404"
-            _rewrite_to_object_store(flow)
-            return
-
-        # On upstream errors, StaleIfError may serve cached content.
-        if upstream_failed or (flow._upstream_head and flow._upstream_head.status_code >= 400):
-            if cache_hit and (policy == StaleIfError or allow_stale_if_error):
-                flow._serve_reason = "stale_if_error_upstream_failed"
-                LOG.debug("Upstream failed -> rewrite to object store (StaleIfError)")
-                _rewrite_to_object_store(flow)
-                return
-
-        # If upstream didn't respond and we have a cache miss,
-        # return a 504 HTTP error
-        if upstream_failed:
-            flow._serve_reason = "upstream_failed"
-            flow._save_response = False
-            if _is_tls_verify_error(flow._upstream_error):
-                detail = str(flow._upstream_error) if flow._upstream_error else "unknown"
-                flow.response = _build_upstream_error_response(
-                    502,
-                    "Bad Gateway",
-                    f"TLS certificate verification failed.\n{detail}",
-                )
-            elif _is_connection_error(flow._upstream_error):
-                detail = str(flow._upstream_error) if flow._upstream_error else "connection error"
-                flow.response = _build_upstream_error_response(
-                    502,
-                    "Bad Gateway",
-                    f"Upstream connection failed.\n{detail}",
-                )
-            else:
-                detail = str(flow._upstream_error) if flow._upstream_error else "upstream timeout"
-                flow.response = _build_upstream_error_response(
-                    504,
-                    "Gateway Timeout",
-                    detail,
-                )
-            return
-
-        if (cache_hit
-                and policy in (Standard, StaleIfError)
-                and flow._upstream_head
-                and (http_2xx(flow._upstream_head) or flow._upstream_head.status_code == 304)):
-            # Decide whether the upstream content is the same as our cached copy.
-            # ETag is the authoritative validator: if both sides have one and they
-            # match, the content is identical regardless of Last-Modified differences
-            # (e.g. cache stored None but upstream now returns a value).
-            upstream_etag = _normalize_etag(flow._upstream_head.headers.get("etag"))
-            cached_etag = _normalize_etag(flow._cache_head.meta.get("headers", {}).get("etag"))
-            upstream_lastmod = flow._upstream_head.headers.get("last-modified")
-            cached_lastmod = flow._cache_head.meta.get("headers", {}).get("last-modified")
-            if upstream_etag and cached_etag:
-                content_unchanged = upstream_etag == cached_etag
-            elif upstream_lastmod or cached_lastmod:
-                content_unchanged = upstream_lastmod == cached_lastmod
-            else:
-                content_unchanged = False
-            if content_unchanged:
-                flow._serve_reason = "cache_hit_revalidated"
-                _rewrite_to_object_store(flow)
-                if flow._cache_key:
-                    batcher = getattr(ctx, "_last_access_batcher", None)
-                    if batcher:
-                        batcher.refresh_stored_at(flow._cache_key)
-                    else:
-                        ctx._executor.submit(
-                            refresh_cache_metadata,
-                            flow._cache_key,
-                            flow._cache_head.meta,
-                        )
-                return
-            flow._serve_reason = "cache_revalidated_content_changed"
-
-        # When xs3lerator is configured and we've reached here (cache miss or
-        # stale+content-changed), redirect the GET to xs3lerator for upstream
-        # download + S3 caching.
         if xs3lerator_enabled and flow.request.method == "GET" and not getattr(flow, "_xs3lerator_rewrite", False):
             _rewrite_to_xs3lerator_miss(flow)
 

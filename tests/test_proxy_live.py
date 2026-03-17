@@ -29,12 +29,11 @@ SYNC_SETTLE_SECONDS = float(os.environ.get("PASSSAGE_SYNC_SETTLE_SECONDS", "1.0"
 POLICY_HEADER = "X-Passsage-Policy"
 
 CONCURRENT_DELAY = 5
-# Each request includes upstream HEAD + GET. If HEAD is delayed too, a single request
-# takes ~2*CONCURRENT_DELAY. We expect concurrency, so each request should finish
-# well under 2*CONCURRENT_DELAY*2 (sequential) and allow some buffer.
+# With xs3lerator handling upstream fetches, concurrent requests should still
+# benefit from deduplication. Allow buffer over sequential time.
 CONCURRENT_MAX_RESPONSE_TIME = CONCURRENT_DELAY * 4 * 0.8
-UPSTREAM_TIMEOUT_DELAY = 12
-UPSTREAM_CLIENT_TIMEOUT = 20
+UPSTREAM_TIMEOUT_DELAY = 65
+UPSTREAM_CLIENT_TIMEOUT = 75
 
 
 def get_method_count(stats: dict, path: str, method: str) -> int:
@@ -1195,7 +1194,7 @@ def _s3_list_objects(prefix: str = "") -> list[str]:
 
 @pytest.mark.integration
 class TestXs3leratorIntegration:
-    """Tests that verify the xs3lerator sidecar integration works end-to-end."""
+    """Tests that verify the xs3lerator integration works end-to-end."""
 
     def test_xs3lerator_healthcheck(self):
         resp = requests.get(f"{XS3LERATOR_URL}/healthz", timeout=5)

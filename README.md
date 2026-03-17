@@ -35,7 +35,7 @@ whether to serve from cache or go upstream. In brief:
   (cache hits) and upstream HTTP servers (cache misses), and simultaneously
   uploads data to S3 on miss. Passsage manages metadata only (Elasticsearch
   indexes, vary indexes). HEAD requests are served synthetically from
-  Elasticsearch metadata when fresh, or via direct upstream HEAD otherwise.
+  Elasticsearch metadata when fresh, or forwarded to xs3lerator otherwise.
 - **Without xs3lerator** (legacy mode): cache hits are fetched from an HTTP
   object store (`--object-store-url`, required). Passsage uploads data to S3
   on cache miss.
@@ -48,8 +48,9 @@ whether to serve from cache or go upstream. In brief:
 - S3 data keys use hash-prefixed format
   `data/<h>/<a>/<s>/<h>/<sha256>` for content-addressed chunks.
 - `NoRefresh` serves from cache immediately on a hit (no revalidation).
-- `Standard` revalidates with an upstream `HEAD` when stale; if the cached `ETag`/`Last-Modified`
-  matches, the cached object is served.
+- `Standard` revalidates via conditional GET through xs3lerator when stale; if the
+  upstream returns 304, the cached object is served. If the content changed, xs3lerator
+  fetches and caches the new version.
 - `StaleIfError` serves stale cache on upstream failure, and `Standard` honors
   `stale-if-error` / `stale-while-revalidate` directives when present.
 - `AlwaysUpstream` always fetches from upstream, even if cached.
