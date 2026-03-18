@@ -21,24 +21,21 @@ See https://docs.mitmproxy.org/stable/concepts/how-mitmproxy-works/ for the deta
   - `StaleIfError`: Serve stale cache on upstream failure (4xx/5xx/timeout)
   - `AlwaysUpstream`: Always fetch from upstream, cache as fallback
   - `NoCache`: Pass through without caching
-  - Default policy when no rule matches: `Standard` (override with `--default-policy`)
+  - Default policy when no rule matches: `Standard` (override via a policy file)
 - **Automatic failover**: Serve cached content when upstream is unavailable
-- **Ban management**: Temporarily ban unresponsive upstreams to avoid timeouts
+- **Presigned URL normalization**: Strip ephemeral signing parameters from cache keys so differently-signed requests share a single cache entry
 
 ## Cache hits and misses
 
-Passsage resolves each request to a cache policy, then uses S3 object metadata to decide
-whether to serve from cache or go upstream. In brief:
+Passsage resolves each request to a cache policy, then uses Elasticsearch metadata
+and xs3lerator to decide whether to serve from cache or go upstream. In brief:
 
-- **With xs3lerator** (`--xs3lerator-url`): GET requests are routed through
-  [xs3lerator](../xs3lerator/), which handles parallel downloads from both S3
-  (cache hits) and upstream HTTP servers (cache misses), and simultaneously
-  uploads data to S3 on miss. Passsage manages metadata only (Elasticsearch
-  indexes, vary indexes). HEAD requests are served synthetically from
-  Elasticsearch metadata when fresh, or forwarded to xs3lerator otherwise.
-- **Without xs3lerator** (legacy mode): cache hits are fetched from an HTTP
-  object store (`--object-store-url`, required). Passsage uploads data to S3
-  on cache miss.
+- GET requests are routed through [xs3lerator](https://github.com/bra-fsn/xs3lerator), which handles
+  parallel downloads from both S3 (cache hits) and upstream HTTP servers (cache
+  misses), and simultaneously uploads data to S3 on miss. Passsage manages
+  metadata only (Elasticsearch indexes, vary indexes).
+- HEAD requests are served synthetically from Elasticsearch metadata when fresh,
+  or forwarded to xs3lerator otherwise.
 - Object metadata is stored in Elasticsearch (`passsage_meta` index) for fast
   real-time lookups by document `_id`. The data objects themselves are immutable
   content-addressed chunks in S3.
@@ -60,14 +57,13 @@ whether to serve from cache or go upstream. In brief:
 `stale-while-revalidate` are supported when present.
 
 On cache misses, the response is fetched from upstream and streamed to the client.
-With xs3lerator enabled, data fetching and S3 upload is handled by xs3lerator;
-Passsage only saves metadata (`.meta` and vary index). Without xs3lerator,
-Passsage uploads the data to S3 itself.
+Data fetching and S3 upload is handled by xs3lerator; Passsage only saves metadata
+(`.meta` and vary index).
 Responses are saved to S3 unless caching is disabled by policy or response headers
 (`Cache-Control: no-store` or `private`, or `Vary: *`). When `Vary` is present, cache
 keys include the `Vary` request headers so separate variants are stored and served.
 
-## Example production setup
+## Architecture
 
 A typical deployment uses Passsage as the TLS-terminating policy engine with
 xs3lerator handling all data transfer. On a cache hit, Passsage rewrites the
@@ -77,60 +73,28 @@ adaptive parallel downloads and simultaneously uploads to S3. Clients point
 `HTTP_PROXY`/`HTTPS_PROXY` at Passsage.
 
 ```
-                                             ┌────────────┐
-                                        ┌───▶│  Upstream  │
-                                        │ ◀──│  Servers   │
-                                        │    │ (PyPI etc) │
-┌──────────────┐     ┌──────────────┐   │    └────────────┘
-│   Client     │────▶│   Passsage   │   │
-│ (pip, curl,  │◀────│ (policy +    │   │
-│  docker...)  │     │  metadata)   │   │
-└──────────────┘     └──────┬───────┘   │
-                            │           │
-                  GET       │           │
-                  requests  │           │
-                            ▼           │
-                     ┌──────────────┐   │    ┌──────────┐
-                     │  xs3lerator  │───┘    │  AWS S3  │
-                     │ (data plane) │◀──────▶│ (cache)  │
-                     └──────────────┘        └──────────┘
+┌──────────────┐     ┌──────────────┐     ┌────────────┐
+│   Client     │────▶│   Passsage   │────▶│  Upstream   │
+│ (pip, curl,  │◀────│ (policy +    │◀────│  Servers    │
+│  docker...)  │     │  metadata)   │     │ (PyPI etc)  │
+└──────────────┘     └──────┬───────┘     └────────────┘
                             │
-                   metadata │  Elasticsearch
-                   only     │  (passsage_meta index)
+                  GET       │   metadata
+                  requests  │   read/write
                             ▼
-                     ┌──────────────┐
-                     │  Passsage    │
-                     │ (writes meta │
-                     │  to ES)     │
+                     ┌──────────────┐        ┌───────────────┐
+                     │  xs3lerator  │◀──────▶│    AWS S3     │
+                     │ (data plane) │        │   (cache)     │
+                     └──────────────┘        └───────────────┘
+                                                    ▲
+                     ┌──────────────┐               │
+                     │Elasticsearch │◀──────────────┘
+                     │(passsage_meta│  metadata index
+                     │  index)      │
                      └──────────────┘
 ```
 
-For deployments without xs3lerator (legacy mode), Passsage can still use an
-HTTP object store directly:
-
-```
-┌──────────────┐     ┌──────────────────────┐     ┌────────────┐
-│   Client     │────▶│   Passsage           │────▶│  Upstream  │
-│ (pip, curl,  │◀────│   (caching proxy)    │◀────│  Servers   │
-│  docker...)  │     │   :3128              │     │ (PyPI etc) │
-└──────────────┘     └──────┬──────┬────────┘     └────────────┘
-                            │      │
-                   fetches  │      │  writes cached objects +
-                   cached   │      │  .meta JSON + vary index
-                   objects  │      │
-                            │      ▼
-                            │  ┌──────────┐
-                            │  │  AWS S3  │
-                            │  │ (cache)  │
-                            │  └──────────┘
-                            │
-                            ▼
-                     ┌──────────────────────┐
-                     │   Object Store HTTP  │
-                     │  (S3 public bucket,  │
-                     │   nginx, or similar) │
-                     └──────────────────────┘
-```
+Both `--elasticsearch-url` and `--xs3lerator-url` are required.
 
 ## Installation
 
@@ -149,20 +113,21 @@ pip install -e ".[dev]"
 ### Basic Usage
 
 ```bash
-# Run with default settings (uses AWS S3)
-passsage
+# Run with required services (Elasticsearch + xs3lerator must be running)
+passsage --elasticsearch-url http://localhost:9200 \
+    --xs3lerator-url http://localhost:8888
 
-# Run on a specific port (CLI or env var)
-PASSSAGE_PORT=9090 passsage
-passsage -p 9090
-
-# Bind to a specific interface (CLI or env var)
-PASSSAGE_HOST=127.0.0.1 passsage
-passsage --bind 127.0.0.1
+# Run on a specific port
+passsage -p 9090 --elasticsearch-url http://localhost:9200 \
+    --xs3lerator-url http://localhost:8888
 
 # Run with web interface
-passsage --web
+passsage --web --elasticsearch-url http://localhost:9200 \
+    --xs3lerator-url http://localhost:8888
 ```
+
+The easiest way to get started is with Docker Compose, which starts all
+required services (see [Docker Development](#docker-development)).
 
 ### Client Setup (Certificate + Proxy Env Vars)
 
@@ -175,7 +140,7 @@ replace `localhost:8080` with the proxy hostname/IP.
 1. Start Passsage (example on localhost):
 
 ```bash
-PASSSAGE_PORT=8080 passsage
+docker compose up --build
 ```
 
 2. Run the proxy env script (it embeds the cert, installs it, and exports proxy env vars):
@@ -209,60 +174,30 @@ export PASSSAGE_PUBLIC_PROXY_URL=http://proxy.example.com:3128
 passsage
 ```
 
-### With LocalStack (Local Development)
-
-Start LocalStack:
-
-```bash
-docker run --rm -p 4566:4566 localstack/localstack
-```
-
-Create and configure the bucket:
-
-```bash
-# Using awslocal (pip install awscli-local)
-awslocal s3 mb s3://proxy-cache
-awslocal s3api put-bucket-policy --bucket proxy-cache --policy '{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "PublicRead",
-    "Effect": "Allow",
-    "Principal": "*",
-    "Action": ["s3:GetObject", "s3:HeadObject"],
-    "Resource": "arn:aws:s3:::proxy-cache/*"
-  }]
-}'
-```
-
-Run Passsage:
-
-```bash
-passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache \
-    --object-store-url http://localhost:4566/proxy-cache
-```
-
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PASSSAGE_PORT` | Proxy listen port | `8080` |
 | `PASSSAGE_HOST` | Proxy bind host | `0.0.0.0` |
-| `S3_BUCKET` | S3 bucket name for cache storage | `364189071156-ds-proxy-us-west-2` (AWS) or `proxy-cache` (custom endpoint) |
+| `S3_BUCKET` | S3 bucket name for cache storage | `proxy-cache` |
 | `S3_ENDPOINT_URL` | Custom S3 endpoint URL | None (uses AWS) |
+| `PASSSAGE_MODE` | Proxy mode: `regular`, `transparent`, `wireguard`, or `upstream` | `regular` |
 | `PASSSAGE_PUBLIC_PROXY_URL` | Externally reachable proxy URL for the onboarding script (e.g. `http://proxy.example.com:3128`). Required behind a load balancer or in Kubernetes. | None |
-| `PASSSAGE_OBJECT_STORE_URL` | HTTP URL of the object store exposing the S3 cache namespace (required). Cache hits are fetched from this URL. | (required) |
-| `PASSSAGE_ELASTICSEARCH_URL` | Elasticsearch URL for metadata storage. | None |
-| `PASSSAGE_ELASTICSEARCH_META_INDEX` | Elasticsearch index for metadata. | `passsage_meta` |
-| `PASSSAGE_ELASTICSEARCH_REPLICAS` | Number of ES index replicas. | `1` |
-| `PASSSAGE_ELASTICSEARCH_SHARDS` | Number of ES index shards. | `9` |
-| `PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL` | Interval for batched last_access updates (seconds). | `30` |
-| `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `0` |
+| `PASSSAGE_NO_PROXY_EXTRA` | Extra comma-separated hosts to add to `NO_PROXY` in the onboarding script | None |
+| `PASSSAGE_ELASTICSEARCH_URL` | Elasticsearch URL for metadata storage (required) | (required) |
+| `PASSSAGE_ELASTICSEARCH_META_INDEX` | Elasticsearch index for metadata | `passsage_meta` |
+| `PASSSAGE_ELASTICSEARCH_REPLICAS` | Number of ES index replicas | `1` |
+| `PASSSAGE_ELASTICSEARCH_SHARDS` | Number of ES index shards | `9` |
+| `PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL` | Interval for batched last_access updates (seconds) | `30` |
+| `PASSSAGE_XS3LERATOR_URL` | xs3lerator base URL (required). All GET requests are routed through xs3lerator for parallel downloads and S3 caching. | (required) |
+| `PASSSAGE_ACCESS_LOGS` | Enable Parquet access logs | `1` (enabled) |
 | `PASSSAGE_ACCESS_LOG_PREFIX` | S3 prefix for access logs | `__passsage_logs__` |
 | `PASSSAGE_ACCESS_LOG_DIR` | Local spool dir for access logs | `/tmp/passsage-logs` |
 | `PASSSAGE_ACCESS_LOG_FLUSH_SECONDS` | Flush interval in seconds | `30` |
 | `PASSSAGE_ACCESS_LOG_FLUSH_BYTES` | Flush size threshold | `1G` |
 | `PASSSAGE_ACCESS_LOG_HEADERS` | Headers to include in access logs | `accept,accept-encoding,cache-control,content-type,content-encoding,etag,last-modified,range,user-agent,via,x-cache,x-cache-lookup,x-amz-request-id` |
-| `PASSSAGE_ERROR_LOGS` | Enable Parquet error logs | `0` |
+| `PASSSAGE_ERROR_LOGS` | Enable Parquet error logs | `1` (enabled) |
 | `PASSSAGE_ERROR_LOG_PREFIX` | S3 prefix for error logs | `__passsage_error_logs__` |
 | `PASSSAGE_ERROR_LOG_DIR` | Local spool dir for error logs | `/tmp/passsage-errors` |
 | `PASSSAGE_ERROR_LOG_FLUSH_SECONDS` | Flush interval in seconds | `30` |
@@ -270,43 +205,51 @@ passsage --s3-endpoint http://localhost:4566 --s3-bucket proxy-cache \
 | `PASSSAGE_CONNECTION_STRATEGY` | Mitmproxy connection strategy: `lazy` (default) or `eager` | `lazy` |
 | `PASSSAGE_MITM_CA_CERT` | mitmproxy CA certificate (PEM file path or inline PEM). Written to `~/.mitmproxy/mitmproxy-ca-cert.pem` before startup. | None |
 | `PASSSAGE_MITM_CA` | mitmproxy CA key+cert bundle (PEM file path or inline PEM). Written to `~/.mitmproxy/mitmproxy-ca.pem` before startup. | None |
-| `PASSSAGE_XS3LERATOR_URL` | xs3lerator base URL (e.g. `http://localhost:8080`). When set, GET requests are routed through xs3lerator for parallel download and S3 caching. | None (disabled) |
+| `PASSSAGE_VERBOSE` | Enable verbose logging | `0` |
+| `PASSSAGE_DEBUG` | Enable debug logging for proxy internals | `0` |
+| `PASSSAGE_DEBUG_PROXY` | Enable debug logging for passsage proxy only | `0` |
+| `PASSSAGE_WEB` | Enable mitmproxy web interface | `0` |
+| `PASSSAGE_POLICY_FILE` | Path to Python file defining policy overrides | None |
+| `PASSSAGE_ALLOW_POLICY_HEADER` | Allow client policy override via `X-Passsage-Policy` header | `0` |
 | `PASSSAGE_S3_HASH_PREFIX_DEPTH` | Number of hash characters to use as S3 path prefix segments (e.g. 4 produces `f/f/3/0/hash...`). Distributes objects across prefixes to avoid S3 throttling. | `4` |
 
 ### CLI Options
 
 ```
-Usage: passsage [OPTIONS]
+Usage: passsage [OPTIONS] COMMAND [ARGS]...
+
+  Passsage (Pas³age) - S3-backed caching proxy.
 
 Options:
   -p, --port INTEGER              Port to listen on (env: PASSSAGE_PORT, default: 8080)
   -b, --bind TEXT                 Address to bind to (env: PASSSAGE_HOST, default: 0.0.0.0)
-  --s3-bucket TEXT                S3 bucket for cache storage
-  --s3-endpoint TEXT              S3 endpoint URL for S3-compatible services
+  --s3-bucket TEXT                S3 bucket for cache storage (env: S3_BUCKET)
+  --s3-endpoint TEXT              S3 endpoint URL for S3-compatible services (env: S3_ENDPOINT_URL)
   -m, --mode [regular|transparent|wireguard|upstream]
-                                  Proxy mode (default: regular)
-  -v, --verbose                   Enable verbose logging
-  --public-proxy-url TEXT         Externally reachable proxy URL for client onboarding
+                                  Proxy mode (env: PASSSAGE_MODE, default: regular)
+  -v, --verbose                   Enable verbose logging (env: PASSSAGE_VERBOSE)
+  --debug                         Enable debug logging for proxy internals (env: PASSSAGE_DEBUG)
+  --debug-proxy                   Enable debug logging for passsage proxy only
+                                  (env: PASSSAGE_DEBUG_PROXY)
+  --web                           Enable mitmproxy web interface (env: PASSSAGE_WEB)
+  --policy-file TEXT              Path to Python file defining policy overrides
+                                  (env: PASSSAGE_POLICY_FILE)
+  --allow-policy-header           Allow client policy override via X-Passsage-Policy
+                                  (env: PASSSAGE_ALLOW_POLICY_HEADER)
+  --public-proxy-url TEXT         Public proxy URL embedded in mitm.it/proxy-env responses
                                   (env: PASSSAGE_PUBLIC_PROXY_URL)
-  --object-store-url TEXT         HTTP URL of the object store (required)
-                                  (env: PASSSAGE_OBJECT_STORE_URL)
-  --elasticsearch-url TEXT       Elasticsearch URL for metadata
-                                  (env: PASSSAGE_ELASTICSEARCH_URL)
-  --elasticsearch-meta-index TEXT  ES index name (default: passsage_meta)
-                                  (env: PASSSAGE_ELASTICSEARCH_META_INDEX)
-  --elasticsearch-replicas INT   Number of ES replicas (default: 1)
-                                  (env: PASSSAGE_ELASTICSEARCH_REPLICAS)
-  --elasticsearch-shards INT     Number of ES shards (default: 9)
-                                  (env: PASSSAGE_ELASTICSEARCH_SHARDS)
-  --elasticsearch-flush-interval FLOAT  Batch flush interval seconds (default: 30)
-                                  (env: PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL)
-  --access-logs                   Enable S3 access logs in Parquet format
+  --no-proxy-extra TEXT           Extra comma-separated hosts to add to NO_PROXY in
+                                  mitm.it/proxy-env responses (env: PASSSAGE_NO_PROXY_EXTRA)
+  --access-logs / --no-access-logs
+                                  Enable S3 access logs in Parquet format (default: enabled)
+                                  (env: PASSSAGE_ACCESS_LOGS)
   --access-log-prefix TEXT        S3 prefix for access logs (env: PASSSAGE_ACCESS_LOG_PREFIX)
   --access-log-dir TEXT           Local spool directory for access logs
   --access-log-flush-seconds TEXT Flush interval in seconds for access logs
   --access-log-flush-bytes TEXT   Flush size threshold for access logs
   --access-log-headers TEXT       Headers to include in access logs
-  --error-logs                    Enable S3 error logs in Parquet format
+  --error-logs / --no-error-logs  Enable S3 error logs in Parquet format (default: enabled)
+                                  (env: PASSSAGE_ERROR_LOGS)
   --error-log-prefix TEXT         S3 prefix for error logs (env: PASSSAGE_ERROR_LOG_PREFIX)
   --error-log-dir TEXT            Local spool directory for error logs
   --error-log-flush-seconds TEXT  Flush interval in seconds for error logs
@@ -315,13 +258,33 @@ Options:
   --health-host TEXT              Health endpoint bind host (env: PASSSAGE_HEALTH_HOST)
   --connection-strategy [lazy|eager]
                                   Upstream TLS connection strategy (default: lazy)
-  --xs3lerator-url TEXT          xs3lerator base URL for parallel GET downloads and S3 caching
+  --mitm-ca-cert TEXT             mitmproxy CA certificate (PEM path or inline)
+                                  (env: PASSSAGE_MITM_CA_CERT)
+  --mitm-ca TEXT                  mitmproxy CA key+cert bundle (PEM path or inline)
+                                  (env: PASSSAGE_MITM_CA)
+  --elasticsearch-url TEXT        Elasticsearch URL for metadata (required)
+                                  (env: PASSSAGE_ELASTICSEARCH_URL)
+  --elasticsearch-meta-index TEXT ES index name (default: passsage_meta)
+                                  (env: PASSSAGE_ELASTICSEARCH_META_INDEX)
+  --elasticsearch-replicas INT    Number of ES replicas (default: 1)
+                                  (env: PASSSAGE_ELASTICSEARCH_REPLICAS)
+  --elasticsearch-shards INT      Number of ES shards (default: 9)
+                                  (env: PASSSAGE_ELASTICSEARCH_SHARDS)
+  --elasticsearch-flush-interval FLOAT
+                                  Batch flush interval seconds (default: 30)
+                                  (env: PASSSAGE_ELASTICSEARCH_FLUSH_INTERVAL)
+  --xs3lerator-url TEXT           xs3lerator base URL (required). All GET requests are routed
+                                  through xs3lerator for parallel downloads and S3 caching.
                                   (env: PASSSAGE_XS3LERATOR_URL)
-  --s3-hash-prefix-depth INT    Hash prefix depth for S3 key partitioning (default: 4)
+  --s3-hash-prefix-depth INT      Hash prefix depth for S3 key partitioning (default: 4)
                                   (env: PASSSAGE_S3_HASH_PREFIX_DEPTH)
-  --web                           Enable mitmproxy web interface
   --version                       Show the version and exit.
   --help                          Show this message and exit.
+
+Commands:
+  cache-keys  Detect query parameters that fragment the cache.
+  errors      Browse or export error logs.
+  logs        Browse or export access logs.
 ```
 
 ### Access Logs
@@ -337,7 +300,8 @@ s3://<bucket>/__passsage_logs__/date=YYYY-MM-DD/hour=HH/<file>.parquet
 Enable logging:
 
 ```bash
-passsage --access-logs
+# Access and error logs are enabled by default. To disable:
+passsage --no-access-logs
 ```
 
 Log UI:
@@ -358,7 +322,8 @@ s3://<bucket>/__passsage_error_logs__/date=YYYY-MM-DD/hour=HH/<file>.parquet
 Enable error logging:
 
 ```bash
-passsage --error-logs
+# Error logs are enabled by default. To disable:
+passsage --no-error-logs
 ```
 
 Error UI:
@@ -366,6 +331,49 @@ Error UI:
 ```bash
 pip install "passsage[ui]"
 passsage errors --start-date 2026-02-01 --end-date 2026-02-02
+```
+
+### Cache Key Analysis
+
+The `cache-keys` subcommand scans access logs for query parameters that fragment
+the cache and cause unnecessary misses. It identifies parameters with many
+distinct values appearing across multiple URL paths — strong candidates for
+cache key stripping (e.g. tracking IDs, session tokens, cache-busters).
+
+```bash
+pip install "passsage[ui]"
+
+# Analyze today's logs
+passsage cache-keys --s3-bucket my-proxy-cache
+
+# Analyze a date range with stricter thresholds
+passsage cache-keys --start-date 2026-02-01 --end-date 2026-02-10 \
+    --min-distinct 50 --min-misses 500
+```
+
+### Health and Debug Endpoints
+
+Passsage starts a lightweight HTTP server for health checks and diagnostics on
+a separate port (default 8082).
+
+| Endpoint | Description |
+|---|---|
+| `/health` | S3 bucket connectivity check. Returns 200 if healthy, 503 otherwise. |
+| `/debug/threads` | Dumps all Python thread tracebacks. |
+| `/debug/connections` | Dumps TCP connections from `/proc/net/tcp`. |
+| `/debug/memory` | GC object type profiling and RSS info. Append `?tracemalloc` for a tracemalloc snapshot. |
+
+```bash
+curl -f http://localhost:8082/health
+curl http://localhost:8082/debug/threads
+curl http://localhost:8082/debug/memory
+```
+
+Configure via environment variables:
+
+```bash
+export PASSSAGE_HEALTH_PORT=8082   # set to 0 to disable
+export PASSSAGE_HEALTH_HOST=0.0.0.0
 ```
 
 ### As a mitmproxy Script
@@ -378,7 +386,7 @@ mitmproxy -s $(python -c "import passsage; print(passsage.get_proxy_path())")
 
 ## Docker Development
 
-The easiest way to develop and test Passsage is with Docker Compose, which sets up LocalStack S3 automatically.
+The easiest way to develop and test Passsage is with Docker Compose, which sets up all required services automatically.
 
 ### Quick Start
 
@@ -392,8 +400,9 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 This starts:
 - **LocalStack** S3 on port 4566 with pre-configured `proxy-cache` bucket
-- **Passsage** proxy on port 8080
-- **Health endpoint** on port 8082 (`/health`)
+- **Elasticsearch** on port 9200 (single-node, metadata storage)
+- **xs3lerator** on port 8888 (data plane: parallel downloads + S3 caching)
+- **Passsage** proxy on port 8080, health endpoint on port 8082
 
 ### Development Workflow
 
@@ -471,21 +480,6 @@ export PROXY_URL=http://localhost:9090
 pytest -m "not slow"
 ```
 
-### Health endpoint
-
-Passsage starts a lightweight HTTP server for health checks on a separate port.
-
-```bash
-curl -f http://localhost:8082/health
-```
-
-Configure it via environment variables:
-
-```bash
-export PASSSAGE_HEALTH_PORT=8082
-export PASSSAGE_HEALTH_HOST=0.0.0.0
-```
-
 ## Content Delivery Services
 
 Passsage ships with built-in handling for common content delivery and object
@@ -506,15 +500,14 @@ parameters _before_ computing the cache key. The original URL (with all
 parameters intact) is still used when talking to the upstream server, so
 authentication continues to work. Only the cache key sees the stripped version.
 
-Normalization rules are applied based on the request hostname using a suffix
-trie for fast matching. The built-in rules cover:
+Signing parameters are stripped from **all URLs** regardless of host, since the
+parameter names are unambiguous credentials/signatures:
 
-| Service / host suffix | Stripped parameters |
+| Signing scheme | Stripped parameters |
 |---|---|
-| `*.amazonaws.com` (S3, CloudFront signed URLs) | All `X-Amz-*` params (Algorithm, Credential, Date, Expires, Signature, Security-Token, SignedHeaders, …) |
-| `*.r2.cloudflarestorage.com` (Cloudflare R2) | All `X-Amz-*` params (R2 uses S3-compatible signing) |
-| `*.production.cloudflare.docker.com` (Cloudflare Docker registry) | `expires`, `signature`, `version` |
-| `*.pkg-containers.githubusercontent.com` (GitHub Container Registry blobs) | Azure SAS token params: `se`, `sig`, `sp`, `spr`, `sr`, `sv`, `ske`, `skoid`, `sks`, `skt`, `sktid`, `skv`, `hmac` |
+| AWS Signature V4 (S3, R2, HuggingFace xethub, etc.) | All `X-Amz-*` params (Algorithm, Credential, Date, Expires, Signature, Security-Token, SignedHeaders, ...) |
+| AWS CloudFront signed URLs | `Expires`, `Policy`, `Signature`, `Key-Pair-Id` |
+| Azure SAS tokens (GitHub Container Registry, Azure Blob, etc.) | `se`, `sig`, `sp`, `spr`, `sr`, `sv`, `ske`, `skoid`, `sks`, `skt`, `sktid`, `skv`, `hmac` |
 
 After stripping, any remaining query parameters are sorted by key to avoid
 cache misses from different parameter orderings.
@@ -537,11 +530,11 @@ Overrides_ below).
 | Pattern | Policy | Rationale |
 |---|---|---|
 | `*.files.pythonhosted.org` | `StaleIfError` | PyPI package files are immutable once published |
-| `pypi.org/simple/*` | `StaleIfError` | Simple index pages; stale index is better than a build failure |
+| `pypi.org/simple/*` | `StaleIfError` + forced SWR (24h) | Simple index pages; stale index is better than a build failure. Background revalidation keeps the index fresh without blocking requests. |
 | `*.deb`, `/Packages`, `/Packages.gz`, `/Packages.xz`, `/InRelease`, APT by-hash paths | `StaleIfError` | Debian/Ubuntu repository metadata and packages |
 | `mran.microsoft.com/snapshot/*` | `StaleIfError` | MRAN R package snapshots |
 | `*.amazonaws.com` (except CodeArtifact) | `NoCache` | S3 API calls, STS tokens — must not be cached |
-| Cloud metadata endpoints (`169.254.169.*`, `169.254.170.*`, Azure/GCP metadata) | `NoCache` | Instance metadata must always be live |
+| Cloud metadata endpoints (`169.254.169.*`, `169.254.170.*`, `100.100.100.*`, Azure/GCP metadata) | `NoCache` | Instance metadata must always be live |
 | `/mitm.it/*` | `NoCache` | mitmproxy's own certificate distribution page |
 
 ### Extending normalization rules
