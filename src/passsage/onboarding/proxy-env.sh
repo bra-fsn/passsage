@@ -96,7 +96,7 @@ install_cert() {
   esac
 }
 
-NO_PROXY_HOSTS="localhost,127.0.0.1,::1,169.254.169.254,169.254.170.2,__PASSSAGE_S3_HOST____PASSSAGE_NO_PROXY_EXTRA__"
+NO_PROXY_HOSTS="localhost,127.0.0.1,::1,169.254.169.254,169.254.170.2,.amazonaws.com,__PASSSAGE_S3_HOST____PASSSAGE_NO_PROXY_EXTRA__"
 
 write_env_file() {
   env_dir="${HOME:-$PWD}/.passsage"
